@@ -1,8 +1,10 @@
 # Bootstrapping Redox on the SGI Indy — 32 MB
 
 **Audience:** agents and engineers working in `irix7/redox`.
-**Status:** bootstrap plan. Redox does not boot on the Indy today. This file says where the
-pieces are, what has already been proved on this machine, and what the 32 MB budget allows.
+**Status:** T1, T3, T4 and T5 pass on iris (2026-11-17): `make indy-gate` netboots the
+Redox kernel on a 32 MiB `indy_ip24`, the kernel maps its heap through the TLB and stops at
+"no initfs". T2 (the x86_64 floor) is not done. There is no userspace yet. This file says
+where the pieces are, what has been proved on this machine, and what the 32 MB budget allows.
 **Fork base:** `redox-os/redox` mirror at `f71658dfca2b978bee55a4c19d95ab926a948c21`
 (2026-11-16). See [Provenance](#provenance-and-rebasing).
 
@@ -600,6 +602,10 @@ In order. Each one ends with evidence, not an opinion.
 
 ### T1 — Pin the toolchain and prove a MIPS object builds in this repository
 
+**Done 2026-11-17** ([ADR 0001](docs/adr/0001-toolchain-pin.md)). `tools/indy-probe` builds
+with `-Zbuild-std=core` for `targets/mips64-sgi-redox.json`; `llvm-readobj` shows ELF32,
+big-endian, `EF_MIPS_ABI2`, `EF_MIPS_ARCH_3`, entry `0x88040000`; 887 bytes of text.
+
 - Add `nightly-2026-10-03` (or a justified single pin) with `rust-src` and
   `llvm-tools-preview`; reconcile `rust-toolchain.toml`.
 - Add `targets/mips64-sgi-redox.json` (copy the field values in §3.4).
@@ -618,6 +624,10 @@ In order. Each one ends with evidence, not an opinion.
 
 ### T3 — Make `redox` the TFTP boot file
 
+**Done 2026-11-17.** `tools/ecoff` converts the ELF; `make indy` writes `build/indy/redox`;
+`tools/indy-gate.sh` drives the PROM. Trace: `BOOTP asks for "redox"`, `RRQ "redox"
+(octet)`, `complete: 975056 bytes, 1905 blocks, 0 retransmits`, PROM `entry: 0x88040000`.
+
 - Build the ECOFF converter (or port the sibling's, as a standalone Rust tool).
 - Add a make target that produces `redox` in a directory served by `iris --tftp-dir`.
 - At the emulated PROM: `boot -f bootp()redox`.
@@ -626,12 +636,34 @@ In order. Each one ends with evidence, not an opinion.
 
 ### T4 — A MIPS kernel `_start` that prints one line and stops
 
+**Done 2026-11-17.** The patch `recipes/core/kernel/indy-mips64.patch` adds
+`src/arch/mips64`. `kstart` builds `KernelArgs` itself (no bootloader; `hwdesc` null, one
+memory area from `MEMCFG0/1`, no initfs). Serial line in `build/indy/gate/serial.log`:
+`kernel::arch::mips64::start:INFO -- Redox OS starting...`. The run continues through
+`startup::memory::init`, `init_mm`, percpu, `allocator::init` (the first TLB refills) and
+stops at `Indy: no initfs in the image, stopping`, which is the gate marker.
+
 - Adapt `KernelArgs` for the PROM handoff; no ACPI, no device tree.
 - Serial output through the IOC's Z85C30, channel B (`0xBFBD_9833`; write the register number
   to the control port, then the data through the same port).
 - **Evidence:** the line in `redox-serial.log`, from a 32 MiB guest, in CI.
 
 ### T5 — The first memory measurement
+
+**Done 2026-11-17**, printed by the kernel on a 32 MiB guest:
+
+| Item | Measured |
+|---|---:|
+| RAM reported by `MEMCFG0` (`0x6720_0000`) | 32768 KiB at `0x0800_0000` |
+| Reserved below the kernel (PROM, vectors) | 256 KiB |
+| Kernel image (text 896, data 56, bss 84) | 1036 KiB |
+| Permanently used after `init_mm` (page tables, frame metadata) | 2052 KiB |
+| Kernel heap, fixed | 1024 KiB |
+| Free after boot | 28392 KiB (7098 frames) |
+
+The kernel image line in §7.2 holds with 12 KiB to spare; the "heap and RMM structures"
+line is 3 MiB measured against 1 MiB budgeted, mostly the per-frame `PageInfo` array and
+the 1024 pre-allocated kernel directory tables `rmm` creates. That is the first line to cut.
 
 - Print the frame allocator's start, the total RAM the PROM reported, the initfs region and
   the kernel image size at boot.
@@ -640,6 +672,22 @@ In order. Each one ends with evidence, not an opinion.
 
 Do not start on relibc, redoxfs or the shell until T4 passes in CI. Each of those is a project,
 and none of them is on the critical path to "the machine runs our code".
+
+### Next, in order
+
+- **T6 — initfs and the bootstrap program.** The kernel stops at "no initfs". Redox's
+  `bootstrap` is a static relibc program; this needs relibc for n32 (D2, option 1: a new
+  PAL against [ADR 0002](docs/adr/0002-syscall-abi.md)) and an initfs appended to the ECOFF
+  image or loaded as a second TFTP file.
+- **T7 — Seeq 8003 Ethernet.** The first device driver, and the one that matters most: a
+  netbooted machine with no disk has nothing else. In Redox it is a userspace scheme, so it
+  follows T6. The HPC3 interrupt demultiplexer (INT3, CP0 IP2/IP3) in the kernel's
+  `arch::interrupt::irq` is its prerequisite; today that module claims no IRQs. Read
+  `irix7/os/docs/research/indy-hardware.md` §4 (HPC3), §4.2 (the interrupt-status bug) and
+  §6 (Seeq register set, DMA, the frame format quirk) first; iris's `src/dev/seeq*` is the
+  model to test against.
+- **T2** stays worth doing: it tells which userspace cut matters most before T6 pulls in
+  packages.
 
 ---
 
@@ -650,14 +698,15 @@ the same shape.
 
 | # | Decision | Why it cannot be deferred |
 |---|---|---|
-| D1 | The nightly pin for this fork | `-Zbuild-std` requires `rust-src`; Redox's pin lacks `llvm-tools-preview` |
+| D1 | **Decided** ([ADR 0001](docs/adr/0001-toolchain-pin.md)): `nightly-2026-10-03` | `-Zbuild-std` requires `rust-src`; Redox's pin lacks `llvm-tools-preview` |
 | D2 | relibc strategy: new MIPS PAL, or adopt the sibling's n32 syscall channel | it decides the kernel ABI and the libc's shape |
-| D3 | Syscall entry convention (register assignment and the `$v0`/`$v1` status channel) | every syscall and the whole libc depend on it |
+| D3 | **Decided** ([ADR 0002](docs/adr/0002-syscall-abi.md)): `$v0` number, `$a0`..`$a5` args, demuxed result in `$v0`, thread pointer in `$gp` | every syscall and the whole libc depend on it |
 | D4 | RedoxFS byte order: endian-explicit accessors (recommended) vs a big-endian variant | it decides whether existing images are readable |
 | D5 | Init source: initfs only, or initfs plus SCSI root | it decides the boot-time RAM floor |
 | D6 | Graphics: serial only in v1, or REX3 from the start | 3.75 MiB vs 300 KiB, and weeks of work |
-| D7 | Multi-core: off in v1 | the Indy is single-CPU; SMP is pure cost |
+| D7 | **Decided**: off; the kernel builds with `--no-default-features` and `ipi` is a no-op | the Indy is single-CPU; SMP is pure cost |
 | D8 | Package format and index for the first image | the sibling's index format exists but is not a Redox format |
+| D9 | **Decided** ([ADR 0003](docs/adr/0003-paging-and-tlb.md)): two-level 4-byte tables, EntryLo-shaped leaves, one ASID, software refill | every mapping and the TLB handler depend on it |
 
 ---
 
@@ -668,9 +717,10 @@ the same shape.
 - **The canonical upstream is GitLab** (`gitlab.redox-os.org/redox-os/redox`). The GitHub
   repository is a mirror and may lag. Rebase onto the mirror; never merge GitLab history into
   this fork.
-- Our changes are patch series under `patches/`, one directory per component, applied by the
-  recipe that builds it — not a divergent copy of upstream source in this repository. This
-  keeps a rebase mechanical.
+- Our changes are patch files next to the recipe that builds the component
+  (`recipes/core/kernel/indy-mips64.patch`, listed in that `recipe.toml` under
+  `[source] patches`), not a divergent copy of upstream source in this repository. This keeps
+  a rebase mechanical. The kernel patch applies to `redox-os/kernel` `8f0e965e`.
 - Every patch series records: the upstream commit it applies to, the reason, and the memory
   effect. A patch that cannot say why it exists is deleted at the next rebase.
 - Upstream's `CONTRIBUTING.md` AI policy means these patches are not candidates for upstream
@@ -729,5 +779,5 @@ IRIS_TFTP_TRACE=1 iris --config redox.toml --tftp-dir /tmp/opencode/redox-netboo
 
 ---
 
-*Last updated: 2026-11-17. If you change a fact in this file, change the date and say what
-proved it.*
+*Last updated: 2026-11-17 (T1, T3, T4, T5 evidence from `make indy-gate` on iris). If you
+change a fact in this file, change the date and say what proved it.*

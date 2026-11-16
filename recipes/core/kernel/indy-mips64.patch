@@ -1,0 +1,2854 @@
+From 4bb050909022f0385d08c207c0e62cca63013342 Mon Sep 17 00:00:00 2001
+From: belikh <io@jupiter.au>
+Date: Tue, 17 Nov 2026 09:24:42 +1000
+Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
+
+A MIPS R4400 n32 big-endian kernel with 32-bit addresses, entered directly
+from the SGI PROM over `boot -f bootp()redox` (ECOFF, no bootloader).
+
+- targets/mips64-unknown-kernel.json, linkers/mips64.ld: image at kseg0
+  0x8804_0000, kstart first, .bss zeroed by kstart.
+- src/arch/mips64: CP0 access, kstart building KernelArgs from linker symbols
+  and MEMCFG0/1, Z85C30 serial console on IOC2 channel B, exception vectors
+  copied to 0x8000_0000/0x80/0x180 (RAM through the low alias), a 38-word
+  64-bit trap frame, software TLB refill from the rmm table, Count/Compare
+  timer at 100 Hz, single-CPU percpu through a static pointer, context switch.
+- rmm/src/arch/mips.rs: two-level 4-byte page tables, EntryLo-shaped leaves
+  with software bits for user, no-execute and uncached, one ASID, flush on
+  table switch.
+- syscall/src/arch/mips64.rs: number in $v0, args $a0..$a5, result in $v0,
+  thread pointer in $gp.
+- panic.rs: no symbol lookup when no ELF header is loaded at KERNEL_OFFSET.
+- Makefile: ARCH=mips64 uses llvm-objcopy and --no-default-features.
+
+Measured on iris (indy_ip24, 32 MiB): kernel image 1036 KiB (text 896 KiB,
+data 56 KiB, bss 84 KiB), TFTP file 975,056 bytes, 2052 KiB permanently
+used after init_mm, 28,392 KiB (7098 frames) free with the 1 MiB heap mapped.
+
+Signed-off-by: belikh <io@jupiter.au>
+---
+ Makefile                               |   7 +
+ linkers/mips64.ld                      |  60 ++++
+ rmm/src/arch/mips.rs                   | 208 ++++++++++++++
+ rmm/src/arch/mod.rs                    |   4 +-
+ rmm/src/lib.rs                         |   1 +
+ src/arch/mips64/consts.rs              |  20 ++
+ src/arch/mips64/cp0.rs                 | 105 +++++++
+ src/arch/mips64/debug.rs               |  19 ++
+ src/arch/mips64/device/cpu/mod.rs      |  11 +
+ src/arch/mips64/device/mod.rs          |  22 ++
+ src/arch/mips64/device/serial.rs       |  14 +
+ src/arch/mips64/interrupt/exception.rs | 298 ++++++++++++++++++++
+ src/arch/mips64/interrupt/handler.rs   | 376 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/irq.rs       |  19 ++
+ src/arch/mips64/interrupt/mod.rs       |  47 ++++
+ src/arch/mips64/interrupt/syscall.rs   |   4 +
+ src/arch/mips64/interrupt/trace.rs     |  19 ++
+ src/arch/mips64/ipi.rs                 |  24 ++
+ src/arch/mips64/misc.rs                |  60 ++++
+ src/arch/mips64/mod.rs                 |  91 ++++++
+ src/arch/mips64/paging.rs              |  15 +
+ src/arch/mips64/start.rs               | 253 +++++++++++++++++
+ src/arch/mips64/stop.rs                |  30 ++
+ src/arch/mips64/time.rs                |  61 ++++
+ src/arch/mod.rs                        |   6 +
+ src/context/arch/mips64.rs             | 216 ++++++++++++++
+ src/context/mod.rs                     |   4 +
+ src/devices/mod.rs                     |   2 +
+ src/devices/serial.rs                  |  13 +
+ src/devices/uart_z85c30.rs             |  86 ++++++
+ src/macros.rs                          |   2 +-
+ src/main.rs                            |   1 +
+ src/panic.rs                           |  15 +
+ src/scheme/irq.rs                      |   2 +
+ src/scheme/proc.rs                     |   3 +-
+ src/startup/mod.rs                     |  20 +-
+ syscall/src/arch/mips64.rs             | 232 +++++++++++++++
+ syscall/src/lib.rs                     |   5 +
+ targets/mips64-unknown-kernel.json     |  31 ++
+ 39 files changed, 2393 insertions(+), 13 deletions(-)
+ create mode 100644 linkers/mips64.ld
+ create mode 100644 rmm/src/arch/mips.rs
+ create mode 100644 src/arch/mips64/consts.rs
+ create mode 100644 src/arch/mips64/cp0.rs
+ create mode 100644 src/arch/mips64/debug.rs
+ create mode 100644 src/arch/mips64/device/cpu/mod.rs
+ create mode 100644 src/arch/mips64/device/mod.rs
+ create mode 100644 src/arch/mips64/device/serial.rs
+ create mode 100644 src/arch/mips64/interrupt/exception.rs
+ create mode 100644 src/arch/mips64/interrupt/handler.rs
+ create mode 100644 src/arch/mips64/interrupt/irq.rs
+ create mode 100644 src/arch/mips64/interrupt/mod.rs
+ create mode 100644 src/arch/mips64/interrupt/syscall.rs
+ create mode 100644 src/arch/mips64/interrupt/trace.rs
+ create mode 100644 src/arch/mips64/ipi.rs
+ create mode 100644 src/arch/mips64/misc.rs
+ create mode 100644 src/arch/mips64/mod.rs
+ create mode 100644 src/arch/mips64/paging.rs
+ create mode 100644 src/arch/mips64/start.rs
+ create mode 100644 src/arch/mips64/stop.rs
+ create mode 100644 src/arch/mips64/time.rs
+ create mode 100644 src/context/arch/mips64.rs
+ create mode 100644 src/devices/uart_z85c30.rs
+ create mode 100644 syscall/src/arch/mips64.rs
+ create mode 100644 targets/mips64-unknown-kernel.json
+
+diff --git a/Makefile b/Makefile
+index 29a59327..683d1fef 100644
+--- a/Makefile
++++ b/Makefile
+@@ -18,6 +18,11 @@ ifeq ($(ARCH),riscv64gc)
+ else ifeq ($(ARCH),i686)
+ 	override ARCH:=i586
+ 	GNU_TARGET=i686-unknown-redox
++else ifeq ($(ARCH),mips64)
++	# SGI Indy: no GNU binutils for the target; llvm-objcopy comes with the toolchain.
++	GNU_TARGET=mips64-sgi-redox
++	OBJCOPY?=llvm-objcopy
++	KERNEL_CARGO_FLAGS?=--no-default-features
+ else
+ 	GNU_TARGET=$(ARCH)-unknown-redox
+ endif
+@@ -32,6 +37,7 @@ MANIFEST=$(SOURCE)/Cargo.toml
+ TARGET_SPEC=$(RUST_TARGET_PATH)/$(ARCH)-unknown-kernel.json
+ 
+ KERNEL_CARGO_FEATURES?=
++KERNEL_CARGO_FLAGS?=
+ 
+ $(BUILD):
+ 	mkdir -p "$@"
+@@ -45,6 +51,7 @@ $(BUILD)/kernel.all: $(LD_SCRIPT) $(LOCKFILE) $(MANIFEST) $(TARGET_SPEC) $(shell
+ 		-Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem \
+ 		-Z json-target-spec \
+ 		--features=$(KERNEL_CARGO_FEATURES) \
++		$(KERNEL_CARGO_FLAGS) \
+ 		-- \
+ 		-C link-arg=-T -Clink-arg="$(LD_SCRIPT)" \
+ 		-C link-arg=-z -Clink-arg=max-page-size=0x1000 \
+diff --git a/linkers/mips64.ld b/linkers/mips64.ld
+new file mode 100644
+index 00000000..b6bf3827
+--- /dev/null
++++ b/linkers/mips64.ld
+@@ -0,0 +1,60 @@
++/* SGI Indy (IP24). The PROM loads the ECOFF image at kseg0 0x8804_0000
++ * (physical 0x0804_0000) and jumps to kstart. Virtual and load addresses are
++ * equal: kseg0 is the cached direct map, so there is no AT() offset. .bss is
++ * kept separate and zeroed by kstart; the PROM does not promise to clear it. */
++ENTRY(kstart)
++OUTPUT_FORMAT("elf32-ntradbigmips")
++OUTPUT_ARCH(mips)
++
++KERNEL_OFFSET = 0x88040000;
++
++SECTIONS {
++    . = KERNEL_OFFSET;
++
++    .text : {
++        __text_start = .;
++        KEEP(*(.text.kstart))
++        *(.text*)
++        . = ALIGN(4096);
++        __text_end = .;
++    }
++
++    .rodata : {
++        __rodata_start = .;
++        *(.rodata*)
++        . = ALIGN(4096);
++        __rodata_end = .;
++    }
++
++    .data : {
++        *(.data*)
++        *(.sdata*)
++        *(.got*)
++        . = ALIGN(4096);
++    }
++
++    .bss (NOLOAD) : {
++        __bss_start = .;
++        *(.bss*)
++        *(.sbss*)
++        *(COMMON)
++        . = ALIGN(4096);
++        __bss_end = .;
++    }
++
++    __end = .;
++
++    /DISCARD/ : {
++        *(.comment*)
++        *(.eh_frame*)
++        *(.gcc_except_table*)
++        *(.note*)
++        *(.rel.eh_frame*)
++        *(.MIPS.abiflags)
++        *(.MIPS.options)
++        *(.reginfo)
++        *(.pdr)
++        *(.mdebug*)
++        *(.gnu.attributes)
++    }
++}
+diff --git a/rmm/src/arch/mips.rs b/rmm/src/arch/mips.rs
+new file mode 100644
+index 00000000..eadd5dfa
+--- /dev/null
++++ b/rmm/src/arch/mips.rs
+@@ -0,0 +1,208 @@
++//! MIPS R4000-class paging for the SGI Indy (R4400, n32 kernel, 32-bit addresses).
++//!
++//! The TLB is refilled by software. `rmm` keeps a two-level table of 4-byte
++//! entries (1024 directory entries, 1024 page entries each, 4 KiB pages) and
++//! the kernel's exception handler walks it. A leaf entry holds the physical
++//! frame number at bits 6..25, the EntryLo `V` (present) and `D` (writable)
++//! bits at bits 1 and 2, and software bits above the frame number: 29
++//! uncached, 30 no-execute, 31 user. The refill handler builds EntryLo from
++//! the frame number and the cache bit; the other software bits never reach
++//! the hardware.
++//!
++//! There is one CPU and no page-table base register, so the active table is a
++//! static. All mappings use ASID 0 and the whole TLB is flushed on a table
++//! switch.
++
++use core::{
++    arch::asm,
++    sync::atomic::{AtomicUsize, Ordering},
++};
++
++use crate::{Arch, PhysicalAddress, TableKind, VirtualAddress};
++
++#[derive(Clone, Copy)]
++pub struct MipsArch;
++
++/// Physical address of the table the refill handler walks.
++pub static CURRENT_TABLE: AtomicUsize = AtomicUsize::new(0);
++
++/// Number of TLB entries on the R4400.
++pub const TLB_ENTRIES: usize = 48;
++
++/// Software bit: build the EntryLo with the uncached cache coherency code.
++pub const PTE_UNCACHED: usize = 1 << 29;
++/// The bits of a leaf entry the hardware understands: frame number, D, V.
++pub const PTE_HARDWARE_MASK: usize = 0x03ff_ffc6;
++/// EntryLo coherency field: cacheable, noncoherent.
++pub const ENTRYLO_CACHEABLE: usize = 3 << 3;
++/// EntryLo coherency field: uncached.
++pub const ENTRYLO_UNCACHED: usize = 2 << 3;
++
++/// Convert a leaf entry to the EntryLo value the refill handler writes.
++#[inline(always)]
++pub fn entry_lo(pte: usize) -> usize {
++    let cache = if pte & PTE_UNCACHED != 0 {
++        ENTRYLO_UNCACHED
++    } else {
++        ENTRYLO_CACHEABLE
++    };
++    (pte & PTE_HARDWARE_MASK) | cache
++}
++
++/// An EntryHi that can never match: a kseg0 address with ASID 0. kseg0 is not
++/// TLB mapped, so an entry tagged with it is as good as empty.
++#[inline(always)]
++fn unmapped_entry_hi(index: usize) -> usize {
++    0x8000_0000 + index * 0x2000
++}
++
++/// Write one TLB entry at `index`.
++///
++/// # Safety
++/// Changes address translation for the whole CPU.
++pub unsafe fn write_indexed(index: usize, entry_hi: usize, entry_lo0: usize, entry_lo1: usize) {
++    unsafe {
++        asm!(
++            "mtc0 {index}, $0",
++            "mtc0 {hi}, $10",
++            "mtc0 {lo0}, $2",
++            "mtc0 {lo1}, $3",
++            "nop",
++            "nop",
++            "tlbwi",
++            "nop",
++            "nop",
++            index = in(reg) index,
++            hi = in(reg) entry_hi,
++            lo0 = in(reg) entry_lo0,
++            lo1 = in(reg) entry_lo1,
++            options(nostack),
++        );
++    }
++}
++
++/// Write a random TLB entry for the pair of pages containing `virt`.
++///
++/// # Safety
++/// Changes address translation for the whole CPU.
++pub unsafe fn write_random(virt: usize, entry_lo0: usize, entry_lo1: usize) {
++    unsafe {
++        asm!(
++            "mtc0 {hi}, $10",
++            "mtc0 {lo0}, $2",
++            "mtc0 {lo1}, $3",
++            "nop",
++            "nop",
++            "tlbwr",
++            "nop",
++            "nop",
++            hi = in(reg) virt & !0x1fff,
++            lo0 = in(reg) entry_lo0,
++            lo1 = in(reg) entry_lo1,
++            options(nostack),
++        );
++    }
++}
++
++/// Clear every TLB entry and set PageMask to 4 KiB pages, Wired to 0.
++///
++/// # Safety
++/// Changes address translation for the whole CPU.
++pub unsafe fn flush_all() {
++    unsafe {
++        asm!(
++            "mtc0 $zero, $5", // PageMask: 4 KiB
++            "mtc0 $zero, $6", // Wired
++            "nop",
++            options(nostack)
++        );
++        for index in 0..TLB_ENTRIES {
++            write_indexed(index, unmapped_entry_hi(index), 0, 0);
++        }
++    }
++}
++
++impl Arch for MipsArch {
++    const KERNEL_SEPARATE_TABLE: bool = false;
++
++    const PAGE_SHIFT: usize = 12; // 4096 bytes
++    const PAGE_ENTRY_SHIFT: usize = 10; // 1024 entries, 4 bytes each
++    const PAGE_LEVELS: usize = 2; // directory, table
++
++    const ENTRY_ADDRESS_WIDTH: usize = 20; // 32-bit physical addresses
++    const ENTRY_ADDRESS_SHIFT: usize = 6; // EntryLo frame number position
++    const ENTRY_FLAG_DEFAULT_PAGE: usize = Self::ENTRY_FLAG_PRESENT;
++    const ENTRY_FLAG_DEFAULT_TABLE: usize = Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_READWRITE;
++    const ENTRY_FLAG_PRESENT: usize = 1 << 1; // EntryLo V
++    const ENTRY_FLAG_READONLY: usize = 0;
++    const ENTRY_FLAG_READWRITE: usize = 1 << 2; // EntryLo D
++    const ENTRY_FLAG_PAGE_USER: usize = 1 << 31; // software
++    const ENTRY_FLAG_NO_EXEC: usize = 1 << 30; // software; the R4400 has no execute permission
++    const ENTRY_FLAG_EXEC: usize = 0;
++    const ENTRY_FLAG_GLOBAL: usize = 0; // one ASID, flushed on switch
++    const ENTRY_FLAG_NO_GLOBAL: usize = 0;
++    const ENTRY_FLAG_DEVICE_MEMORY: usize = PTE_UNCACHED;
++    const ENTRY_FLAG_UNCACHEABLE: usize = PTE_UNCACHED;
++    const ENTRY_FLAG_WRITE_COMBINING: usize = PTE_UNCACHED;
++
++    /// kseg0: the cached direct map of the low 512 MiB of physical memory.
++    const PHYS_OFFSET: usize = 0x8000_0000;
++
++    #[inline(always)]
++    fn invalidate(address: VirtualAddress) {
++        unsafe {
++            let index: isize;
++            asm!(
++                "mtc0 {hi}, $10",
++                "nop",
++                "nop",
++                "tlbp",
++                "nop",
++                "nop",
++                "mfc0 {index}, $0",
++                hi = in(reg) address.data() & !0x1fff,
++                index = out(reg) index,
++                options(nostack),
++            );
++            if index >= 0 {
++                let index = index as usize;
++                write_indexed(index, unmapped_entry_hi(index), 0, 0);
++            }
++        }
++    }
++
++    #[inline(always)]
++    fn invalidate_all() {
++        unsafe { flush_all() }
++    }
++
++    #[inline(always)]
++    fn table(_table_kind: TableKind) -> PhysicalAddress {
++        PhysicalAddress::new(CURRENT_TABLE.load(Ordering::Acquire))
++    }
++
++    #[inline(always)]
++    unsafe fn set_table(_table_kind: TableKind, address: PhysicalAddress) {
++        CURRENT_TABLE.store(address.data(), Ordering::Release);
++        unsafe { flush_all() }
++    }
++
++    fn virt_is_valid(_address: VirtualAddress) -> bool {
++        // Every 32-bit address is a valid MIPS virtual address.
++        true
++    }
++}
++
++const _: () = {
++    assert!(MipsArch::PAGE_SIZE == 4096);
++    assert!(MipsArch::PAGE_OFFSET_MASK == 0xFFF);
++    assert!(MipsArch::PAGE_ADDRESS_SHIFT == 32);
++    assert!(MipsArch::PAGE_ADDRESS_SIZE == 0x0000_0001_0000_0000);
++    assert!(MipsArch::PAGE_ADDRESS_MASK == 0xFFFF_F000);
++    assert!(MipsArch::PAGE_ENTRY_SIZE == 4);
++    assert!(MipsArch::PAGE_ENTRIES == 1024);
++    assert!(MipsArch::PAGE_ENTRY_MASK == 0x3FF);
++    assert!(MipsArch::ENTRY_ADDRESS_MASK == 0x000F_FFFF);
++    assert!(MipsArch::ENTRY_FLAGS_MASK == 0xFC00_003F);
++    assert!(MipsArch::PHYS_OFFSET == 0x8000_0000);
++};
+diff --git a/rmm/src/arch/mod.rs b/rmm/src/arch/mod.rs
+index 33d912f2..15ef511c 100644
+--- a/rmm/src/arch/mod.rs
++++ b/rmm/src/arch/mod.rs
+@@ -9,7 +9,9 @@ pub mod aarch64;
+ pub mod emulate;
+ #[cfg(target_pointer_width = "64")]
+ pub mod riscv64;
+-#[cfg(target_pointer_width = "32")]
++#[cfg(target_arch = "mips64")]
++pub mod mips;
++#[cfg(all(target_pointer_width = "32", target_arch = "x86"))]
+ pub mod x86;
+ #[cfg(target_pointer_width = "64")]
+ pub mod x86_64;
+diff --git a/rmm/src/lib.rs b/rmm/src/lib.rs
+index 1f2c1a13..ccbee701 100644
+--- a/rmm/src/lib.rs
++++ b/rmm/src/lib.rs
+@@ -1,6 +1,7 @@
+ #![no_std]
+ #![allow(clippy::new_without_default)]
+ #![feature(slice_shift)]
++#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
+ 
+ use core::ops::AddAssign;
+ 
+diff --git a/src/arch/mips64/consts.rs b/src/arch/mips64/consts.rs
+new file mode 100644
+index 00000000..84217eeb
+--- /dev/null
++++ b/src/arch/mips64/consts.rs
+@@ -0,0 +1,20 @@
++//! Fixed virtual addresses. Physical RAM starts at 0x0800_0000 and is reached
++//! through kseg0 (`PHYS_OFFSET` 0x8000_0000) and kseg1 for devices.
++
++/// Offset to kernel heap: the start of kseg2, TLB mapped. The heap is a fixed
++/// 1 MiB (`allocator::KERNEL_HEAP_SIZE`).
++#[inline(always)]
++pub fn kernel_heap_offset() -> usize {
++    0xC000_0000
++}
++
++/// End offset of the user image, i.e. kernel start: the end of useg.
++pub const USER_END_OFFSET: usize = 0x8000_0000;
++
++/// Physical base of DRAM on the Indy.
++pub const RAM_PHYS_BASE: usize = 0x0800_0000;
++
++/// Physical bytes below the kernel reserved for the PROM, the exception
++/// vectors (the first 512 KiB of RAM is aliased at physical 0) and the ARCS
++/// parameter block.
++pub const LOW_RESERVED_BYTES: usize = 0x0004_0000;
+diff --git a/src/arch/mips64/cp0.rs b/src/arch/mips64/cp0.rs
+new file mode 100644
+index 00000000..ab264103
+--- /dev/null
++++ b/src/arch/mips64/cp0.rs
+@@ -0,0 +1,105 @@
++//! CP0 (system control coprocessor) registers of the R4400.
++
++use core::arch::asm;
++
++pub const INDEX: u32 = 0;
++pub const ENTRY_LO0: u32 = 2;
++pub const ENTRY_LO1: u32 = 3;
++pub const CONTEXT: u32 = 4;
++pub const PAGE_MASK: u32 = 5;
++pub const WIRED: u32 = 6;
++pub const BAD_VADDR: u32 = 8;
++pub const COUNT: u32 = 9;
++pub const ENTRY_HI: u32 = 10;
++pub const COMPARE: u32 = 11;
++pub const STATUS: u32 = 12;
++pub const CAUSE: u32 = 13;
++pub const EPC: u32 = 14;
++pub const PRID: u32 = 15;
++pub const CONFIG: u32 = 16;
++
++/// Status register bits.
++pub mod status {
++    pub const IE: u32 = 1 << 0;
++    pub const EXL: u32 = 1 << 1;
++    pub const ERL: u32 = 1 << 2;
++    /// Kernel/supervisor/user mode field: 0 kernel, 2 user.
++    pub const KSU_MASK: u32 = 0x18;
++    pub const KSU_USER: u32 = 0x10;
++    pub const UX: u32 = 1 << 5;
++    pub const SX: u32 = 1 << 6;
++    pub const KX: u32 = 1 << 7;
++    pub const IM_MASK: u32 = 0xff00;
++    /// Timer interrupt (IP7).
++    pub const IM7: u32 = 1 << 15;
++    /// Bootstrap exception vectors (PROM) when set.
++    pub const BEV: u32 = 1 << 22;
++    pub const CU1: u32 = 1 << 29;
++}
++
++/// Cause register bits.
++pub mod cause {
++    pub const EXC_CODE_MASK: u32 = 0x7c;
++    pub const EXC_CODE_SHIFT: u32 = 2;
++    pub const IP_MASK: u32 = 0xff00;
++    pub const IP7: u32 = 1 << 15;
++    /// Exception in a branch delay slot.
++    pub const BD: u32 = 1 << 31;
++
++    pub const EXC_INT: u32 = 0;
++    pub const EXC_MOD: u32 = 1;
++    pub const EXC_TLBL: u32 = 2;
++    pub const EXC_TLBS: u32 = 3;
++    pub const EXC_ADEL: u32 = 4;
++    pub const EXC_ADES: u32 = 5;
++    pub const EXC_IBE: u32 = 6;
++    pub const EXC_DBE: u32 = 7;
++    pub const EXC_SYS: u32 = 8;
++    pub const EXC_BP: u32 = 9;
++    pub const EXC_RI: u32 = 10;
++    pub const EXC_CPU: u32 = 11;
++    pub const EXC_OV: u32 = 12;
++    pub const EXC_TR: u32 = 13;
++    pub const EXC_FPE: u32 = 15;
++}
++
++macro_rules! cp0_access {
++    ($read:ident, $write:ident, $reg:expr) => {
++        #[inline(always)]
++        pub fn $read() -> u32 {
++            let value: u32;
++            unsafe {
++                asm!(concat!("mfc0 {}, $", $reg), out(reg) value, options(nomem, nostack));
++            }
++            value
++        }
++
++        /// # Safety
++        /// Writing CP0 changes CPU state: translation, interrupts or timing.
++        #[inline(always)]
++        pub unsafe fn $write(value: u32) {
++            unsafe {
++                asm!(
++                    concat!("mtc0 {}, $", $reg),
++                    "nop",
++                    "nop",
++                    in(reg) value,
++                    options(nomem, nostack)
++                );
++            }
++        }
++    };
++}
++
++cp0_access!(read_status, write_status, 12);
++cp0_access!(read_cause, write_cause, 13);
++cp0_access!(read_epc, write_epc, 14);
++cp0_access!(read_count, write_count, 9);
++cp0_access!(read_compare, write_compare, 11);
++cp0_access!(read_bad_vaddr, write_bad_vaddr, 8);
++cp0_access!(read_prid, write_prid, 15);
++cp0_access!(read_config, write_config, 16);
++cp0_access!(read_entry_hi, write_entry_hi, 10);
++cp0_access!(read_wired, write_wired, 6);
++cp0_access!(read_page_mask, write_page_mask, 5);
++cp0_access!(read_context, write_context, 4);
+diff --git a/src/arch/mips64/debug.rs b/src/arch/mips64/debug.rs
+new file mode 100644
+index 00000000..b66a081c
+--- /dev/null
++++ b/src/arch/mips64/debug.rs
+@@ -0,0 +1,19 @@
++use spin::MutexGuard;
++
++use crate::{arch::device::serial::COM1, devices::serial::SerialKind};
++
++pub struct Writer<'a> {
++    serial: MutexGuard<'a, SerialKind>,
++}
++
++impl<'a> Writer<'a> {
++    pub fn new() -> Writer<'a> {
++        Writer {
++            serial: COM1.lock(),
++        }
++    }
++
++    pub fn write(&mut self, buf: &[u8]) {
++        self.serial.write(buf);
++    }
++}
+diff --git a/src/arch/mips64/device/cpu/mod.rs b/src/arch/mips64/device/cpu/mod.rs
+new file mode 100644
+index 00000000..e8c7e2c3
+--- /dev/null
++++ b/src/arch/mips64/device/cpu/mod.rs
+@@ -0,0 +1,11 @@
++use core::fmt::{Result, Write};
++
++use crate::arch::cp0;
++
++pub fn cpu_info<W: Write>(w: &mut W) -> Result {
++    let prid = cp0::read_prid();
++    writeln!(w, "Implementation: 0x{:02x}", (prid >> 8) & 0xff)?;
++    writeln!(w, "Revision: 0x{:02x}", prid & 0xff)?;
++    writeln!(w, "Config: 0x{:08x}", cp0::read_config())?;
++    Ok(())
++}
+diff --git a/src/arch/mips64/device/mod.rs b/src/arch/mips64/device/mod.rs
+new file mode 100644
+index 00000000..272e5679
+--- /dev/null
++++ b/src/arch/mips64/device/mod.rs
+@@ -0,0 +1,22 @@
++//! Indy devices the kernel itself drives: the serial console and the CP0
++//! timer. Everything else (HPC3, SCSI, Seeq Ethernet, Newport) is a userspace
++//! scheme reached through fixed kseg1 addresses; there is no bus enumeration.
++
++pub mod cpu;
++pub mod serial;
++
++pub unsafe fn init() {
++    unsafe {
++        super::time::init();
++    }
++}
++
++pub unsafe fn init_noncore() {}
++
++pub struct ArchPercpuMisc;
++
++impl ArchPercpuMisc {
++    pub const fn default() -> Self {
++        Self
++    }
++}
+diff --git a/src/arch/mips64/device/serial.rs b/src/arch/mips64/device/serial.rs
+new file mode 100644
+index 00000000..85cd4255
+--- /dev/null
++++ b/src/arch/mips64/device/serial.rs
+@@ -0,0 +1,14 @@
++use spin::Mutex;
++
++use crate::devices::{serial::SerialKind, uart_z85c30::SerialPort};
++
++/// IOC2 Z85C30 channel B control port (kseg1). Channel B is "Serial Port 1".
++pub const SCC_CHANNEL_B: usize = 0xBFBD_9833;
++
++pub static COM1: Mutex<SerialKind> = Mutex::new(SerialKind::NotPresent);
++
++pub unsafe fn init() {
++    let mut port = unsafe { SerialPort::new(SCC_CHANNEL_B) };
++    port.init();
++    *COM1.lock() = SerialKind::Z85c30(port);
++}
+diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
+new file mode 100644
+index 00000000..5bdf7acb
+--- /dev/null
++++ b/src/arch/mips64/interrupt/exception.rs
+@@ -0,0 +1,298 @@
++//! Exception vectors and the common handler.
++//!
++//! The R4400 takes every exception at one of three kseg0 vectors when
++//! `Status.BEV` is clear: TLB refill at 0x8000_0000, extended refill at
++//! 0x8000_0080 and the general vector at 0x8000_0180. On the Indy physical
++//! 0 aliases the first 512 KiB of RAM, so the vectors are RAM. Each vector
++//! is a jump to `exception_entry`, which saves the frame and calls
++//! `exception_handler_inner`.
++
++use ::syscall::Exception;
++use core::arch::naked_asm;
++use rmm::{Arch, VirtualAddress};
++
++use crate::{
++    arch::cp0::{self, cause},
++    context::signal::excp_handler,
++    memory::{GenericPfFlags, RmmA},
++    ptrace,
++    sync::CleanLockToken,
++    syscall::{self, flag::*},
++};
++
++use super::{handler::FRAME_SIZE, InterruptStack};
++
++const VECTOR_TLB_REFILL: usize = 0x8000_0000;
++const VECTOR_XTLB_REFILL: usize = 0x8000_0080;
++const VECTOR_GENERAL: usize = 0x8000_0180;
++
++/// Copy the vector stub to the three vector addresses and make it visible to
++/// the instruction cache.
++pub unsafe fn install_vectors() {
++    unsafe {
++        let stub = vector_stub as usize as *const u32;
++        for vector in [VECTOR_TLB_REFILL, VECTOR_XTLB_REFILL, VECTOR_GENERAL] {
++            let dst = vector as *mut u32;
++            for i in 0..VECTOR_STUB_WORDS {
++                dst.add(i).write_volatile(stub.add(i).read_volatile());
++            }
++        }
++        flush_caches();
++    }
++}
++
++/// Write back and invalidate the whole primary data cache and invalidate the
++/// primary instruction cache (R4400: 16 KiB each, direct mapped, 16- and
++/// 32-byte lines). `cache` operations are indexed, so any kseg0 address works.
++pub unsafe fn flush_caches() {
++    unsafe {
++        let mut addr: usize = 0x8000_0000;
++        while addr < 0x8000_0000 + 16 * 1024 {
++            core::arch::asm!(
++                "cache 1, 0({0})",  // Index_Writeback_Inv_D
++                "cache 0, 0({0})",  // Index_Invalidate_I
++                in(reg) addr,
++                options(nostack)
++            );
++            addr += 16;
++        }
++    }
++}
++
++/// Instruction words in `vector_stub`.
++const VECTOR_STUB_WORDS: usize = 4;
++
++/// Position-independent: `la` expands to lui/ori with the absolute address.
++#[unsafe(naked)]
++unsafe extern "C" fn vector_stub() {
++    naked_asm!(
++        "
++        .set noreorder
++        .set noat
++        la      $26, {entry}
++        jr      $26
++        nop
++        .set at
++        .set reorder
++        ",
++        entry = sym exception_entry,
++    )
++}
++
++#[unsafe(naked)]
++pub unsafe extern "C" fn exception_entry() {
++    naked_asm!(
++        "
++        .set noreorder
++        .set noat
++        move    $27, $sp
++        mfc0    $26, $12
++        andi    $26, $26, 0x18
++        beqz    $26, 1f
++        nop
++        // From user mode: take this context's kernel stack.
++        la      $26, PERCPU_PTR
++        lw      $26, 0($26)
++        lw      $sp, 4($26)
++    1:
++        addiu   $sp, $sp, -{frame_size}
++        ",
++        push_registers!(),
++        "
++        // Leave exception level so a nested TLB miss updates EPC; stay in
++        // kernel mode with interrupts off. The frame keeps the real Status.
++        mfc0    $8, $12
++        li      $9, ~0x1b
++        and     $8, $8, $9
++        mtc0    $8, $12
++        nop
++        nop
++        move    $4, $sp
++        la      $25, {handler}
++        jalr    $25
++        nop
++        // Returning to user mode: remember the kernel stack top for the next trap.
++        ld      $8, 256($sp)
++        andi    $8, $8, 0x18
++        beqz    $8, 2f
++        nop
++        la      $8, PERCPU_PTR
++        lw      $8, 0($8)
++        addiu   $9, $sp, {frame_size}
++        sw      $9, 4($8)
++    2:
++        ",
++        pop_registers!(),
++        "
++        eret
++        nop
++        .set at
++        .set reorder
++        ",
++        frame_size = const FRAME_SIZE,
++        handler = sym exception_handler_inner,
++    )
++}
++
++unsafe extern "C" fn exception_handler_inner(regs: &mut InterruptStack) {
++    unsafe {
++        let cause_reg = regs.iret.cause as u32;
++        let exc_code = (cause_reg & cause::EXC_CODE_MASK) >> cause::EXC_CODE_SHIFT;
++        let user_mode = regs.iret.status as u32 & cp0::status::KSU_MASK != 0;
++
++        match exc_code {
++            cause::EXC_INT => handle_interrupt(regs, cause_reg),
++            cause::EXC_MOD | cause::EXC_TLBL | cause::EXC_TLBS => {
++                if !tlb_fault(regs, exc_code, user_mode) {
++                    if user_mode {
++                        handle_user_exception(regs, exc_code);
++                    } else {
++                        handle_system_exception(regs, exc_code);
++                    }
++                }
++            }
++            _ if user_mode => handle_user_exception(regs, exc_code),
++            _ => handle_system_exception(regs, exc_code),
++        }
++    }
++}
++
++fn handle_interrupt(regs: &mut InterruptStack, cause_reg: u32) {
++    let pending = cause_reg & regs.iret.status as u32 & cause::IP_MASK;
++    let mut token = unsafe { CleanLockToken::new() };
++    if pending & cause::IP7 != 0 {
++        crate::arch::time::tick();
++        crate::context::timeout::trigger(&mut token);
++        crate::context::switch::tick(&mut token);
++    }
++    // TODO: HPC3/INT3 local interrupts (IP2, IP3) for userspace drivers.
++}
++
++unsafe fn handle_system_exception(regs: &InterruptStack, exc_code: u32) {
++    error!(
++        "Kernel exception {} at {:#x}, BadVAddr {:#x}",
++        exc_code,
++        { regs.iret.epc },
++        { regs.iret.badvaddr }
++    );
++    regs.dump();
++    loop {
++        unsafe { super::halt() }
++    }
++}
++
++unsafe fn handle_user_exception(regs: &mut InterruptStack, exc_code: u32) {
++    unsafe {
++        let mut token = CleanLockToken::new();
++
++        if exc_code == cause::EXC_SYS {
++            let r = &mut regs.registers;
++            // Skip the syscall instruction. LLVM never places it in a branch delay slot.
++            regs.iret.epc += 4;
++            let ret = syscall::syscall(
++                r.v0 as usize,
++                r.a0 as usize,
++                r.a1 as usize,
++                r.a2 as usize,
++                r.a3 as usize,
++                r.a4 as usize,
++                r.a5 as usize,
++                &mut token,
++            );
++            r.v0 = ret as u64;
++            return;
++        }
++
++        if exc_code == cause::EXC_BP
++            && ptrace::breakpoint_callback(PTRACE_STOP_BREAKPOINT, None, &mut token).is_some()
++        {
++            return;
++        }
++
++        info!(
++            "User exception {} at {:#x}, BadVAddr {:#x}",
++            exc_code,
++            { regs.iret.epc },
++            { regs.iret.badvaddr }
++        );
++        regs.dump();
++
++        excp_handler(Exception {
++            code: exc_code as usize,
++            address: regs.iret.badvaddr as usize,
++        });
++    }
++}
++
++/// Serve a TLB exception from the page table; fall back to the generic page
++/// fault handler. Returns true when execution can resume at EPC.
++unsafe fn tlb_fault(regs: &mut InterruptStack, exc_code: u32, user_mode: bool) -> bool {
++    unsafe {
++        let badvaddr = regs.iret.badvaddr as usize;
++        let page = badvaddr & !(RmmA::PAGE_SIZE - 1);
++        let write = exc_code == cause::EXC_TLBS || exc_code == cause::EXC_MOD;
++
++        // Walk the active table.
++        let root = RmmA::table(rmm::TableKind::User);
++        let directory = RmmA::phys_to_virt(root).data() as *const usize;
++        let pde = directory.add(page >> 22).read_volatile();
++        let pte = if pde & RmmA::ENTRY_FLAG_PRESENT != 0 {
++            let table_phys = ((pde >> RmmA::ENTRY_ADDRESS_SHIFT) & RmmA::ENTRY_ADDRESS_MASK)
++                << RmmA::PAGE_SHIFT;
++            let table = RmmA::phys_to_virt(rmm::PhysicalAddress::new(table_phys)).data()
++                as *const usize;
++            Some(table.add((page >> 12) & 0x3ff).read_volatile())
++        } else {
++            None
++        };
++
++        if let Some(pte) = pte
++            && pte & RmmA::ENTRY_FLAG_PRESENT != 0
++            && (!user_mode || pte & RmmA::ENTRY_FLAG_PAGE_USER != 0)
++            && (!write || pte & RmmA::ENTRY_FLAG_READWRITE != 0)
++            && exc_code != cause::EXC_MOD
++        {
++            // Present in the table, missing from the TLB: refill the pair.
++            let table_phys = ((pde >> RmmA::ENTRY_ADDRESS_SHIFT) & RmmA::ENTRY_ADDRESS_MASK)
++                << RmmA::PAGE_SHIFT;
++            let table = RmmA::phys_to_virt(rmm::PhysicalAddress::new(table_phys)).data()
++                as *const usize;
++            let even = (page >> 12) & 0x3fe;
++            let lo0 = pte_to_entry_lo(table.add(even).read_volatile(), user_mode);
++            let lo1 = pte_to_entry_lo(table.add(even + 1).read_volatile(), user_mode);
++            rmm::mips::write_random(page, lo0, lo1);
++            return true;
++        }
++
++        let present = pte.is_some_and(|pte| pte & RmmA::ENTRY_FLAG_PRESENT != 0);
++        let mut flags = GenericPfFlags::empty();
++        flags.set(GenericPfFlags::PRESENT, present);
++        flags.set(GenericPfFlags::INVOLVED_WRITE, write);
++        flags.set(GenericPfFlags::USER_NOT_SUPERVISOR, user_mode);
++        flags.set(
++            GenericPfFlags::INSTR_NOT_DATA,
++            regs.iret.epc as usize & !3 == badvaddr & !3,
++        );
++
++        let ok =
++            crate::memory::page_fault_handler(regs, flags, VirtualAddress::new(badvaddr)).is_ok();
++        if ok {
++            // The handler changed the table; drop any stale TLB entry so the
++            // retried access refills from the table.
++            RmmA::invalidate(VirtualAddress::new(page));
++        }
++        ok
++    }
++}
++
++/// A page the user may not touch is invisible to it: both halves of a pair
++/// are written, so a kernel-only page next to a user page must not leak.
++fn pte_to_entry_lo(pte: usize, user_mode: bool) -> usize {
++    if pte & RmmA::ENTRY_FLAG_PRESENT == 0 {
++        return 0;
++    }
++    if user_mode && pte & RmmA::ENTRY_FLAG_PAGE_USER == 0 {
++        return 0;
++    }
++    rmm::mips::entry_lo(pte)
++}
+diff --git a/src/arch/mips64/interrupt/handler.rs b/src/arch/mips64/interrupt/handler.rs
+new file mode 100644
+index 00000000..4f860d02
+--- /dev/null
++++ b/src/arch/mips64/interrupt/handler.rs
+@@ -0,0 +1,376 @@
++//! The trap frame. Every general register is saved as 64 bits, because n32
++//! code keeps 64-bit values in registers even though pointers are 32 bits.
++//!
++//! Layout is shared with the assembly in `exception.rs`: register `$n` is at
++//! byte offset `(n - 1) * 8`, followed by the CP0 state.
++
++use crate::{memory::ArchIntCtx, panic, syscall::IntRegisters};
++
++#[derive(Default)]
++#[repr(C)]
++pub struct Registers {
++    pub at: u64, // $1
++    pub v0: u64, // $2
++    pub v1: u64, // $3
++    pub a0: u64, // $4
++    pub a1: u64, // $5
++    pub a2: u64, // $6
++    pub a3: u64, // $7
++    pub a4: u64, // $8
++    pub a5: u64, // $9
++    pub a6: u64, // $10
++    pub a7: u64, // $11
++    pub t0: u64, // $12
++    pub t1: u64, // $13
++    pub t2: u64, // $14
++    pub t3: u64, // $15
++    pub s0: u64, // $16
++    pub s1: u64, // $17
++    pub s2: u64, // $18
++    pub s3: u64, // $19
++    pub s4: u64, // $20
++    pub s5: u64, // $21
++    pub s6: u64, // $22
++    pub s7: u64, // $23
++    pub t8: u64, // $24
++    pub t9: u64, // $25
++    pub k0: u64, // $26 (scratch, not restored)
++    pub k1: u64, // $27 (scratch, not restored)
++    pub gp: u64, // $28, the thread pointer
++    pub sp: u64, // $29
++    pub fp: u64, // $30
++    pub ra: u64, // $31
++}
++
++impl Registers {
++    pub fn dump(&self) {
++        println!("AT:  {:>016X}  V0:  {:>016X}  V1:  {:>016X}", { self.at }, { self.v0 }, { self.v1 });
++        println!("A0:  {:>016X}  A1:  {:>016X}  A2:  {:>016X}", { self.a0 }, { self.a1 }, { self.a2 });
++        println!("A3:  {:>016X}  A4:  {:>016X}  A5:  {:>016X}", { self.a3 }, { self.a4 }, { self.a5 });
++        println!("A6:  {:>016X}  A7:  {:>016X}  T0:  {:>016X}", { self.a6 }, { self.a7 }, { self.t0 });
++        println!("T1:  {:>016X}  T2:  {:>016X}  T3:  {:>016X}", { self.t1 }, { self.t2 }, { self.t3 });
++        println!("S0:  {:>016X}  S1:  {:>016X}  S2:  {:>016X}", { self.s0 }, { self.s1 }, { self.s2 });
++        println!("S3:  {:>016X}  S4:  {:>016X}  S5:  {:>016X}", { self.s3 }, { self.s4 }, { self.s5 });
++        println!("S6:  {:>016X}  S7:  {:>016X}  T8:  {:>016X}", { self.s6 }, { self.s7 }, { self.t8 });
++        println!("T9:  {:>016X}  GP:  {:>016X}  SP:  {:>016X}", { self.t9 }, { self.gp }, { self.sp });
++        println!("FP:  {:>016X}  RA:  {:>016X}", { self.fp }, { self.ra });
++    }
++}
++
++#[derive(Default)]
++#[repr(C)]
++pub struct IretRegisters {
++    pub epc: u64,
++    pub status: u64,
++    pub cause: u64,
++    pub badvaddr: u64,
++    pub hi: u64,
++    pub lo: u64,
++    /// Keeps the frame a multiple of 16 bytes.
++    pub pad: u64,
++}
++
++impl IretRegisters {
++    pub fn dump(&self) {
++        println!(
++            "EPC: {:>016X}  STATUS: {:>08X}  CAUSE: {:>08X}  BADVADDR: {:>016X}",
++            { self.epc },
++            { self.status },
++            { self.cause },
++            { self.badvaddr }
++        );
++    }
++}
++
++// NOTE: Layout of this structure must be synced with assembly code in exception.rs
++#[derive(Default)]
++#[repr(C)]
++pub struct InterruptStack {
++    pub registers: Registers,
++    pub iret: IretRegisters,
++}
++
++/// Byte size of the trap frame, as the assembly reserves it.
++pub const FRAME_SIZE: usize = 38 * 8;
++
++impl InterruptStack {
++    pub fn init(&mut self) {
++        const {
++            assert!(FRAME_SIZE == size_of::<InterruptStack>());
++            assert!(FRAME_SIZE % 16 == 0);
++        }
++        // Return to user mode with interrupts enabled.
++        self.iret.status = (crate::arch::cp0::status::KSU_USER
++            | crate::arch::cp0::status::EXL
++            | crate::arch::cp0::status::IE
++            | crate::arch::cp0::status::IM7) as u64;
++    }
++    pub fn frame_pointer(&self) -> usize {
++        self.registers.fp as usize
++    }
++    pub fn stack_pointer(&self) -> usize {
++        self.registers.sp as usize
++    }
++    pub fn set_stack_pointer(&mut self, sp: usize) {
++        self.registers.sp = sp as u64;
++    }
++    pub fn set_instr_pointer(&mut self, ip: usize) {
++        self.iret.epc = ip as u64;
++    }
++    pub fn instr_pointer(&self) -> usize {
++        self.iret.epc as usize
++    }
++    pub fn sig_archdep_reg(&self) -> usize {
++        self.registers.t0 as usize
++    }
++
++    pub fn set_syscall_ret_reg(&mut self, ret: usize) {
++        self.registers.v0 = ret as u64;
++    }
++
++    pub fn set_arg1(&mut self, arg_opt: Option<usize>) {
++        if let Some(arg) = arg_opt {
++            self.registers.a1 = arg as u64;
++        }
++    }
++
++    pub fn dump(&self) {
++        self.iret.dump();
++        self.registers.dump();
++    }
++
++    pub fn trace(&self) {
++        self.dump();
++        unsafe {
++            panic::user_stack_trace(&self);
++            panic::stack_trace();
++        }
++    }
++
++    /// Saves all registers to a struct used by the proc:
++    /// scheme to read/write registers.
++    pub fn save(&self, all: &mut IntRegisters) {
++        let r = &self.registers;
++        all.pc = self.iret.epc as usize;
++        all.at = r.at as usize;
++        all.v0 = r.v0 as usize;
++        all.v1 = r.v1 as usize;
++        all.a0 = r.a0 as usize;
++        all.a1 = r.a1 as usize;
++        all.a2 = r.a2 as usize;
++        all.a3 = r.a3 as usize;
++        all.a4 = r.a4 as usize;
++        all.a5 = r.a5 as usize;
++        all.a6 = r.a6 as usize;
++        all.a7 = r.a7 as usize;
++        all.t0 = r.t0 as usize;
++        all.t1 = r.t1 as usize;
++        all.t2 = r.t2 as usize;
++        all.t3 = r.t3 as usize;
++        all.s0 = r.s0 as usize;
++        all.s1 = r.s1 as usize;
++        all.s2 = r.s2 as usize;
++        all.s3 = r.s3 as usize;
++        all.s4 = r.s4 as usize;
++        all.s5 = r.s5 as usize;
++        all.s6 = r.s6 as usize;
++        all.s7 = r.s7 as usize;
++        all.t8 = r.t8 as usize;
++        all.t9 = r.t9 as usize;
++        all.sp = r.sp as usize;
++        all.fp = r.fp as usize;
++        all.ra = r.ra as usize;
++        all.hi = self.iret.hi as usize;
++        all.lo = self.iret.lo as usize;
++    }
++
++    /// Loads all registers from a struct used by the proc:
++    /// scheme to read/write registers.
++    pub fn load(&mut self, all: &IntRegisters) {
++        let r = &mut self.registers;
++        self.iret.epc = all.pc as u64;
++        r.at = all.at as u64;
++        r.v0 = all.v0 as u64;
++        r.v1 = all.v1 as u64;
++        r.a0 = all.a0 as u64;
++        r.a1 = all.a1 as u64;
++        r.a2 = all.a2 as u64;
++        r.a3 = all.a3 as u64;
++        r.a4 = all.a4 as u64;
++        r.a5 = all.a5 as u64;
++        r.a6 = all.a6 as u64;
++        r.a7 = all.a7 as u64;
++        r.t0 = all.t0 as u64;
++        r.t1 = all.t1 as u64;
++        r.t2 = all.t2 as u64;
++        r.t3 = all.t3 as u64;
++        r.s0 = all.s0 as u64;
++        r.s1 = all.s1 as u64;
++        r.s2 = all.s2 as u64;
++        r.s3 = all.s3 as u64;
++        r.s4 = all.s4 as u64;
++        r.s5 = all.s5 as u64;
++        r.s6 = all.s6 as u64;
++        r.s7 = all.s7 as u64;
++        r.t8 = all.t8 as u64;
++        r.t9 = all.t9 as u64;
++        r.sp = all.sp as u64;
++        r.fp = all.fp as u64;
++        r.ra = all.ra as u64;
++        self.iret.hi = all.hi as u64;
++        self.iret.lo = all.lo as u64;
++    }
++
++    //TODO: single step through the Watch registers or a breakpoint at EPC + 4
++    pub fn is_singlestep(&self) -> bool {
++        false
++    }
++    pub fn set_singlestep(&mut self, _singlestep: bool) {}
++}
++
++impl ArchIntCtx for InterruptStack {
++    fn ip(&self) -> usize {
++        self.iret.epc as usize
++    }
++    fn recover_and_efault(&mut self) {
++        // Set the return value to nonzero to indicate usercopy failure (EFAULT), and emulate the
++        // return instruction by setting the return pointer to the saved RA value.
++        self.iret.epc = self.registers.ra;
++        self.registers.v0 = 1;
++    }
++}
++
++/// Store all general registers except `$sp` (kept by the caller) into the
++/// frame at `$sp`, then the CP0 state. Expects `$sp` already lowered by
++/// `FRAME_SIZE`. `$k1` holds the original stack pointer.
++#[macro_export]
++macro_rules! push_registers {
++    () => {
++        "
++    sd      $1, 0($sp)
++    sd      $2, 8($sp)
++    sd      $3, 16($sp)
++    sd      $4, 24($sp)
++    sd      $5, 32($sp)
++    sd      $6, 40($sp)
++    sd      $7, 48($sp)
++    sd      $8, 56($sp)
++    sd      $9, 64($sp)
++    sd      $10, 72($sp)
++    sd      $11, 80($sp)
++    sd      $12, 88($sp)
++    sd      $13, 96($sp)
++    sd      $14, 104($sp)
++    sd      $15, 112($sp)
++    sd      $16, 120($sp)
++    sd      $17, 128($sp)
++    sd      $18, 136($sp)
++    sd      $19, 144($sp)
++    sd      $20, 152($sp)
++    sd      $21, 160($sp)
++    sd      $22, 168($sp)
++    sd      $23, 176($sp)
++    sd      $24, 184($sp)
++    sd      $25, 192($sp)
++    sd      $zero, 200($sp)
++    sd      $zero, 208($sp)
++    sd      $28, 216($sp)
++    sd      $27, 224($sp)
++    sd      $30, 232($sp)
++    sd      $31, 240($sp)
++    dmfc0   $8, $14
++    sd      $8, 248($sp)
++    mfc0    $8, $12
++    sd      $8, 256($sp)
++    mfc0    $8, $13
++    sd      $8, 264($sp)
++    dmfc0   $8, $8
++    sd      $8, 272($sp)
++    mfhi    $8
++    sd      $8, 280($sp)
++    mflo    $8
++    sd      $8, 288($sp)
++    "
++    };
++}
++
++/// Restore CP0 state and every general register from the frame at `$sp`,
++/// loading `$sp` itself last.
++#[macro_export]
++macro_rules! pop_registers {
++    () => {
++        "
++    ld      $8, 280($sp)
++    mthi    $8
++    ld      $8, 288($sp)
++    mtlo    $8
++    ld      $8, 248($sp)
++    dmtc0   $8, $14
++    ld      $8, 256($sp)
++    mtc0    $8, $12
++    nop
++    nop
++    ld      $1, 0($sp)
++    ld      $2, 8($sp)
++    ld      $3, 16($sp)
++    ld      $4, 24($sp)
++    ld      $5, 32($sp)
++    ld      $6, 40($sp)
++    ld      $7, 48($sp)
++    ld      $8, 56($sp)
++    ld      $9, 64($sp)
++    ld      $10, 72($sp)
++    ld      $11, 80($sp)
++    ld      $12, 88($sp)
++    ld      $13, 96($sp)
++    ld      $14, 104($sp)
++    ld      $15, 112($sp)
++    ld      $16, 120($sp)
++    ld      $17, 128($sp)
++    ld      $18, 136($sp)
++    ld      $19, 144($sp)
++    ld      $20, 152($sp)
++    ld      $21, 160($sp)
++    ld      $22, 168($sp)
++    ld      $23, 176($sp)
++    ld      $24, 184($sp)
++    ld      $25, 192($sp)
++    ld      $28, 216($sp)
++    ld      $30, 232($sp)
++    ld      $31, 240($sp)
++    ld      $29, 224($sp)
++    "
++    };
++}
++
++/// Enter user mode for the first time on this context's kernel stack.
++///
++/// Reached from `switch_to_inner` with `$ra` = this function and `$s7` =
++/// the kernel function to run first (`setup_initial_call`). The trap frame
++/// prepared below `Kstack::initial_top` is then restored and `eret` enters
++/// user mode.
++#[unsafe(naked)]
++pub unsafe extern "C" fn enter_usermode() -> ! {
++    core::arch::naked_asm!(
++        "
++        .set noreorder
++        .set noat
++        move    $25, $23
++        jalr    $25
++        nop
++        // Record this context's kernel stack top for the next user trap.
++        la      $8, PERCPU_PTR
++        lw      $8, 0($8)
++        addiu   $9, $sp, {frame_size}
++        sw      $9, 4($8)
++        ",
++        pop_registers!(),
++        "
++        eret
++        nop
++        .set at
++        .set reorder
++        ",
++        frame_size = const FRAME_SIZE,
++    )
++}
+diff --git a/src/arch/mips64/interrupt/irq.rs b/src/arch/mips64/interrupt/irq.rs
+new file mode 100644
+index 00000000..37a8cb29
+--- /dev/null
++++ b/src/arch/mips64/interrupt/irq.rs
+@@ -0,0 +1,19 @@
++//! Device interrupts for the `irq:` scheme.
++//!
++//! The Indy routes device interrupts through the INT3 local interrupt
++//! controller into CP0 IP2/IP3. Until that demultiplexer exists no device
++//! IRQ can be claimed: the iterator is empty and acknowledgements are no-ops.
++
++use crate::cpu_set::LogicalCpuId;
++
++pub unsafe fn acknowledge(_irq: usize) {}
++
++pub fn is_reserved(_cpu_id: LogicalCpuId, _index: u8) -> bool {
++    false
++}
++
++pub fn set_reserved(_cpu_id: LogicalCpuId, _index: u8, _reserved: bool) {}
++
++pub fn available_irqs_iter(_cpu_id: LogicalCpuId) -> impl Iterator<Item = u8> + 'static {
++    0..0
++}
+diff --git a/src/arch/mips64/interrupt/mod.rs b/src/arch/mips64/interrupt/mod.rs
+new file mode 100644
+index 00000000..bd878a28
+--- /dev/null
++++ b/src/arch/mips64/interrupt/mod.rs
+@@ -0,0 +1,47 @@
++use super::cp0;
++
++#[macro_use]
++pub mod handler;
++
++pub mod exception;
++pub mod irq;
++pub mod syscall;
++pub mod trace;
++
++pub use handler::InterruptStack;
++
++/// Clear interrupts
++#[inline(always)]
++pub unsafe fn disable() {
++    unsafe { cp0::write_status(cp0::read_status() & !cp0::status::IE) }
++}
++
++/// Set interrupts and halt
++/// This will atomically wait for the next interrupt
++/// Performing enable followed by halt is not guaranteed to be atomic, use this instead!
++#[inline(always)]
++pub unsafe fn enable_and_halt() {
++    // The R4400 has no wait instruction: enabling interrupts and spinning is
++    // the closest thing. The first interrupt returns here.
++    unsafe {
++        enable_and_nop();
++        core::arch::asm!("nop", "nop", options(nomem, nostack));
++    }
++}
++
++/// Set interrupts and nop
++/// This will enable interrupts and allow the IF flag to be processed
++/// Simply enabling interrupts does not gurantee that they will trigger, use this instead!
++#[inline(always)]
++pub unsafe fn enable_and_nop() {
++    unsafe {
++        cp0::write_status(cp0::read_status() | cp0::status::IE);
++        core::arch::asm!("nop", options(nomem, nostack));
++    }
++}
++
++/// Halt instruction
++#[inline(always)]
++pub unsafe fn halt() {
++    unsafe { core::arch::asm!("nop", options(nomem, nostack)) }
++}
+diff --git a/src/arch/mips64/interrupt/syscall.rs b/src/arch/mips64/interrupt/syscall.rs
+new file mode 100644
+index 00000000..c0639ebb
+--- /dev/null
++++ b/src/arch/mips64/interrupt/syscall.rs
+@@ -0,0 +1,4 @@
++pub use super::handler::enter_usermode;
++
++/// Nothing to program: `syscall` always traps to the general exception vector.
++pub unsafe fn init() {}
+diff --git a/src/arch/mips64/interrupt/trace.rs b/src/arch/mips64/interrupt/trace.rs
+new file mode 100644
+index 00000000..eb852f28
+--- /dev/null
++++ b/src/arch/mips64/interrupt/trace.rs
+@@ -0,0 +1,19 @@
++//! Kernel stack traces. n32 code from LLVM keeps a frame pointer in `$30`
++//! with `frame-pointer = "always"`, but the saved return address offset is not
++//! fixed, so no frame walk is attempted yet: a panic prints the registers only.
++
++pub struct StackTrace {
++    pub fp: usize,
++    pub pc_ptr: *const usize,
++}
++
++impl StackTrace {
++    #[inline(always)]
++    pub unsafe fn start() -> Option<Self> {
++        None
++    }
++
++    pub unsafe fn next(self) -> Option<Self> {
++        None
++    }
++}
+diff --git a/src/arch/mips64/ipi.rs b/src/arch/mips64/ipi.rs
+new file mode 100644
+index 00000000..98ff903a
+--- /dev/null
++++ b/src/arch/mips64/ipi.rs
+@@ -0,0 +1,24 @@
++//! The Indy has one CPU: inter-processor interrupts are no-ops.
++
++#[derive(Clone, Copy, Debug)]
++#[repr(u8)]
++pub enum IpiKind {
++    Wakeup = 0x40,
++    Tlb = 0x41,
++    Switch = 0x42,
++    Pit = 0x43,
++}
++
++#[derive(Clone, Copy, Debug)]
++#[repr(u8)]
++pub enum IpiTarget {
++    Current = 1,
++    All = 2,
++    Other = 3,
++}
++
++#[inline(always)]
++pub fn ipi(_kind: IpiKind, _target: IpiTarget) {}
++
++#[inline(always)]
++pub fn ipi_single(_kind: IpiKind, _target: &crate::percpu::PercpuBlock) {}
+diff --git a/src/arch/mips64/misc.rs b/src/arch/mips64/misc.rs
+new file mode 100644
+index 00000000..cff02765
+--- /dev/null
++++ b/src/arch/mips64/misc.rs
+@@ -0,0 +1,60 @@
++//! Per-CPU block. The R4400 has no thread-pointer register in kernel mode and
++//! the Indy has one CPU, so the block is reached through a static pointer the
++//! exception entry also reads.
++
++use core::cell::SyncUnsafeCell;
++
++use crate::{
++    cpu_set::LogicalCpuId,
++    memory::{RmmA, RmmArch},
++    percpu::PercpuBlock,
++};
++
++#[repr(C)]
++pub struct ArchPercpu {
++    // These fields must be kept first and in this order. Assembly in exception.rs depends on it.
++    pub tmp: usize,
++    /// Kernel stack pointer to load when an exception arrives from user mode:
++    /// the top of the current context's kernel stack.
++    pub kernel_sp: usize,
++
++    pub percpu: PercpuBlock,
++}
++
++/// Address of the single `ArchPercpu`; 0 until `init`.
++#[unsafe(no_mangle)]
++pub static PERCPU_PTR: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
++
++pub fn arch_percpu() -> *mut ArchPercpu {
++    unsafe { PERCPU_PTR.get().read_volatile() as *mut ArchPercpu }
++}
++
++#[cfg(not(test))]
++impl PercpuBlock {
++    pub fn current() -> &'static Self {
++        let ptr = arch_percpu();
++        assert!(!ptr.is_null(), "percpu used before misc::init");
++        unsafe { &(*ptr).percpu }
++    }
++}
++
++#[cold]
++pub unsafe fn init(cpu_id: LogicalCpuId) {
++    unsafe {
++        const {
++            assert!(size_of::<ArchPercpu>() <= crate::memory::PAGE_SIZE);
++        }
++        let must_be_zero = true;
++        let frame =
++            crate::memory::allocate_frame(must_be_zero).expect("failed to allocate percpu memory");
++        let virt = RmmA::phys_to_virt(frame.base()).data() as *mut ArchPercpu;
++
++        virt.write(ArchPercpu {
++            tmp: 0,
++            kernel_sp: 0,
++            percpu: PercpuBlock::init(cpu_id),
++        });
++
++        PERCPU_PTR.get().write_volatile(virt as usize);
++    }
++}
+diff --git a/src/arch/mips64/mod.rs b/src/arch/mips64/mod.rs
+new file mode 100644
+index 00000000..5cd9dc7c
+--- /dev/null
++++ b/src/arch/mips64/mod.rs
+@@ -0,0 +1,91 @@
++//! SGI Indy (IP24): MIPS R4400, n32 kernel with 32-bit addresses, big-endian.
++//!
++//! Address space: useg (0..0x8000_0000) is user and TLB mapped; kseg0
++//! (0x8000_0000) is the cached direct map the kernel runs in; kseg1
++//! (0xA000_0000) is the uncached direct map used for device registers; kseg2
++//! (0xC000_0000) holds TLB-mapped kernel memory: the heap and kernel stacks.
++
++/// Constants like memory locations
++pub mod consts;
++
++/// CP0 register access
++pub mod cp0;
++
++/// Debugging support
++pub mod debug;
++
++/// Devices
++pub mod device;
++
++/// Interrupt instructions
++#[macro_use]
++pub mod interrupt;
++
++/// Inter-processor interrupts (one CPU: no-ops)
++pub mod ipi;
++
++/// Per-CPU data
++pub mod misc;
++
++/// Paging
++pub mod paging;
++
++/// Initialization and start function
++pub mod start;
++
++/// Stop function
++pub mod stop;
++
++pub mod time;
++
++pub use ::rmm::mips::MipsArch as CurrentRmmArch;
++use core::arch::naked_asm;
++
++pub use arch_copy_to_user as arch_copy_from_user;
++
++/// Copy `len` bytes from `src` to `dst`, one of them in userspace. A fault
++/// inside `__usercopy_start..__usercopy_end` is turned into a non-zero
++/// return by the page fault handler (`recover_and_efault`).
++#[unsafe(naked)]
++pub unsafe extern "C" fn arch_copy_to_user(dst: usize, src: usize, len: usize) -> u8 {
++    naked_asm!(
++        "
++        .set noreorder
++    .global __usercopy_start
++    __usercopy_start:
++        beqz    $6, 2f
++        nop
++    1:  lbu     $8, 0($5)
++        addiu   $5, $5, 1
++        addiu   $6, $6, -1
++        sb      $8, 0($4)
++        bnez    $6, 1b
++        addiu   $4, $4, 1
++    2:  jr      $31
++        move    $2, $zero
++    .global __usercopy_end
++    __usercopy_end:
++        .set reorder
++    "
++    )
++}
++
++pub const KFX_SIZE: usize = 512;
++
++// This function exists as the KFX size is dynamic on x86_64.
++pub fn kfx_size() -> usize {
++    KFX_SIZE
++}
++
++#[inline]
++pub fn current_stack_ptr() -> *mut u8 {
++    let ret: *mut u8;
++    unsafe {
++        core::arch::asm!(
++            "move {}, $sp",
++            out(reg) ret,
++            options(nomem, preserves_flags, nostack),
++        );
++    }
++    ret
++}
+diff --git a/src/arch/mips64/paging.rs b/src/arch/mips64/paging.rs
+new file mode 100644
+index 00000000..62d40404
+--- /dev/null
++++ b/src/arch/mips64/paging.rs
+@@ -0,0 +1,15 @@
++//! TLB setup: 4 KiB pages, nothing wired, ASID 0, every entry cleared, and
++//! the exception vectors in place so refills can be served.
++
++use super::cp0;
++
++#[cold]
++pub unsafe fn init() {
++    unsafe {
++        cp0::write_entry_hi(0); // ASID 0
++        rmm::mips::flush_all();
++        super::interrupt::exception::install_vectors();
++        // Vectors live in kseg0 now: leave the PROM's bootstrap vectors.
++        cp0::write_status(cp0::read_status() & !cp0::status::BEV);
++    }
++}
+diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
+new file mode 100644
+index 00000000..f53c0cd7
+--- /dev/null
++++ b/src/arch/mips64/start.rs
+@@ -0,0 +1,253 @@
++//! Kernel entry from the SGI PROM.
++//!
++//! `boot -f bootp()redox` loads the ECOFF image at kseg0 0x8804_0000 and
++//! jumps to `kstart` with ARCS arguments in `$a0`..`$a2`, caches on, TLB
++//! unused by us, interrupts off and `Status.BEV` set. There is no bootloader
++//! and no `KernelArgs`, so `kstart` builds them: the kernel's own extent from
++//! linker symbols, one memory area sized from the memory controller, an empty
++//! environment and no bootstrap image yet.
++
++use core::{arch::naked_asm, cell::SyncUnsafeCell};
++
++use crate::{
++    allocator,
++    arch::{consts, cp0, device, paging},
++    context::context::Kstack,
++    devices::graphical_debug,
++    startup::{memory::BootloaderMemoryKind, KernelArgs},
++};
++
++#[repr(C, align(16))]
++struct StackAlign<T>(T);
++
++/// Boot stack, page aligned so it can be registered with the memory map.
++#[repr(C, align(4096))]
++struct PageAlign<T>(T);
++
++const STACK_SIZE: usize = 64 * 1024;
++static STACK: SyncUnsafeCell<PageAlign<[u8; STACK_SIZE]>> =
++    SyncUnsafeCell::new(PageAlign([0; STACK_SIZE]));
++
++/// Matches `BootloaderMemoryEntry` in startup::memory.
++#[repr(C, packed(8))]
++struct AreaEntry {
++    base: u64,
++    size: u64,
++    kind: BootloaderMemoryKind,
++}
++
++static AREAS: SyncUnsafeCell<[AreaEntry; 2]> = SyncUnsafeCell::new([
++    AreaEntry {
++        base: 0,
++        size: 0,
++        kind: BootloaderMemoryKind::Null,
++    },
++    AreaEntry {
++        base: 0,
++        size: 0,
++        kind: BootloaderMemoryKind::Null,
++    },
++]);
++
++unsafe extern "C" {
++    static __bss_start: u8;
++    static __bss_end: u8;
++    static __end: u8;
++}
++
++// FIXME use extern "custom"
++#[unsafe(naked)]
++#[unsafe(no_mangle)]
++#[unsafe(link_section = ".text.kstart")]
++extern "C" fn kstart() {
++    naked_asm!(
++        "
++        .set noreorder
++        .set noat
++        // Kernel mode, interrupts off, 32-bit addressing, keep BEV until the
++        // vectors are installed.
++        li      $8, {status}
++        mtc0    $8, $12
++        nop
++        nop
++        move    $28, $zero
++
++        la      $sp, {stack}
++        li      $8, {stack_size}
++        addu    $sp, $sp, $8
++        addiu   $sp, $sp, -16
++
++        la      $8, __bss_start
++        la      $9, __bss_end
++    1:
++        sltu    $10, $8, $9
++        beqz    $10, 2f
++        nop
++        sw      $zero, 0($8)
++        b       1b
++        addiu   $8, $8, 4
++    2:
++        la      $25, {start}
++        jalr    $25
++        nop
++    3:
++        b       3b
++        nop
++        .set at
++        .set reorder
++        ",
++        status = const cp0::status::BEV,
++        stack = sym STACK,
++        stack_size = const STACK_SIZE,
++        start = sym start,
++    );
++}
++
++/// Bytes of DRAM the PROM mapped contiguously from `RAM_PHYS_BASE`.
++///
++/// `MEMCFG0`/`MEMCFG1` each hold two 16-bit bank fields: bit 13 valid, bits
++/// 12..8 size in units minus one, bits 7..0 base in units. The unit is 4 MiB
++/// below memory controller revision 5 and 16 MiB from revision 5.
++fn ram_bytes() -> usize {
++    const MC_SYSID: *const u32 = 0xBFA0_001C as *const u32;
++    const MC_MEMCFG0: *const u32 = 0xBFA0_00C4 as *const u32;
++    const MC_MEMCFG1: *const u32 = 0xBFA0_00CC as *const u32;
++    let (sysid, cfg0, cfg1) = unsafe {
++        (
++            MC_SYSID.read_volatile(),
++            MC_MEMCFG0.read_volatile(),
++            MC_MEMCFG1.read_volatile(),
++        )
++    };
++    let shift = if sysid & 0x0f >= 5 { 24 } else { 22 };
++    let mut end = consts::RAM_PHYS_BASE as u64;
++    let fields = [cfg0 >> 16, cfg0 & 0xffff, cfg1 >> 16, cfg1 & 0xffff];
++    for _ in 0..fields.len() {
++        for field in fields {
++            if field & 0x2000 == 0 {
++                continue;
++            }
++            let base = ((field & 0xff) as u64) << shift;
++            let size = ((((field >> 8) & 0x1f) + 1) as u64) << shift;
++            if base <= end && base + size > end {
++                end = base + size;
++            }
++        }
++    }
++    (end - consts::RAM_PHYS_BASE as u64) as usize
++}
++
++/// The entry to Rust, all things must be initialized
++unsafe extern "C" fn start() -> ! {
++    unsafe {
++        // Set up serial debug
++        device::serial::init();
++
++        info!("Redox OS starting...");
++
++        // TLB cleared, exception vectors in kseg0, BEV off: from here a kernel
++        // fault prints its registers instead of vanishing into the PROM.
++        paging::init();
++        info!("Indy: exception vectors installed, TLB cleared");
++
++        let ram = ram_bytes();
++        let kernel_base = consts::RAM_PHYS_BASE + consts::LOW_RESERVED_BYTES;
++        let kernel_end_virt = &raw const __end as usize;
++        let kernel_size = kernel_end_virt - crate::kernel_executable_offsets::KERNEL_OFFSET();
++        info!(
++            "Indy: {} MiB RAM at {:#x}, kernel {:#x}+{:#x}, bss {:#x}..{:#x}",
++            ram >> 20,
++            consts::RAM_PHYS_BASE,
++            kernel_base,
++            kernel_size,
++            &raw const __bss_start as usize,
++            &raw const __bss_end as usize,
++        );
++
++        let areas = &mut *AREAS.get();
++        areas[0] = AreaEntry {
++            base: consts::RAM_PHYS_BASE as u64,
++            size: consts::LOW_RESERVED_BYTES as u64,
++            kind: BootloaderMemoryKind::Reserved,
++        };
++        areas[1] = AreaEntry {
++            base: kernel_base as u64,
++            size: (ram - consts::LOW_RESERVED_BYTES) as u64,
++            kind: BootloaderMemoryKind::Free,
++        };
++
++        let stack_base = STACK.get() as usize - PHYS_OFFSET;
++        let args = KernelArgs {
++            kernel_base: kernel_base as u64,
++            kernel_size: kernel_size as u64,
++            stack_base: stack_base as u64,
++            stack_size: STACK_SIZE as u64,
++            env_base: 0,
++            env_size: 0,
++            hwdesc_base: 0,
++            hwdesc_size: 0,
++            // Read directly, not through phys_to_virt: give the kseg0 address.
++            areas_base: AREAS.get() as usize as u64,
++            areas_size: size_of::<[AreaEntry; 2]>() as u64,
++            // No initfs yet: the kernel stops when it looks for one.
++            bootstrap_base: 0,
++            bootstrap_size: 0,
++        };
++        let args = &args;
++
++        graphical_debug::init(args.env());
++        args.print();
++
++        // Initialize RMM
++        let mut bump_allocator = crate::startup::memory::init(args, None, None);
++        info!("Indy: frame allocator ready");
++
++        crate::memory::init_mm(&mut bump_allocator);
++
++        crate::arch::misc::init(crate::cpu_set::LogicalCpuId::new(0));
++        info!(
++            "Indy: percpu block at {:#x}",
++            crate::arch::misc::arch_percpu() as usize
++        );
++
++        // Setup kernel heap (TLB-mapped kseg2: the first refills happen here)
++        allocator::init();
++        info!("Indy: kernel heap mapped at {:#x}", crate::kernel_heap_offset());
++
++        // Activate memory logging
++        crate::log::init();
++
++        // Initialize devices
++        device::init();
++
++        // Initialize all of the non-core devices not otherwise needed to complete initialization
++        device::init_noncore();
++
++        // T5 accounting: what the machine gave and what boot took.
++        info!(
++            "Indy: ram {} KiB, low reserved {} KiB, kernel image {} KiB, free after boot {} KiB ({} frames)",
++            ram >> 10,
++            consts::LOW_RESERVED_BYTES >> 10,
++            kernel_size >> 10,
++            (crate::memory::free_frames() * crate::memory::PAGE_SIZE) >> 10,
++            crate::memory::free_frames(),
++        );
++
++        if args.bootstrap_size == 0 {
++            info!("Indy: no initfs in the image, stopping");
++            loop {
++                super::interrupt::disable();
++                super::interrupt::halt();
++            }
++        }
++
++        let bootstrap = args.bootstrap();
++
++        crate::startup::kmain(
++            bootstrap,
++            Kstack::new(None).expect("failed to allocate stack"),
++        );
++    }
++}
++
++const PHYS_OFFSET: usize = <crate::arch::CurrentRmmArch as rmm::Arch>::PHYS_OFFSET;
+diff --git a/src/arch/mips64/stop.rs b/src/arch/mips64/stop.rs
+new file mode 100644
+index 00000000..7614c259
+--- /dev/null
++++ b/src/arch/mips64/stop.rs
+@@ -0,0 +1,30 @@
++use crate::sync::CleanLockToken;
++
++/// Jump to the PROM's reset entry. The PROM re-sizes memory and shows its
++/// menu again, so this is a warm reboot.
++pub unsafe fn kreset() -> ! {
++    println!("kreset");
++    unsafe { emergency_reset() }
++}
++
++pub unsafe fn emergency_reset() -> ! {
++    unsafe {
++        core::arch::asm!(
++            "li $8, 0xBFC00000",
++            "jr $8",
++            "nop",
++            options(noreturn, nostack)
++        );
++    }
++}
++
++pub unsafe fn kstop(_token: &mut CleanLockToken) -> ! {
++    // TODO: soft power off through the DS1386 / IOC2 power control register.
++    println!("kstop: halting");
++    loop {
++        unsafe {
++            super::interrupt::disable();
++            super::interrupt::halt();
++        }
++    }
++}
+diff --git a/src/arch/mips64/time.rs b/src/arch/mips64/time.rs
+new file mode 100644
+index 00000000..58685027
+--- /dev/null
++++ b/src/arch/mips64/time.rs
+@@ -0,0 +1,61 @@
++//! Monotonic time from CP0 Count.
++//!
++//! Count runs at half the pipeline clock on the R4400. The emulator's default
++//! is 33 MHz; a real Indy must be calibrated against the IOC's 8254 at boot.
++//! Until that calibration exists the frequency is a constant.
++
++use core::sync::atomic::{AtomicU64, Ordering};
++
++use super::cp0;
++use crate::sync::CleanLockToken;
++
++/// CP0 Count increments per second.
++pub const COUNT_HZ: u64 = 33_000_000;
++
++/// Scheduler tick rate.
++pub const TICKS_PER_SECOND: u64 = 100;
++pub const COUNTS_PER_TICK: u32 = (COUNT_HZ / TICKS_PER_SECOND) as u32;
++
++/// Count value extended to 64 bits across wraps by the timer interrupt.
++static COUNT_HIGH: AtomicU64 = AtomicU64::new(0);
++static LAST_COUNT: AtomicU64 = AtomicU64::new(0);
++
++/// Called from the timer interrupt: track Count wrap-around and arm the next tick.
++pub fn tick() {
++    let now = cp0::read_count() as u64;
++    let last = LAST_COUNT.load(Ordering::Relaxed);
++    if now < last {
++        COUNT_HIGH.fetch_add(1 << 32, Ordering::Relaxed);
++    }
++    LAST_COUNT.store(now, Ordering::Relaxed);
++    unsafe {
++        cp0::write_compare(cp0::read_compare().wrapping_add(COUNTS_PER_TICK));
++    }
++}
++
++/// Start the Count/Compare timer and unmask IP7.
++pub unsafe fn init() {
++    unsafe {
++        cp0::write_count(0);
++        cp0::write_compare(COUNTS_PER_TICK);
++        LAST_COUNT.store(0, Ordering::Relaxed);
++        cp0::write_status(cp0::read_status() | cp0::status::IM7);
++    }
++}
++
++fn count64() -> u64 {
++    let now = cp0::read_count() as u64;
++    let mut high = COUNT_HIGH.load(Ordering::Relaxed);
++    if now < LAST_COUNT.load(Ordering::Relaxed) {
++        high += 1 << 32;
++    }
++    high | now
++}
++
++pub fn monotonic_absolute(_token: &mut CleanLockToken) -> u128 {
++    count64() as u128 * 1_000_000_000u128 / COUNT_HZ as u128
++}
++
++pub fn monotonic_resolution() -> u128 {
++    1_000_000_000u128 / COUNT_HZ as u128
++}
+diff --git a/src/arch/mod.rs b/src/arch/mod.rs
+index 2aae6399..e5791c1e 100644
+--- a/src/arch/mod.rs
++++ b/src/arch/mod.rs
+@@ -25,3 +25,9 @@ mod x86_shared;
+ pub mod riscv64;
+ #[cfg(target_arch = "riscv64")]
+ pub use self::riscv64::*;
++
++#[cfg(target_arch = "mips64")]
++#[macro_use]
++pub mod mips64;
++#[cfg(target_arch = "mips64")]
++pub use self::mips64::*;
+diff --git a/src/context/arch/mips64.rs b/src/context/arch/mips64.rs
+new file mode 100644
+index 00000000..11c452ed
+--- /dev/null
++++ b/src/context/arch/mips64.rs
+@@ -0,0 +1,216 @@
++use crate::{
++    arch::interrupt::InterruptStack, context::context::Kstack, memory::RmmA, percpu::PercpuBlock,
++    syscall::FloatRegisters,
++};
++use core::{mem::offset_of, sync::atomic::AtomicBool};
++use rmm::{Arch, VirtualAddress};
++use spin::Once;
++use syscall::{error::*, EnvRegisters};
++
++pub const KFX_ALIGN: usize = 16;
++
++/// Callee-saved state of a context that is not running. Registers are 64
++/// bits on the R4400 even though n32 pointers are 32.
++#[derive(Clone, Debug, Default)]
++#[repr(C)]
++pub struct Context {
++    sp: u64,
++    ra: u64,
++    fp: u64,
++    gp: u64,
++    s0: u64,
++    s1: u64,
++    s2: u64,
++    s3: u64,
++    s4: u64,
++    s5: u64,
++    s6: u64,
++    s7: u64,
++    status: u64,
++}
++
++impl Context {
++    pub fn new() -> Self {
++        Self {
++            // Kernel mode, timer unmasked, interrupts off until the context
++            // enables them itself (run_userspace) or returns to user mode.
++            status: crate::arch::cp0::status::IM7 as u64,
++            ..Self::default()
++        }
++    }
++
++    fn set_stack(&mut self, address: usize) {
++        self.sp = address as u64;
++    }
++
++    fn set_ra(&mut self, address: usize) {
++        self.ra = address as u64;
++    }
++
++    fn set_s7(&mut self, address: usize) {
++        self.s7 = address as u64;
++    }
++
++    pub(crate) fn setup_initial_call(
++        &mut self,
++        stack: &Kstack,
++        func: extern "C" fn(),
++        userspace_allowed: bool,
++    ) {
++        let mut stack_top = stack.initial_top();
++
++        const INT_REGS_SIZE: usize = size_of::<InterruptStack>();
++
++        if userspace_allowed {
++            unsafe {
++                // Zero-initialize InterruptStack registers.
++                stack_top = stack_top.sub(INT_REGS_SIZE);
++                stack_top.write_bytes(0_u8, INT_REGS_SIZE);
++                (&mut *stack_top.cast::<InterruptStack>()).init();
++            }
++        }
++
++        self.set_ra(crate::arch::interrupt::syscall::enter_usermode as usize);
++        self.set_s7(func as usize);
++
++        self.set_stack(stack_top as usize);
++    }
++}
++
++impl super::Context {
++    pub fn get_fx_regs(&self) -> FloatRegisters {
++        // TODO: the FPU is disabled (Status.CU1 = 0); userspace is soft float.
++        FloatRegisters::default()
++    }
++
++    pub fn set_fx_regs(&mut self, _new: FloatRegisters) {}
++
++    pub fn current_syscall(&self) -> Option<[usize; 7]> {
++        if !self.inside_syscall {
++            return None;
++        }
++        let regs = self.regs()?;
++        let r = &regs.registers;
++        Some([
++            r.v0 as usize,
++            r.a0 as usize,
++            r.a1 as usize,
++            r.a2 as usize,
++            r.a3 as usize,
++            r.a4 as usize,
++            r.a5 as usize,
++        ])
++    }
++
++    pub(crate) fn write_current_env_regs(&mut self, regs: EnvRegisters) -> Result<()> {
++        self.write_env_regs(regs)
++    }
++
++    pub(crate) fn write_env_regs(&mut self, regs: EnvRegisters) -> Result<()> {
++        if RmmA::virt_is_valid(VirtualAddress::new(regs.tp)) {
++            match self.regs_mut() {
++                Some(stack) => {
++                    stack.registers.gp = regs.tp as u64;
++                    Ok(())
++                }
++                None => Err(Error::new(ESRCH)),
++            }
++        } else {
++            Err(Error::new(EINVAL))
++        }
++    }
++
++    pub(crate) fn read_current_env_regs(&self) -> Result<EnvRegisters> {
++        self.read_env_regs()
++    }
++
++    pub(crate) fn read_env_regs(&self) -> Result<EnvRegisters> {
++        match self.regs() {
++            Some(stack) => Ok(EnvRegisters {
++                tp: stack.registers.gp as usize,
++            }),
++            None => Err(Error::new(ESRCH)),
++        }
++    }
++    pub fn set_userspace_io_allowed(&mut self, _allowed: bool) {}
++}
++
++pub static EMPTY_CR3: Once<rmm::PhysicalAddress> = Once::new();
++
++// SAFETY: EMPTY_CR3 must be initialized.
++pub unsafe fn empty_cr3() -> rmm::PhysicalAddress {
++    unsafe {
++        debug_assert!(EMPTY_CR3.poll().is_some());
++        *EMPTY_CR3.get_unchecked()
++    }
++}
++
++/// Switch to the next context by restoring its stack and registers
++pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
++    unsafe {
++        PercpuBlock::current()
++            .new_addrsp_tmp
++            .set(next.addr_space.clone());
++
++        switch_to_inner(&mut prev.arch, &mut next.arch);
++    }
++}
++
++#[unsafe(naked)]
++unsafe extern "C" fn switch_to_inner(prev: &mut Context, next: &mut Context) {
++    core::arch::naked_asm!(r#"
++        .set noreorder
++        sd      $16, {off_s0}($4)
++        ld      $16, {off_s0}($5)
++        sd      $17, {off_s1}($4)
++        ld      $17, {off_s1}($5)
++        sd      $18, {off_s2}($4)
++        ld      $18, {off_s2}($5)
++        sd      $19, {off_s3}($4)
++        ld      $19, {off_s3}($5)
++        sd      $20, {off_s4}($4)
++        ld      $20, {off_s4}($5)
++        sd      $21, {off_s5}($4)
++        ld      $21, {off_s5}($5)
++        sd      $22, {off_s6}($4)
++        ld      $22, {off_s6}($5)
++        sd      $23, {off_s7}($4)
++        ld      $23, {off_s7}($5)
++        sd      $28, {off_gp}($4)
++        ld      $28, {off_gp}($5)
++        sd      $30, {off_fp}($4)
++        ld      $30, {off_fp}($5)
++        sd      $29, {off_sp}($4)
++        ld      $29, {off_sp}($5)
++        sd      $31, {off_ra}($4)
++        ld      $31, {off_ra}($5)
++
++        mfc0    $8, $12
++        sd      $8, {off_status}($4)
++        ld      $8, {off_status}($5)
++        mtc0    $8, $12
++        nop
++        nop
++
++        la      $25, {switch_hook}
++        jr      $25
++        nop
++        .set reorder
++        "#,
++        off_s0 = const(offset_of!(Context, s0)),
++        off_s1 = const(offset_of!(Context, s1)),
++        off_s2 = const(offset_of!(Context, s2)),
++        off_s3 = const(offset_of!(Context, s3)),
++        off_s4 = const(offset_of!(Context, s4)),
++        off_s5 = const(offset_of!(Context, s5)),
++        off_s6 = const(offset_of!(Context, s6)),
++        off_s7 = const(offset_of!(Context, s7)),
++        off_gp = const(offset_of!(Context, gp)),
++        off_fp = const(offset_of!(Context, fp)),
++        off_sp = const(offset_of!(Context, sp)),
++        off_ra = const(offset_of!(Context, ra)),
++        off_status = const(offset_of!(Context, status)),
++
++        switch_hook = sym crate::context::switch_finish_hook,
++    );
++}
+diff --git a/src/context/mod.rs b/src/context/mod.rs
+index 13fe2c9c..3fdee977 100644
+--- a/src/context/mod.rs
++++ b/src/context/mod.rs
+@@ -47,6 +47,10 @@ mod arch;
+ #[path = "arch/riscv64.rs"]
+ mod arch;
+ 
++#[cfg(target_arch = "mips64")]
++#[path = "arch/mips64.rs"]
++mod arch;
++
+ /// Context struct
+ pub mod context;
+ 
+diff --git a/src/devices/mod.rs b/src/devices/mod.rs
+index dc475689..d1a3104b 100644
+--- a/src/devices/mod.rs
++++ b/src/devices/mod.rs
+@@ -4,3 +4,5 @@ pub mod serial;
+ pub mod uart_16550;
+ pub mod uart_meson;
+ pub mod uart_pl011;
++#[cfg(target_arch = "mips64")]
++pub mod uart_z85c30;
+diff --git a/src/devices/serial.rs b/src/devices/serial.rs
+index 1b3435dc..8e0ad399 100644
+--- a/src/devices/serial.rs
++++ b/src/devices/serial.rs
+@@ -2,6 +2,8 @@ use syscall::MmioPtr;
+ #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+ use syscall::Pio;
+ 
++#[cfg(target_arch = "mips64")]
++use crate::devices::uart_z85c30;
+ use crate::{
+     devices::{uart_16550, uart_meson, uart_pl011},
+     scheme::debug::{debug_input, debug_notify},
+@@ -17,6 +19,8 @@ pub enum SerialKind {
+     Ns16550u32(uart_16550::SerialPort<MmioPtr<u32>>),
+     Meson(uart_meson::SerialPort),
+     Pl011(uart_pl011::SerialPort),
++    #[cfg(target_arch = "mips64")]
++    Z85c30(uart_z85c30::SerialPort),
+ }
+ 
+ impl SerialKind {
+@@ -68,6 +72,13 @@ impl SerialKind {
+             }
+             Self::Meson(inner) => inner.receive(token),
+             Self::Pl011(inner) => inner.receive(token),
++            #[cfg(target_arch = "mips64")]
++            Self::Z85c30(inner) => {
++                while let Some(c) = inner.receive() {
++                    debug_input(c, token);
++                }
++                debug_notify(token);
++            }
+         }
+     }
+ 
+@@ -80,6 +91,8 @@ impl SerialKind {
+             Self::Ns16550u32(inner) => inner.write(buf),
+             Self::Meson(inner) => inner.write(buf),
+             Self::Pl011(inner) => inner.write(buf),
++            #[cfg(target_arch = "mips64")]
++            Self::Z85c30(inner) => inner.write(buf),
+         }
+     }
+ }
+diff --git a/src/devices/uart_z85c30.rs b/src/devices/uart_z85c30.rs
+new file mode 100644
+index 00000000..75bc3dc0
+--- /dev/null
++++ b/src/devices/uart_z85c30.rs
+@@ -0,0 +1,86 @@
++//! Zilog Z85C30 ESCC inside the SGI Indy's IOC2, polled.
++//!
++//! Registers are indirect: write the register number to the control port,
++//! then the value to the same port. The data register has its own port.
++//! Channel B is the Indy's rear-panel "Serial Port 1" (the PROM's `serial0`).
++
++use core::ptr::{read_volatile, write_volatile};
++
++/// RR0 bit 0: a received character is available.
++const RR0_RX_AVAILABLE: u8 = 0x01;
++/// RR0 bit 2: the transmit buffer is empty.
++const RR0_TX_EMPTY: u8 = 0x04;
++
++/// 9600 baud from the 3.672 MHz PCLK in x16 clock mode:
++/// baud = PCLK / (2 * 16 * (tc + 2)); tc = 10 gives 9562.
++const BAUD_9600_TIME_CONSTANT: u8 = 10;
++
++pub struct SerialPort {
++    control: *mut u8,
++    data: *mut u8,
++}
++
++// The port is only ever reached through the COM1 mutex.
++unsafe impl Send for SerialPort {}
++
++impl SerialPort {
++    /// `control` is the kseg1 address of the channel's control port; the data
++    /// port is the next word (same byte lane).
++    pub const unsafe fn new(control: usize) -> Self {
++        Self {
++            control: control as *mut u8,
++            data: (control + 4) as *mut u8,
++        }
++    }
++
++    fn write_reg(&mut self, reg: u8, value: u8) {
++        unsafe {
++            write_volatile(self.control, reg);
++            write_volatile(self.control, value);
++        }
++    }
++
++    fn rr0(&self) -> u8 {
++        unsafe { read_volatile(self.control) }
++    }
++
++    /// 9600 8N1, no interrupts, DTR and RTS asserted.
++    pub fn init(&mut self) {
++        self.write_reg(9, 0x40); // channel reset B
++        self.write_reg(4, 0x44); // x16 clock, 1 stop bit, no parity
++        self.write_reg(3, 0xc0); // rx 8 bits per character, receiver off
++        self.write_reg(5, 0x60); // tx 8 bits per character, transmitter off
++        self.write_reg(9, 0x00); // no interrupts
++        self.write_reg(11, 0x50); // tx and rx clocks from the baud rate generator
++        self.write_reg(12, BAUD_9600_TIME_CONSTANT);
++        self.write_reg(13, 0x00);
++        self.write_reg(14, 0x02); // baud rate generator source PCLK
++        self.write_reg(14, 0x03); // baud rate generator on
++        self.write_reg(3, 0xc1); // receiver on
++        self.write_reg(5, 0xea); // DTR, tx 8 bits, transmitter on, RTS
++    }
++
++    pub fn receive(&mut self) -> Option<u8> {
++        if self.rr0() & RR0_RX_AVAILABLE != 0 {
++            Some(unsafe { read_volatile(self.data) })
++        } else {
++            None
++        }
++    }
++
++    pub fn send(&mut self, byte: u8) {
++        while self.rr0() & RR0_TX_EMPTY == 0 {
++            core::hint::spin_loop();
++        }
++        unsafe { write_volatile(self.data, byte) }
++    }
++
++    pub fn write(&mut self, buf: &[u8]) {
++        for &byte in buf {
++            if byte == b'\n' {
++                self.send(b'\r');
++            }
++            self.send(byte);
++        }
++    }
++}
+diff --git a/src/macros.rs b/src/macros.rs
+index 2f81a3cb..34a5abd9 100644
+--- a/src/macros.rs
++++ b/src/macros.rs
+@@ -40,7 +40,7 @@ macro_rules! info {
+ #[macro_export]
+ macro_rules! debug {
+     ($($arg:tt)*) => {
+-        if cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {
++        if cfg!(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "mips64")) {
+             println!("{}:DEBUG -- {}", core::module_path!(), format_args!($($arg)*));
+         }
+     };
+diff --git a/src/main.rs b/src/main.rs
+index a29621fa..3f05f23d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -4,6 +4,7 @@
+ //! provides Unix-like syscalls for primarily Rust applications
+ 
+ #![feature(int_roundings)]
++#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
+ #![cfg_attr(dtb, feature(iter_next_chunk))]
+ #![feature(sync_unsafe_cell)]
+ #![feature(btree_cursors)]
+diff --git a/src/panic.rs b/src/panic.rs
+index ded62e62..45143468 100644
+--- a/src/panic.rs
++++ b/src/panic.rs
+@@ -83,6 +83,21 @@ pub unsafe fn stack_trace() {
+         let mapper = KernelMapper::lock_ro();
+ 
+         let kernel_ptr = crate::kernel_executable_offsets::KERNEL_OFFSET() as *const u8;
++        // A firmware that loads the kernel as a flat image (the SGI PROM
++        // loads ECOFF) leaves no ELF header to read symbols from.
++        if slice::from_raw_parts(kernel_ptr, 4) != elf::ELFMAG {
++            println!("TRACE: no ELF header at KERNEL_OFFSET, no symbols");
++            let mut frame = StackTrace::start();
++            for _ in 0..64 {
++                if let Some(frame_) = frame {
++                    println!("  {:>016x}", *frame_.pc_ptr);
++                    frame = frame_.next();
++                } else {
++                    break;
++                }
++            }
++            return;
++        }
+         let elf_header: &FileHeader<NativeEndian> = object::pod::from_bytes(slice::from_raw_parts(
+             kernel_ptr,
+             size_of::<FileHeader<NativeEndian>>(),
+diff --git a/src/scheme/irq.rs b/src/scheme/irq.rs
+index daedb374..94fcfbe3 100644
+--- a/src/scheme/irq.rs
++++ b/src/scheme/irq.rs
+@@ -24,6 +24,8 @@ use super::{CallerCtx, HandleMap, OpenResult, SchemeExt, StrOrBytes};
+ use crate::arch::interrupt::{available_irqs_iter, irq::acknowledge, is_reserved, set_reserved};
+ #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+ use crate::dtb::irqchip::{acknowledge, available_irqs_iter, is_reserved, set_reserved, IRQ_CHIP};
++#[cfg(target_arch = "mips64")]
++use crate::arch::interrupt::irq::{acknowledge, available_irqs_iter, is_reserved, set_reserved};
+ use crate::{
+     cpu_set::LogicalCpuId,
+     event,
+diff --git a/src/scheme/proc.rs b/src/scheme/proc.rs
+index cba8ebf5..21db148f 100644
+--- a/src/scheme/proc.rs
++++ b/src/scheme/proc.rs
+@@ -457,7 +457,8 @@ impl KernelScheme for ProcScheme {
+                     #[cfg(any(
+                         target_arch = "x86_64",
+                         target_arch = "aarch64",
+-                        target_arch = "riscv64"
++                        target_arch = "riscv64",
++                        target_arch = "mips64"
+                     ))]
+                     regs.set_arg1(arg1);
+ 
+diff --git a/src/startup/mod.rs b/src/startup/mod.rs
+index 2cbdd332..8c61c5cf 100644
+--- a/src/startup/mod.rs
++++ b/src/startup/mod.rs
+@@ -19,14 +19,14 @@ pub mod memory;
+ 
+ #[repr(C, packed(8))]
+ pub(crate) struct KernelArgs {
+-    kernel_base: u64,
+-    kernel_size: u64,
++    pub(crate) kernel_base: u64,
++    pub(crate) kernel_size: u64,
+ 
+-    stack_base: u64,
+-    stack_size: u64,
++    pub(crate) stack_base: u64,
++    pub(crate) stack_size: u64,
+ 
+-    env_base: u64,
+-    env_size: u64,
++    pub(crate) env_base: u64,
++    pub(crate) env_size: u64,
+ 
+     /// The base pointer to the saved RSDP or device tree blob.
+     ///
+@@ -39,13 +39,13 @@ pub(crate) struct KernelArgs {
+     pub(crate) hwdesc_base: u64,
+     pub(crate) hwdesc_size: u64,
+ 
+-    areas_base: u64,
+-    areas_size: u64,
++    pub(crate) areas_base: u64,
++    pub(crate) areas_size: u64,
+ 
+     /// The physical base 64-bit pointer to the contiguous bootstrap/initfs.
+-    bootstrap_base: u64,
++    pub(crate) bootstrap_base: u64,
+     /// Size of contiguous bootstrap/initfs physical region, not necessarily page aligned.
+-    bootstrap_size: u64,
++    pub(crate) bootstrap_size: u64,
+ }
+ 
+ impl KernelArgs {
+diff --git a/syscall/src/arch/mips64.rs b/syscall/src/arch/mips64.rs
+new file mode 100644
+index 00000000..052b03cb
+--- /dev/null
++++ b/syscall/src/arch/mips64.rs
+@@ -0,0 +1,232 @@
++//! MIPS n32 (SGI Indy) system call ABI.
++//!
++//! Number in `$v0`, arguments in `$a0`..`$a5`, the demultiplexed result in
++//! `$v0`. The `syscall` instruction traps; the kernel skips it on return.
++//! The thread pointer lives in `$gp` (`$28`): the kernel and libc are static
++//! and use no GOT, so the register is free for TLS, which is the layout the
++//! n32 libc work on this machine already uses.
++
++use core::{
++    mem,
++    ops::{Deref, DerefMut},
++    slice,
++};
++
++#[cfg(feature = "userspace")]
++use core::arch::asm;
++
++use super::error::{Error, Result};
++
++pub const PAGE_SIZE: usize = 4096;
++/// Size of the metadata region used to transfer information from the kernel to the bootstrapper.
++pub const KERNEL_METADATA_SIZE: usize = 4 * PAGE_SIZE;
++
++#[cfg(feature = "userspace")]
++macro_rules! syscall {
++    ($($name:ident($a:ident, $($b:ident, $($c:ident, $($d:ident, $($e:ident, $($f:ident, $($g:ident, )?)?)?)?)?)?);)+) => {
++        $(
++            pub unsafe fn $name(mut $a: usize, $($b: usize, $($c: usize, $($d: usize, $($e: usize, $($f: usize, $($g: usize)?)?)?)?)?)?) -> Result<usize> {
++                asm!(
++                    "syscall",
++                    inout("$2") $a,
++                    $(
++                        in("$4") $b,
++                        $(
++                            in("$5") $c,
++                            $(
++                                in("$6") $d,
++                                $(
++                                    in("$7") $e,
++                                    $(
++                                        in("$8") $f,
++                                        $(
++                                            in("$9") $g,
++                                        )?
++                                    )?
++                                )?
++                            )?
++                        )?
++                    )?
++                    lateout("$3") _,
++                    options(nostack),
++                );
++
++                Error::demux($a)
++            }
++        )+
++    };
++}
++
++#[cfg(feature = "userspace")]
++syscall! {
++    syscall0(a,);
++    syscall1(a, b,);
++    syscall2(a, b, c,);
++    syscall3(a, b, c, d,);
++    syscall4(a, b, c, d, e,);
++    syscall5(a, b, c, d, e, f,);
++    syscall6(a, b, c, d, e, f, g,);
++}
++
++/// General registers as the `proc:` scheme reads and writes them. Register
++/// values are 64 bits wide on the R4400; this view keeps the low 32 bits.
++#[derive(Copy, Clone, Debug, Default)]
++#[repr(C)]
++pub struct IntRegisters {
++    pub pc: usize,
++    pub at: usize,
++    pub v0: usize,
++    pub v1: usize,
++    pub a0: usize,
++    pub a1: usize,
++    pub a2: usize,
++    pub a3: usize,
++    pub a4: usize,
++    pub a5: usize,
++    pub a6: usize,
++    pub a7: usize,
++    pub t0: usize,
++    pub t1: usize,
++    pub t2: usize,
++    pub t3: usize,
++    pub s0: usize,
++    pub s1: usize,
++    pub s2: usize,
++    pub s3: usize,
++    pub s4: usize,
++    pub s5: usize,
++    pub s6: usize,
++    pub s7: usize,
++    pub t8: usize,
++    pub t9: usize,
++    // gp ($28) is the thread pointer and lives in EnvRegisters
++    pub sp: usize,
++    pub fp: usize,
++    pub ra: usize,
++    pub hi: usize,
++    pub lo: usize,
++}
++
++impl Deref for IntRegisters {
++    type Target = [u8];
++    fn deref(&self) -> &[u8] {
++        unsafe {
++            slice::from_raw_parts(
++                self as *const IntRegisters as *const u8,
++                mem::size_of::<IntRegisters>(),
++            )
++        }
++    }
++}
++
++impl DerefMut for IntRegisters {
++    fn deref_mut(&mut self) -> &mut [u8] {
++        unsafe {
++            slice::from_raw_parts_mut(
++                self as *mut IntRegisters as *mut u8,
++                mem::size_of::<IntRegisters>(),
++            )
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, Default)]
++#[repr(C, packed)]
++pub struct FloatRegisters {
++    pub fregs: [u64; 32],
++    pub fcsr: u32,
++}
++
++impl Deref for FloatRegisters {
++    type Target = [u8];
++    fn deref(&self) -> &[u8] {
++        unsafe {
++            slice::from_raw_parts(
++                self as *const FloatRegisters as *const u8,
++                mem::size_of::<FloatRegisters>(),
++            )
++        }
++    }
++}
++
++impl DerefMut for FloatRegisters {
++    fn deref_mut(&mut self) -> &mut [u8] {
++        unsafe {
++            slice::from_raw_parts_mut(
++                self as *mut FloatRegisters as *mut u8,
++                mem::size_of::<FloatRegisters>(),
++            )
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, Default)]
++#[repr(packed)]
++pub struct EnvRegisters {
++    /// Thread pointer: `$gp` (`$28`).
++    pub tp: usize,
++}
++
++impl Deref for EnvRegisters {
++    type Target = [u8];
++    fn deref(&self) -> &[u8] {
++        unsafe {
++            slice::from_raw_parts(
++                self as *const EnvRegisters as *const u8,
++                mem::size_of::<EnvRegisters>(),
++            )
++        }
++    }
++}
++
++impl DerefMut for EnvRegisters {
++    fn deref_mut(&mut self) -> &mut [u8] {
++        unsafe {
++            slice::from_raw_parts_mut(
++                self as *mut EnvRegisters as *mut u8,
++                mem::size_of::<EnvRegisters>(),
++            )
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, Default)]
++#[repr(C, packed)]
++pub struct Exception {
++    /// CP0 Cause ExcCode.
++    pub code: usize,
++    /// CP0 BadVAddr, or 0 when the exception has none.
++    pub address: usize,
++}
++
++impl Exception {
++    pub fn pack(&self) -> (usize, usize) {
++        (self.code, self.address)
++    }
++    pub fn unpack(code: usize, address: usize) -> Self {
++        Exception { code, address }
++    }
++}
++
++impl Deref for Exception {
++    type Target = [u8];
++    fn deref(&self) -> &[u8] {
++        unsafe {
++            slice::from_raw_parts(
++                self as *const Exception as *const u8,
++                mem::size_of::<Exception>(),
++            )
++        }
++    }
++}
++
++impl DerefMut for Exception {
++    fn deref_mut(&mut self) -> &mut [u8] {
++        unsafe {
++            slice::from_raw_parts_mut(
++                self as *mut Exception as *mut u8,
++                mem::size_of::<Exception>(),
++            )
++        }
++    }
++}
+diff --git a/syscall/src/lib.rs b/syscall/src/lib.rs
+index 49628da8..6cf00c1e 100644
+--- a/syscall/src/lib.rs
++++ b/syscall/src/lib.rs
+@@ -1,4 +1,5 @@
+ #![cfg_attr(not(any(feature = "std", test)), no_std)]
++#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
+ #![allow(unexpected_cfgs)] // why does this even exist?
+ 
+ #[cfg(test)]
+@@ -22,6 +23,10 @@ mod arch;
+ #[path = "arch/x86_64.rs"]
+ mod arch;
+ 
++#[cfg(target_arch = "mips64")]
++#[path = "arch/mips64.rs"]
++mod arch;
++
+ /// Function definitions
+ #[cfg(feature = "userspace")]
+ pub mod call;
+diff --git a/targets/mips64-unknown-kernel.json b/targets/mips64-unknown-kernel.json
+new file mode 100644
+index 00000000..38ecdbf1
+--- /dev/null
++++ b/targets/mips64-unknown-kernel.json
+@@ -0,0 +1,31 @@
++{
++  "abi": "n32",
++  "arch": "mips64",
++  "cpu": "mips3",
++  "crt-objects-fallback": "false",
++  "data-layout": "E-m:e-p:32:32-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128",
++  "disable-redzone": true,
++  "eh-frame-header": false,
++  "emit-debug-gdb-scripts": false,
++  "env": "",
++  "executables": true,
++  "features": "+mips3,+soft-float,+noabicalls",
++  "frame-pointer": "always",
++  "linker": "rust-lld",
++  "linker-flavor": "gnu-lld",
++  "llvm-abiname": "n32",
++  "llvm-args": [
++    "-mno-check-zero-division"
++  ],
++  "llvm-target": "mips64",
++  "max-atomic-width": 64,
++  "no-default-libraries": true,
++  "os": "none",
++  "panic-strategy": "abort",
++  "position-independent-executables": false,
++  "relocation-model": "static",
++  "target-c-int-width": 32,
++  "target-endian": "big",
++  "target-pointer-width": 32,
++  "vendor": "sgi"
++}
+-- 
+2.56.0
+
