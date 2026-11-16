@@ -1,0 +1,12 @@
+[package]
+name = "ecoff"
+version = "0.1.0"
+edition = "2024"
+description = "Convert an ELF32 big-endian MIPS executable to the ECOFF image the SGI Indy PROM loads"
+license = "MIT"
+
+[[bin]]
+name = "ecoff"
+path = "src/main.rs"
+
+[dependencies]

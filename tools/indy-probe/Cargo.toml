@@ -1,0 +1,18 @@
+[package]
+name = "indy-probe"
+version = "0.1.0"
+edition = "2024"
+description = "Prints one line on the SGI Indy serial console from the PROM and stops"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+lto = true
+codegen-units = 1
+debug = false
+
+[profile.dev]
+panic = "abort"

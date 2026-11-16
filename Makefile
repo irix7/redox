@@ -104,6 +104,9 @@ include mk/ch.mk
 # CI
 include mk/ci.mk
 
+# SGI Indy netboot targets
+include mk/indy.mk
+
 env: prefix FORCE $(CONTAINER_TAG)
 ifeq ($(PODMAN_BUILD),1)
 	$(PODMAN_RUN) make $@

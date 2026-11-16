@@ -1,0 +1,10 @@
+[build]
+target = "../../targets/mips64-sgi-redox.json"
+
+[unstable]
+json-target-spec = true
+build-std = ["core"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.mips64-sgi-redox]
+rustflags = ["-C", "link-arg=-Tlinker.ld", "-C", "link-arg=-e", "-C", "link-arg=_start"]
