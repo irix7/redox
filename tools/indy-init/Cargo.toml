@@ -1,0 +1,15 @@
+[package]
+name = "indy-init"
+version = "0.1.0"
+edition = "2024"
+description = "First std program for the Indy: stands in for init until base's init builds"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+codegen-units = 1
+debug = false

@@ -4,7 +4,8 @@
 #   tools/relibc-indy.sh [SYSROOT]      default: build/indy/sysroot
 #
 # Produces lib/libc.a (relibc plus the Rust libm), lib/crt0.o, crti.o,
-# crtn.o and an empty libm.a. No headers (cbindgen is not installed) and no
+# crtn.o and empty libm, libdl, libpthread, librt and libgcc_s archives
+# (std links -lgcc_s on Redox; the port has no unwinder). No headers (cbindgen is not installed) and no
 # libc.so: the port links statically. C needs the Bootlin n32 SDK at
 # INDY_MIPS_SDK (default /mnt/europa/toolchains/mips64-n32--uclibc--stable-2026.08-1)
 # for relibc's one C file.
@@ -13,8 +14,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SYSROOT="${1:-$ROOT/build/indy/sysroot}"
 SDK="${INDY_MIPS_SDK:-/mnt/europa/toolchains/mips64-n32--uclibc--stable-2026.08-1}"
 SRC="$ROOT/recipes/core/relibc/source"
+unset RUSTUP_TOOLCHAIN
 . "$ROOT/tools/env.sh"
 
+unset RUSTUP_TOOLCHAIN
 export RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")"
 export TARGET=mips64-sgi-redox
 export TARGET_SPEC="$ROOT/targets/mips64-sgi-redox.json"
@@ -33,6 +36,6 @@ mkdir -p "$SYSROOT/lib"
 cp "$BUILD/librelibc.a" "$SYSROOT/lib/libc.a"
 cp "$BUILD/crt0.o" "$BUILD/crti.o" "$BUILD/crtn.o" "$SYSROOT/lib/"
 ln -sf crt0.o "$SYSROOT/lib/crt1.o"
-rm -f "$SYSROOT/lib/libm.a" "$SYSROOT/lib/libdl.a" "$SYSROOT/lib/libpthread.a" "$SYSROOT/lib/librt.a"
-for lib in m dl pthread rt; do "$AR" -rcs "$SYSROOT/lib/lib$lib.a"; done
+rm -f "$SYSROOT"/lib/lib{m,dl,pthread,rt,gcc_s}.a
+for lib in m dl pthread rt gcc_s; do "$AR" -rcs "$SYSROOT/lib/lib$lib.a"; done
 ls -l "$SYSROOT/lib"

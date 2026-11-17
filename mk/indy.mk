@@ -8,7 +8,7 @@
 INDY_BUILD=build/indy
 INDY_TARGET=targets/mips64-sgi-redox.json
 INDY_TFTP_DIR?=/var/lib/sgi-netboot
-INDY_MARKER?=bootstrap: namespace scheme start
+INDY_MARKER?=REDOX-INDY-INIT: hello
 # The toolchain pin of this fork; the kernel checkout carries upstream's own.
 INDY_RUST_TOOLCHAIN?=nightly-2026-10-03
 
@@ -57,11 +57,23 @@ $(BOOTSTRAP_ELF): FORCE
 $(INITFS_AR): FORCE
 	cd $(BASE_SOURCE)/initfs/tools && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) cargo build --release
 
-# The initfs holds what the bootstrap starts: bin/init and the drivers. There
-# is no relibc for the target yet, so the directory carries only the layout.
-$(INITFS_IMG): $(BOOTSTRAP_ELF) $(INITFS_AR)
+# The static relibc sysroot (tools/relibc-indy.sh) and the first std program,
+# which stands in for init until base's init builds for the target.
+SYSROOT=$(INDY_BUILD)/sysroot
+INIT_ELF=tools/indy-init/target/mips64-sgi-redox/release/indy-init
+RUST_SRC?=/mnt/europa/redox-rust-src/library
+
+$(SYSROOT)/lib/libc.a: FORCE
+	tools/relibc-indy.sh $(CURDIR)/$(SYSROOT)
+
+$(INIT_ELF): $(SYSROOT)/lib/libc.a $(wildcard tools/indy-init/src/*.rs) tools/indy-init/Cargo.toml tools/indy-init/.cargo/config.toml
+	cd tools/indy-init && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) __CARGO_TESTS_ONLY_SRC_ROOT=$(RUST_SRC) cargo build --release
+
+# The initfs holds what the bootstrap starts: bin/init and the drivers.
+$(INITFS_IMG): $(BOOTSTRAP_ELF) $(INITFS_AR) $(INIT_ELF)
 	rm -rf $(INITFS_DIR)
 	mkdir -p $(INITFS_DIR)/bin $(INITFS_DIR)/lib/drivers $(INITFS_DIR)/lib/init.d
+	install -m 0755 $(INIT_ELF) $(INITFS_DIR)/bin/init
 	$(INITFS_AR) $(INITFS_DIR) $(BOOTSTRAP_ELF) -o $@
 	ls -l $@
 
