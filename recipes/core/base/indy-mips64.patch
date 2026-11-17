@@ -1,4 +1,4 @@
-From c2fcd4476ee8878846a985b7163fcc3eaea0c0b0 Mon Sep 17 00:00:00 2001
+From 11d754090d16093366e8efc9e7b44a98ed011c55 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:40 +1000
 Subject: [PATCH] Indy (mips64 n32): bootstrap entry, Seeq 8003 driver,
@@ -18,6 +18,7 @@ Subject: [PATCH] Indy (mips64 n32): bootstrap entry, Seeq 8003 driver,
   bootstrap takes redox-rt from the local relibc checkout.
 
 Signed-off-by: belikh <io@jupiter.au>
+Signed-off-by: belikh <io@belic.net>
 ---
  Cargo.lock                      | 133 ++++++-------
  Cargo.toml                      |   6 +
@@ -26,13 +27,13 @@ Signed-off-by: belikh <io@jupiter.au>
  bootstrap/src/initnsmgr.rs      |   4 +-
  bootstrap/src/main.rs           |   5 +
  bootstrap/src/mips64.ld         |  59 ++++++
- bootstrap/src/mips64.rs         |  57 ++++++
+ bootstrap/src/mips64.rs         |  58 ++++++
  drivers/common/src/dma.rs       |   3 +
  drivers/net/seeqd/Cargo.toml    |  19 ++
  drivers/net/seeqd/src/device.rs | 318 ++++++++++++++++++++++++++++++++
  drivers/net/seeqd/src/main.rs   | 113 ++++++++++++
  netstack/src/scheme/mod.rs      |   5 +-
- 13 files changed, 666 insertions(+), 74 deletions(-)
+ 13 files changed, 667 insertions(+), 74 deletions(-)
  create mode 100644 bootstrap/src/mips64.ld
  create mode 100644 bootstrap/src/mips64.rs
  create mode 100644 drivers/net/seeqd/Cargo.toml
@@ -780,10 +781,10 @@ index 0000000..a0201b3
 +}
 diff --git a/bootstrap/src/mips64.rs b/bootstrap/src/mips64.rs
 new file mode 100644
-index 0000000..e3fd459
+index 0000000..a3ae912
 --- /dev/null
 +++ b/bootstrap/src/mips64.rs
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,58 @@
 +//! SGI Indy: MIPS n32, 32-bit user addresses. useg ends at 0x8000_0000.
 +
 +use core::mem;
@@ -793,7 +794,8 @@ index 0000000..e3fd459
 +use syscall::number::SYS_FMAP;
 +
 +const STACK_SIZE: usize = 64 * 1024; // 64 KiB
-+pub const USERMODE_END: usize = 0x8000_0000;
++// 64 KiB below the end of useg: see the kernel's USER_END_OFFSET.
++pub const USERMODE_END: usize = 0x7fff_0000;
 +pub const STACK_START: usize = USERMODE_END - syscall::KERNEL_METADATA_SIZE - STACK_SIZE;
 +
 +static MAP: Map = Map {

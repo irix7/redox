@@ -1,4 +1,4 @@
-From 7f18fe27bd1e1145839cdc19c8f10814d4c542c3 Mon Sep 17 00:00:00 2001
+From 2f47f64ae8f0a53a666a0cd35b01e049e0fe31bb Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:49 +1000
 Subject: [PATCH] redox-rt, generic-rt: add mips64 n32 (SGI Indy)
@@ -13,6 +13,7 @@ Thread pointer convention: $gp ($28) holds &tcb_ptr + 8, so the TCB pointer
 is read at -8($28). Static code with no GOT leaves $gp free.
 
 Signed-off-by: belikh <io@jupiter.au>
+Signed-off-by: belikh <io@belic.net>
 ---
  Cargo.lock                                 |   3 -
  Cargo.toml                                 |   6 +-
@@ -151,7 +152,7 @@ index 226c366..738cd2b 100644
          let tcb_len = unsafe { Self::arch_read(offset_of!(Self, tcb_len)) };
 diff --git a/redox-rt/src/arch/mips64.rs b/redox-rt/src/arch/mips64.rs
 new file mode 100644
-index 0000000..74834b2
+index 0000000..c442ac2
 --- /dev/null
 +++ b/redox-rt/src/arch/mips64.rs
 @@ -0,0 +1,292 @@
@@ -179,9 +180,9 @@ index 0000000..74834b2
 +
 +use super::ForkScratchpad;
 +
-+/// User addresses end at 0x8000_0000; the kernel's metadata pages sit just
++/// User mappings end at 0x7fff_0000 (the kernel's USER_END_OFFSET); the kernel's metadata pages sit just
 +/// below that, and the initial stack grows down from below them.
-+pub const STACK_TOP: usize = 0x8000_0000 - syscall::KERNEL_METADATA_SIZE;
++pub const STACK_TOP: usize = 0x7fff_0000 - syscall::KERNEL_METADATA_SIZE;
 +pub const STACK_SIZE: usize = 1024 * 1024;
 +
 +#[derive(Debug, Default)]

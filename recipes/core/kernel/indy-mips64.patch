@@ -1,4 +1,4 @@
-From 2dee244c2d965014ba4d7eca8e697644b15dc885 Mon Sep 17 00:00:00 2001
+From 2c7bfa874dcb3258367c19ed8b9dfaca6841dab0 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -34,7 +34,7 @@ Signed-off-by: belikh <io@belic.net>
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
  src/arch/mips64/cache.rs               |  93 ++++++
- src/arch/mips64/consts.rs              |  20 ++
+ src/arch/mips64/consts.rs              |  24 ++
  src/arch/mips64/cp0.rs                 | 112 +++++++
  src/arch/mips64/debug.rs               |  24 ++
  src/arch/mips64/device/arcs.rs         | 174 +++++++++++
@@ -42,7 +42,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/device/mod.rs          |  24 ++
  src/arch/mips64/device/serial.rs       |  14 +
  src/arch/mips64/interrupt/exception.rs | 386 ++++++++++++++++++++++++
- src/arch/mips64/interrupt/handler.rs   | 390 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/handler.rs   | 394 +++++++++++++++++++++++++
  src/arch/mips64/interrupt/irq.rs       |  90 ++++++
  src/arch/mips64/interrupt/mod.rs       |  47 +++
  src/arch/mips64/interrupt/syscall.rs   |   4 +
@@ -69,7 +69,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 41 files changed, 2953 insertions(+), 12 deletions(-)
+ 41 files changed, 2961 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -538,10 +538,10 @@ index 00000000..cb70e2ca
 +}
 diff --git a/src/arch/mips64/consts.rs b/src/arch/mips64/consts.rs
 new file mode 100644
-index 00000000..84217eeb
+index 00000000..947305d1
 --- /dev/null
 +++ b/src/arch/mips64/consts.rs
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,24 @@
 +//! Fixed virtual addresses. Physical RAM starts at 0x0800_0000 and is reached
 +//! through kseg0 (`PHYS_OFFSET` 0x8000_0000) and kseg1 for devices.
 +
@@ -552,8 +552,12 @@ index 00000000..84217eeb
 +    0xC000_0000
 +}
 +
-+/// End offset of the user image, i.e. kernel start: the end of useg.
-+pub const USER_END_OFFSET: usize = 0x8000_0000;
++/// End of user mappings, 64 KiB below the end of useg. The thread pointer is
++/// the TLS block plus 0x7000 and is used with negative offsets; with
++/// Status.UX set the CPU adds base and offset in 64 bits, so a thread
++/// pointer at or above 0x8000_0000 (sign-extended in its register) gives an
++/// address error. Nothing may be mapped where that sum could cross.
++pub const USER_END_OFFSET: usize = 0x7fff_0000;
 +
 +/// Physical base of DRAM on the Indy.
 +pub const RAM_PHYS_BASE: usize = 0x0800_0000;
@@ -1351,10 +1355,10 @@ index 00000000..3eb5694a
 +}
 diff --git a/src/arch/mips64/interrupt/handler.rs b/src/arch/mips64/interrupt/handler.rs
 new file mode 100644
-index 00000000..3ae0fc84
+index 00000000..e038a227
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/handler.rs
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,394 @@
 +//! The trap frame. Every general register is saved as 64 bits, because n32
 +//! code keeps 64-bit values in registers even though pointers are 32 bits.
 +//!
@@ -1465,7 +1469,11 @@ index 00000000..3ae0fc84
 +            assert!(FRAME_SIZE % 16 == 0);
 +        }
 +        // Return to user mode with interrupts enabled.
++        // UX: n32 code uses 64-bit instructions (`sd`, `ld`, `daddu`), which
++        // are reserved in user mode without it. With UX set, user TLB misses
++        // arrive at the XTLB refill vector, which has the same stub.
 +        self.iret.status = (crate::arch::cp0::status::KSU_USER
++            | crate::arch::cp0::status::UX
 +            | crate::arch::cp0::status::EXL
 +            | crate::arch::cp0::status::IE
 +            | crate::arch::cp0::status::IM_ENABLED) as u64;
