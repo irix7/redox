@@ -708,6 +708,12 @@ and none of them is on the critical path to "the machine runs our code".
   on iris). The PROM refuses to autoload when its console cannot open
   (`NoAutoLoad=CONSOLE OPEN FAILED.`), which is the headless-emulator case; there
   `console=d` is also needed.
+- **T8a — PROM console and cache faults.** 2026-11-17. The first boot on the real Indy hung
+  after `entry: 0x88040000` with nothing on screen. The kernel now logs through the ARCS
+  console (the Newport screen) and takes its memory map from the PROM's descriptors, which
+  leaves 768 KiB to the PROM. iris hid a cache fault: gate with `IRIS_ARGS="--cache full"`
+  as well. VCED/VCEI are handled in the exception entry. Cache aliasing on R4600/R5000,
+  which do not trap, is open.
 - **T9 — next.** First real-hardware boot and whatever it shows; shrink the initfs (4.4 MiB
   against a 2 MiB budget); an entropy source for `randd`; the serial interrupt (INT3
   mappable lines) instead of polling; `ion` in place of the bring-up shell.
