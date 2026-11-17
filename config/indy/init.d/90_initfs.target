@@ -5,5 +5,5 @@ requires_weak = [
     "10_seeqd.service",
     "20_netstack.service",
     "30_dhcpd.service",
-    "40_netinfo.service",
+    "40_sh.service",
 ]

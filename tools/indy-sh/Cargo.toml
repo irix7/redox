@@ -1,8 +1,8 @@
 [package]
-name = "indy-init"
+name = "indy-sh"
 version = "0.1.0"
 edition = "2024"
-description = "First std program for the Indy: stands in for init until base's init builds"
+description = "Bring-up shell for the Indy: serial console and TCP port 23"
 license = "MIT"
 
 [dependencies]

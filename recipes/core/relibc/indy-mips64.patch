@@ -1,4 +1,4 @@
-From 543a6b223280d957b1fd832f0cf0ead9f0fe9768 Mon Sep 17 00:00:00 2001
+From 7f18fe27bd1e1145839cdc19c8f10814d4c542c3 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:49 +1000
 Subject: [PATCH] redox-rt, generic-rt: add mips64 n32 (SGI Indy)
@@ -18,7 +18,7 @@ Signed-off-by: belikh <io@jupiter.au>
  Cargo.toml                                 |   6 +-
  Makefile                                   |   7 +-
  generic-rt/src/lib.rs                      |  19 ++
- redox-rt/src/arch/mips64.rs                | 289 +++++++++++++++++++++
+ redox-rt/src/arch/mips64.rs                | 292 +++++++++++++++++++++
  redox-rt/src/arch/mod.rs                   |   5 +
  redox-rt/src/lib.rs                        |  32 ++-
  redox-rt/src/proc.rs                       |   6 +-
@@ -47,7 +47,7 @@ Signed-off-by: belikh <io@jupiter.au>
  src/lib.rs                                 |   1 +
  src/platform/redox/ptrace.rs               |  12 +
  stripcore.sh                               |   5 +-
- 33 files changed, 561 insertions(+), 53 deletions(-)
+ 33 files changed, 564 insertions(+), 53 deletions(-)
  create mode 100644 redox-rt/src/arch/mips64.rs
  create mode 100644 src/header/arch_mips64_user/cbindgen.toml
  create mode 100644 src/header/arch_mips64_user/mod.rs
@@ -151,10 +151,10 @@ index 226c366..738cd2b 100644
          let tcb_len = unsafe { Self::arch_read(offset_of!(Self, tcb_len)) };
 diff --git a/redox-rt/src/arch/mips64.rs b/redox-rt/src/arch/mips64.rs
 new file mode 100644
-index 0000000..54a6e7a
+index 0000000..74834b2
 --- /dev/null
 +++ b/redox-rt/src/arch/mips64.rs
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,292 @@
 +//! MIPS n32 (SGI Indy). Registers are 64 bits wide, pointers 32.
 +//!
 +//! Thread pointer: `$gp` (`$28`) is the MIPS thread pointer
@@ -351,7 +351,10 @@ index 0000000..54a6e7a
 +    lw      $7, 16($sp)
 +    lw      $8, 20($sp)
 +    lw      $9, 24($sp)
-+    addiu   $sp, $sp, 32
++    // Seven words were pushed; n32 wants the stack 16-byte aligned at a call.
++    addiu   $sp, $sp, 28
++    li      $10, -16
++    and     $sp, $sp, $10
 +
 +    jalr    $25
 +    nop

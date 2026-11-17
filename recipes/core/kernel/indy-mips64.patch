@@ -1,4 +1,4 @@
-From 991a4b51aa02bb27feda1ed5c22646f37aeb805d Mon Sep 17 00:00:00 2001
+From 0f4a88e5a14c00fff0ae2b31f17f493015a020a3 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -33,14 +33,14 @@ Signed-off-by: belikh <io@jupiter.au>
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
  src/arch/mips64/consts.rs              |  20 ++
- src/arch/mips64/cp0.rs                 | 105 +++++++
+ src/arch/mips64/cp0.rs                 | 112 ++++++++
  src/arch/mips64/debug.rs               |  19 ++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
- src/arch/mips64/device/mod.rs          |  22 ++
+ src/arch/mips64/device/mod.rs          |  23 ++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 333 +++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 338 ++++++++++++++++++++++
  src/arch/mips64/interrupt/handler.rs   | 384 +++++++++++++++++++++++++
- src/arch/mips64/interrupt/irq.rs       |  19 ++
+ src/arch/mips64/interrupt/irq.rs       |  90 ++++++
  src/arch/mips64/interrupt/mod.rs       |  47 +++
  src/arch/mips64/interrupt/syscall.rs   |   4 +
  src/arch/mips64/interrupt/trace.rs     |  19 ++
@@ -67,7 +67,7 @@ Signed-off-by: belikh <io@jupiter.au>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 40 files changed, 2464 insertions(+), 13 deletions(-)
+ 40 files changed, 2548 insertions(+), 13 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/consts.rs
@@ -461,10 +461,10 @@ index 00000000..84217eeb
 +pub const LOW_RESERVED_BYTES: usize = 0x0004_0000;
 diff --git a/src/arch/mips64/cp0.rs b/src/arch/mips64/cp0.rs
 new file mode 100644
-index 00000000..ab264103
+index 00000000..fe08c5ca
 --- /dev/null
 +++ b/src/arch/mips64/cp0.rs
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,112 @@
 +//! CP0 (system control coprocessor) registers of the R4400.
 +
 +use core::arch::asm;
@@ -497,8 +497,13 @@ index 00000000..ab264103
 +    pub const SX: u32 = 1 << 6;
 +    pub const KX: u32 = 1 << 7;
 +    pub const IM_MASK: u32 = 0xff00;
++    /// INT3 local 0 (IP2) and local 1 (IP3).
++    pub const IM2: u32 = 1 << 10;
++    pub const IM3: u32 = 1 << 11;
 +    /// Timer interrupt (IP7).
 +    pub const IM7: u32 = 1 << 15;
++    /// Interrupt inputs every context runs with: timer and both INT3 cascades.
++    pub const IM_ENABLED: u32 = IM7 | IM2 | IM3;
 +    /// Bootstrap exception vectors (PROM) when set.
 +    pub const BEV: u32 = 1 << 22;
 +    pub const CU1: u32 = 1 << 29;
@@ -509,6 +514,8 @@ index 00000000..ab264103
 +    pub const EXC_CODE_MASK: u32 = 0x7c;
 +    pub const EXC_CODE_SHIFT: u32 = 2;
 +    pub const IP_MASK: u32 = 0xff00;
++    pub const IP2: u32 = 1 << 10;
++    pub const IP3: u32 = 1 << 11;
 +    pub const IP7: u32 = 1 << 15;
 +    /// Exception in a branch delay slot.
 +    pub const BD: u32 = 1 << 31;
@@ -614,10 +621,10 @@ index 00000000..e8c7e2c3
 +}
 diff --git a/src/arch/mips64/device/mod.rs b/src/arch/mips64/device/mod.rs
 new file mode 100644
-index 00000000..272e5679
+index 00000000..080c0e1f
 --- /dev/null
 +++ b/src/arch/mips64/device/mod.rs
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,23 @@
 +//! Indy devices the kernel itself drives: the serial console and the CP0
 +//! timer. Everything else (HPC3, SCSI, Seeq Ethernet, Newport) is a userspace
 +//! scheme reached through fixed kseg1 addresses; there is no bus enumeration.
@@ -628,6 +635,7 @@ index 00000000..272e5679
 +pub unsafe fn init() {
 +    unsafe {
 +        super::time::init();
++        super::interrupt::irq::init();
 +    }
 +}
 +
@@ -662,10 +670,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..31390e7f
+index 00000000..bf764181
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,338 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -828,12 +836,17 @@ index 00000000..31390e7f
 +fn handle_interrupt(regs: &mut InterruptStack, cause_reg: u32) {
 +    let pending = cause_reg & regs.iret.status as u32 & cause::IP_MASK;
 +    let mut token = unsafe { CleanLockToken::new() };
++    if pending & (cause::IP2 | cause::IP3) != 0 {
++        unsafe { super::irq::handle(pending, &mut token) };
++    }
 +    if pending & cause::IP7 != 0 {
 +        crate::arch::time::tick();
++        // The console's receive side is polled from the tick: the serial
++        // interrupt arrives through INT3's mappable lines, not routed yet.
++        crate::arch::device::serial::COM1.lock().receive(&mut token);
 +        crate::context::timeout::trigger(&mut token);
 +        crate::context::switch::tick(&mut token);
 +    }
-+    // TODO: HPC3/INT3 local interrupts (IP2, IP3) for userspace drivers.
 +}
 +
 +unsafe fn handle_system_exception(regs: &InterruptStack, exc_code: u32) {
@@ -1001,7 +1014,7 @@ index 00000000..31390e7f
 +}
 diff --git a/src/arch/mips64/interrupt/handler.rs b/src/arch/mips64/interrupt/handler.rs
 new file mode 100644
-index 00000000..dba445c2
+index 00000000..e2040126
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/handler.rs
 @@ -0,0 +1,384 @@
@@ -1118,7 +1131,7 @@ index 00000000..dba445c2
 +        self.iret.status = (crate::arch::cp0::status::KSU_USER
 +            | crate::arch::cp0::status::EXL
 +            | crate::arch::cp0::status::IE
-+            | crate::arch::cp0::status::IM7) as u64;
++            | crate::arch::cp0::status::IM_ENABLED) as u64;
 +    }
 +    pub fn frame_pointer(&self) -> usize {
 +        self.registers.fp as usize
@@ -1391,19 +1404,89 @@ index 00000000..dba445c2
 +}
 diff --git a/src/arch/mips64/interrupt/irq.rs b/src/arch/mips64/interrupt/irq.rs
 new file mode 100644
-index 00000000..37a8cb29
+index 00000000..0cd49786
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/irq.rs
-@@ -0,0 +1,19 @@
-+//! Device interrupts for the `irq:` scheme.
+@@ -0,0 +1,90 @@
++//! Device interrupts for the `irq:` scheme: the IOC2's INT3 controller.
 +//!
-+//! The Indy routes device interrupts through the INT3 local interrupt
-+//! controller into CP0 IP2/IP3. Until that demultiplexer exists no device
-+//! IRQ can be claimed: the iterator is empty and acknowledgements are no-ops.
++//! INT3 has two 8-bit local interrupt registers. Local 0 drives CPU IP2,
++//! local 1 drives IP3. Each has a status and a mask register (a set mask bit
++//! enables the line). IRQ numbers 0..8 are local 0 bits, 8..16 local 1 bits:
++//!
++//! | IRQ | Source |
++//! |---|---|
++//! | 1, 2 | SCSI 0, SCSI 1 |
++//! | 3 | Ethernet (Seeq 8003 and its HPC3 DMA) |
++//! | 5 | parallel port |
++//! | 12 | HPC3 DMA done |
++//!
++//! A line that fires is masked and reported to its `irq:` handle; the
++//! driver's acknowledgement unmasks it. A line nobody holds stays masked
++//! after its first interrupt.
 +
-+use crate::cpu_set::LogicalCpuId;
++use core::ptr::{read_volatile, write_volatile};
 +
-+pub unsafe fn acknowledge(_irq: usize) {}
++use crate::{
++    arch::cp0::{self, cause, status},
++    cpu_set::LogicalCpuId,
++    scheme::irq::irq_trigger,
++    sync::CleanLockToken,
++};
++
++const L0_STAT: *mut u8 = 0xBFBD_9883 as *mut u8;
++const L0_MASK: *mut u8 = 0xBFBD_9887 as *mut u8;
++const L1_STAT: *mut u8 = 0xBFBD_988B as *mut u8;
++const L1_MASK: *mut u8 = 0xBFBD_988F as *mut u8;
++
++/// Enable every local line and the two CPU inputs they cascade into.
++pub unsafe fn init() {
++    unsafe {
++        write_volatile(L0_MASK, 0xff);
++        write_volatile(L1_MASK, 0xff);
++        cp0::write_status(cp0::read_status() | status::IM2 | status::IM3);
++    }
++}
++
++/// Called from the exception handler with the pending, enabled Cause bits.
++pub unsafe fn handle(pending: u32, token: &mut CleanLockToken) {
++    unsafe {
++        if pending & cause::IP2 != 0 {
++            dispatch(L0_STAT, L0_MASK, 0, token);
++        }
++        if pending & cause::IP3 != 0 {
++            dispatch(L1_STAT, L1_MASK, 8, token);
++        }
++    }
++}
++
++unsafe fn dispatch(stat: *mut u8, mask: *mut u8, base: u8, token: &mut CleanLockToken) {
++    unsafe {
++        let enabled = read_volatile(mask);
++        let active = read_volatile(stat) & enabled;
++        if active == 0 {
++            return;
++        }
++        // Mask what fired until its driver acknowledges it.
++        write_volatile(mask, enabled & !active);
++        for bit in 0..8u8 {
++            if active & (1 << bit) != 0 {
++                irq_trigger(base + bit, token);
++            }
++        }
++    }
++}
++
++pub unsafe fn acknowledge(irq: usize) {
++    unsafe {
++        let (mask, bit) = match irq {
++            0..=7 => (L0_MASK, irq as u8),
++            8..=15 => (L1_MASK, irq as u8 - 8),
++            _ => return,
++        };
++        write_volatile(mask, read_volatile(mask) | (1 << bit));
++    }
++}
 +
 +pub fn is_reserved(_cpu_id: LogicalCpuId, _index: u8) -> bool {
 +    false
@@ -1411,6 +1494,7 @@ index 00000000..37a8cb29
 +
 +pub fn set_reserved(_cpu_id: LogicalCpuId, _index: u8, _reserved: bool) {}
 +
++/// Only the sixteen INT3 lines exist; none is handed out dynamically.
 +pub fn available_irqs_iter(_cpu_id: LogicalCpuId) -> impl Iterator<Item = u8> + 'static {
 +    0..0
 +}
@@ -2116,7 +2200,7 @@ index 2aae6399..e5791c1e 100644
 +pub use self::mips64::*;
 diff --git a/src/context/arch/mips64.rs b/src/context/arch/mips64.rs
 new file mode 100644
-index 00000000..11c452ed
+index 00000000..f04c5b0e
 --- /dev/null
 +++ b/src/context/arch/mips64.rs
 @@ -0,0 +1,216 @@
@@ -2156,7 +2240,7 @@ index 00000000..11c452ed
 +        Self {
 +            // Kernel mode, timer unmasked, interrupts off until the context
 +            // enables them itself (run_userspace) or returns to user mode.
-+            status: crate::arch::cp0::status::IM7 as u64,
++            status: crate::arch::cp0::status::IM_ENABLED as u64,
 +            ..Self::default()
 +        }
 +    }

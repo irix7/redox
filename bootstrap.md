@@ -3,7 +3,8 @@
 **Audience:** agents and engineers working in `irix7/redox`.
 **Status:** T1 and T3 to T7 pass on iris (2026-11-17): `make indy-gate` netboots kernel plus
 initfs on a 32 MiB `indy_ip24`, base's `init` starts `randd`, the Seeq driver, `netstack` and
-`dhcpd`, and the gate waits for the DHCP lease. Nothing has run on real hardware yet. T2 (the
+`dhcpd` and a shell reachable on TCP port 23; the gate waits for the DHCP lease, runs a
+command over TCP and reboots to the PROM. Nothing has run on real hardware yet. T2 (the
 x86_64 floor) is not done. This file says
 where the pieces are, what has been proved on this machine, and what the 32 MB budget allows.
 **Fork base:** `redox-os/redox` mirror at `f71658dfca2b978bee55a4c19d95ab926a948c21`
@@ -694,9 +695,22 @@ and none of them is on the critical path to "the machine runs our code".
   Not done: the HPC3/INT3 interrupt path in the kernel (`arch::interrupt::irq` claims no
   IRQs), the IOC2 twisted-pair select, collision and error counters, and any run on real
   hardware.
-- **T8 — next.** Interrupts for the driver; a shell on the serial console; shrink the
-  initfs (4.2 MiB against a 2 MiB budget: every program statically links std and relibc, at
-  about 450 KiB each); an entropy source for `randd` (it seeds with zero today).
+- **T8 — interrupts, a shell, remote access.** Done in the emulator 2026-11-17. The kernel
+  demultiplexes INT3 (local 0 on IP2, local 1 on IP3) into `irq:0..15`; `seeqd` takes
+  `irq:3` and keeps a 250 ms timer only to restart a stopped ring. The console's receive
+  side is polled from the timer tick. `tools/indy-sh` is a bring-up shell on the serial
+  console and on TCP port 23 (`help`, `ls`, `cat`, `ps`, `net`, `uname`, `dmesg`, `reboot`,
+  or a program from the initfs). `reboot` writes `reset` to `/scheme/sys/kstop`; the kernel
+  jumps to the PROM. `make indy-gate` drives all of it: lease, a command over TCP, reboot,
+  PROM menu.
+- **Unattended boot.** With `SystemPartition=bootp()`, `OSLoader=redox` and `AutoLoad=Yes`
+  in the PROM, power-on and every `reboot` netboot Redox without typing (two cycles proved
+  on iris). The PROM refuses to autoload when its console cannot open
+  (`NoAutoLoad=CONSOLE OPEN FAILED.`), which is the headless-emulator case; there
+  `console=d` is also needed.
+- **T9 — next.** First real-hardware boot and whatever it shows; shrink the initfs (4.4 MiB
+  against a 2 MiB budget); an entropy source for `randd`; the serial interrupt (INT3
+  mappable lines) instead of polling; `ion` in place of the bring-up shell.
 - **T2** stays worth doing: it tells which userspace cut matters most before T6 pulls in
   packages.
 

@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "indy-init"
+name = "indy-sh"
 version = "0.1.0"

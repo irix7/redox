@@ -60,15 +60,15 @@ $(INITFS_AR): FORCE
 # The static relibc sysroot (tools/relibc-indy.sh) and the first std program,
 # which stands in for init until base's init builds for the target.
 SYSROOT=$(INDY_BUILD)/sysroot
-INIT_ELF=tools/indy-init/target/mips64-sgi-redox/release/indy-init
+INIT_ELF=tools/indy-sh/target/mips64-sgi-redox/release/indy-sh
 RUST_SRC?=/mnt/europa/redox-rust-src/library
 
 $(SYSROOT)/lib/libc.a: FORCE
 	tools/relibc-indy.sh $(CURDIR)/$(SYSROOT)
 
-$(INIT_ELF): $(SYSROOT)/lib/libc.a $(wildcard tools/indy-init/src/*.rs) tools/indy-init/Cargo.toml tools/indy-init/.cargo/config.toml
-	touch tools/indy-init/src/main.rs
-	cd tools/indy-init && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) __CARGO_TESTS_ONLY_SRC_ROOT=$(RUST_SRC) cargo build --release
+$(INIT_ELF): $(SYSROOT)/lib/libc.a $(wildcard tools/indy-sh/src/*.rs) tools/indy-sh/Cargo.toml tools/indy-sh/.cargo/config.toml
+	touch tools/indy-sh/src/main.rs
+	cd tools/indy-sh && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) __CARGO_TESTS_ONLY_SRC_ROOT=$(RUST_SRC) cargo build --release
 
 # Base programs for the target: the real init, the Seeq driver and the network
 # stack (tools/base-indy.sh).
@@ -79,12 +79,12 @@ $(BASE_OUT)/init: $(SYSROOT)/lib/libc.a FORCE
 	tools/base-indy.sh $(BASE_BINS)
 
 # The initfs holds what the bootstrap starts: init, its unit files
-# (config/indy/init.d), the driver, the network stack and the console reporter.
+# (config/indy/init.d), the driver, the network stack and the bring-up shell.
 $(INITFS_IMG): $(BOOTSTRAP_ELF) $(INITFS_AR) $(INIT_ELF) $(BASE_OUT)/init $(wildcard config/indy/init.d/*)
 	rm -rf $(INITFS_DIR)
 	mkdir -p $(INITFS_DIR)/bin $(INITFS_DIR)/lib/drivers $(INITFS_DIR)/lib/init.d
 	for bin in $(BASE_BINS); do install -m 0755 $(BASE_OUT)/$$bin $(INITFS_DIR)/bin/$$bin; done
-	install -m 0755 $(INIT_ELF) $(INITFS_DIR)/bin/netinfo
+	install -m 0755 $(INIT_ELF) $(INITFS_DIR)/bin/sh
 	install -m 0644 config/indy/init.d/* $(INITFS_DIR)/lib/init.d/
 	mkdir -p $(INITFS_DIR)/etc/net
 	install -m 0644 config/indy/net/* $(INITFS_DIR)/etc/net/
@@ -99,7 +99,7 @@ $(INDY_BUILD)/redox: $(INDY_ELF) $(ECOFF) $(INITFS_IMG)
 indy: $(INDY_BUILD)/redox
 
 indy-gate: $(INDY_BUILD)/redox
-	WORK=$(CURDIR)/$(INDY_BUILD)/gate tools/indy-gate.sh $< "$(INDY_MARKER)"
+	WORK=$(CURDIR)/$(INDY_BUILD)/gate SHELL_CHECK=1 tools/indy-gate.sh $< "$(INDY_MARKER)"
 
 indy-netboot: $(INDY_BUILD)/redox
 	install -m 0644 $< $(INDY_TFTP_DIR)/redox

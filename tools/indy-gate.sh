@@ -14,6 +14,9 @@
 #   IRIS, IRIS_CI   emulator binaries (default: /mnt/europa/iris/target/release)
 #   WORK            working directory
 #   MONITOR_PORT    iris monitor port (default 18893); give concurrent runs their own
+#   SHELL_PORT      host port forwarded to the guest's TCP shell (default 12323)
+#   SHELL_CHECK     1 to also drive the TCP shell: run a command, then `reboot`
+#                   and wait for the PROM to come back
 set -euo pipefail
 
 IMAGE="${1:?usage: indy-gate.sh IMAGE [MARKER] [TIMEOUT_SECONDS]}"
@@ -24,6 +27,7 @@ IRIS="${IRIS:-/mnt/europa/iris/target/release/iris}"
 IRIS_CI="${IRIS_CI:-/mnt/europa/iris/target/release/iris-ci}"
 WORK="${WORK:-$(pwd)/build/indy/gate}"
 MONITOR_PORT="${MONITOR_PORT:-18893}"
+SHELL_PORT="${SHELL_PORT:-12323}"
 
 for path in "$IMAGE" "$IRIS" "$IRIS_CI"; do
   if [ ! -e "$path" ]; then
@@ -50,6 +54,12 @@ mode = "nat"
 tftp_dir = "$WORK/tftp"
 
 [scsi]
+
+[[port_forward]]
+proto = "tcp"
+host_port = $SHELL_PORT
+guest_port = 23
+bind = "localhost"
 TOML
 
 IRIS_NO_IDLE=1 IRIS_TFTP_TRACE=1 "$IRIS" --config "$WORK/machine.toml" --ci \
@@ -83,6 +93,15 @@ ic serial-wait '>>' --timeout 30
 ic serial-send 'boot -f bootp()redox'
 ic serial-wait 'entry: 0x' --timeout 60
 ic serial-wait "$MARKER" --timeout "$TIMEOUT"
+
+if [ "${SHELL_CHECK:-0}" = 1 ]; then
+  reply="$( (printf 'echo tcp-shell-ok\r\nuname\r\n'; sleep 4) | socat - "TCP:127.0.0.1:$SHELL_PORT" | tr -d '\r' )"
+  echo "$reply" | sed 's/^/indy-gate: tcp> /'
+  echo "$reply" | grep -q 'tcp-shell-ok'
+  (printf 'reboot\r\n'; sleep 2) | socat - "TCP:127.0.0.1:$SHELL_PORT" >/dev/null || true
+  ic serial-wait 'System Maintenance Menu' --timeout 120
+  echo "indy-gate: reboot returned to the PROM"
+fi
 
 echo "indy-gate: PASS  marker \"$MARKER\" seen; logs in $WORK"
 grep -E 'tftp .*(RRQ|complete)' "$WORK/iris.out" || true

@@ -1,4 +1,4 @@
-From fd27cc8bd8519946816adea7c4553998701507b3 Mon Sep 17 00:00:00 2001
+From c2fcd4476ee8878846a985b7163fcc3eaea0c0b0 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:40 +1000
 Subject: [PATCH] Indy (mips64 n32): bootstrap entry, Seeq 8003 driver,
@@ -19,7 +19,7 @@ Subject: [PATCH] Indy (mips64 n32): bootstrap entry, Seeq 8003 driver,
 
 Signed-off-by: belikh <io@jupiter.au>
 ---
- Cargo.lock                      | 133 +++++++-------
+ Cargo.lock                      | 133 ++++++-------
  Cargo.toml                      |   6 +
  bootstrap/Cargo.lock            |   7 +-
  bootstrap/Cargo.toml            |  11 +-
@@ -29,10 +29,10 @@ Signed-off-by: belikh <io@jupiter.au>
  bootstrap/src/mips64.rs         |  57 ++++++
  drivers/common/src/dma.rs       |   3 +
  drivers/net/seeqd/Cargo.toml    |  19 ++
- drivers/net/seeqd/src/device.rs | 313 ++++++++++++++++++++++++++++++++
- drivers/net/seeqd/src/main.rs   |  93 ++++++++++
+ drivers/net/seeqd/src/device.rs | 318 ++++++++++++++++++++++++++++++++
+ drivers/net/seeqd/src/main.rs   | 113 ++++++++++++
  netstack/src/scheme/mod.rs      |   5 +-
- 13 files changed, 641 insertions(+), 74 deletions(-)
+ 13 files changed, 666 insertions(+), 74 deletions(-)
  create mode 100644 bootstrap/src/mips64.ld
  create mode 100644 bootstrap/src/mips64.rs
  create mode 100644 drivers/net/seeqd/Cargo.toml
@@ -882,10 +882,10 @@ index 0000000..a06c2f2
 +workspace = true
 diff --git a/drivers/net/seeqd/src/device.rs b/drivers/net/seeqd/src/device.rs
 new file mode 100644
-index 0000000..d2cbe36
+index 0000000..9725c53
 --- /dev/null
 +++ b/drivers/net/seeqd/src/device.rs
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,318 @@
 +//! Seeq 8003 and the HPC3 Ethernet DMA engines.
 +//!
 +//! Register facts (checked against the iris emulator's `hpc3.rs` and
@@ -1081,6 +1081,11 @@ index 0000000..d2cbe36
 +        self.enet_write(RX_CTRL, CTRL_ACTIVE);
 +    }
 +
++    /// Drop the interrupt the Seeq and the DMA engines raised.
++    pub fn clear_interrupt(&mut self) {
++        unsafe { self.enet_write(RX_RESET, RESET_CLEAR_IRQ) }
++    }
++
 +    /// Timer tick: restart the receive channel if it stopped at the end of
 +    /// the ring while descriptors are free again.
 +    pub fn poll(&mut self) {
@@ -1201,16 +1206,16 @@ index 0000000..d2cbe36
 +}
 diff --git a/drivers/net/seeqd/src/main.rs b/drivers/net/seeqd/src/main.rs
 new file mode 100644
-index 0000000..bd48f05
+index 0000000..d2467b3
 --- /dev/null
 +++ b/drivers/net/seeqd/src/main.rs
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,113 @@
 +//! Seeq 8003 Ethernet on the SGI Indy.
 +//!
 +//! The controller sits behind the HPC3, which moves frames with two DMA
 +//! engines walking descriptor chains in memory. The device is at fixed
-+//! physical addresses; there is no bus to enumerate. The driver polls on a
-+//! timer: the kernel does not route the HPC3 interrupt to userspace yet.
++//! physical addresses; there is no bus to enumerate. Frames arrive on INT3
++//! local 0 bit 3 (`irq:3`); a slow timer restarts a stopped receive ring.
 +
 +use std::mem::size_of;
 +
@@ -1222,8 +1227,11 @@ index 0000000..bd48f05
 +
 +pub mod device;
 +
-+/// Receive ring poll period.
-+const POLL_NS: i32 = 10_000_000;
++/// Period of the fallback poll that restarts a stopped receive ring.
++const POLL_NS: i32 = 250_000_000;
++
++/// INT3 local 0 bit 3: the Seeq and its HPC3 DMA engines.
++const ETHERNET_IRQ: u32 = 3;
 +
 +fn arm_timer(time: &Fd) {
 +    let mut now = TimeSpec::default();
@@ -1261,15 +1269,22 @@ index 0000000..bd48f05
 +
 +    user_data! {
 +        enum Source {
++            Irq,
 +            Time,
 +            Scheme,
 +        }
 +    }
 +
++    let irq = Fd::open(&format!("/scheme/irq/{ETHERNET_IRQ}"), O_RDWR, 0)
++        .expect("seeqd: failed to open the Ethernet interrupt");
++
 +    let time_path = format!("/scheme/time/{}", syscall::CLOCK_MONOTONIC);
 +    let time = Fd::open(&time_path, O_RDWR, 0).expect("seeqd: failed to open the time scheme");
 +
 +    let event_queue = EventQueue::<Source>::new().expect("seeqd: could not create event queue");
++    event_queue
++        .subscribe(irq.raw(), Source::Irq, event::EventFlags::READ)
++        .expect("seeqd: failed to subscribe to the interrupt");
 +    event_queue
 +        .subscribe(time.raw(), Source::Time, event::EventFlags::READ)
 +        .expect("seeqd: failed to subscribe to the timer");
@@ -1286,6 +1301,16 @@ index 0000000..bd48f05
 +
 +    for event in event_queue.map(|e| e.expect("seeqd: failed to get next event")) {
 +        match event.user_data {
++            Source::Irq => {
++                // The kernel masked the line; clear the cause, serve the
++                // rings, then acknowledge to unmask it.
++                let mut count = [0u8; 8];
++                let len = irq.read(&mut count).unwrap_or(0);
++                scheme.adapter_mut().clear_interrupt();
++                scheme.adapter_mut().poll();
++                scheme.tick().unwrap();
++                let _ = irq.write(&count[..len]);
++            }
 +            Source::Time => {
 +                scheme.adapter_mut().poll();
 +                scheme.tick().unwrap();
