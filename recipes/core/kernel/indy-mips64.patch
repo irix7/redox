@@ -1,4 +1,4 @@
-From 0f4a88e5a14c00fff0ae2b31f17f493015a020a3 Mon Sep 17 00:00:00 2001
+From f5d855ab0a374bdcaa9a8fcf9db547e48b92b37c Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -26,6 +26,7 @@ data 56 KiB, bss 84 KiB), TFTP file 975,056 bytes, 2052 KiB permanently
 used after init_mm, 28,392 KiB (7098 frames) free with the 1 MiB heap mapped.
 
 Signed-off-by: belikh <io@jupiter.au>
+Signed-off-by: belikh <io@belic.net>
 ---
  Makefile                               |   7 +
  linkers/mips64.ld                      |  60 ++++
@@ -34,11 +35,12 @@ Signed-off-by: belikh <io@jupiter.au>
  rmm/src/lib.rs                         |   1 +
  src/arch/mips64/consts.rs              |  20 ++
  src/arch/mips64/cp0.rs                 | 112 ++++++++
- src/arch/mips64/debug.rs               |  19 ++
+ src/arch/mips64/debug.rs               |  24 ++
+ src/arch/mips64/device/arcs.rs         | 174 +++++++++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
- src/arch/mips64/device/mod.rs          |  23 ++
+ src/arch/mips64/device/mod.rs          |  24 ++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 338 ++++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 365 +++++++++++++++++++++++
  src/arch/mips64/interrupt/handler.rs   | 384 +++++++++++++++++++++++++
  src/arch/mips64/interrupt/irq.rs       |  90 ++++++
  src/arch/mips64/interrupt/mod.rs       |  47 +++
@@ -48,7 +50,7 @@ Signed-off-by: belikh <io@jupiter.au>
  src/arch/mips64/misc.rs                |  60 ++++
  src/arch/mips64/mod.rs                 |  91 ++++++
  src/arch/mips64/paging.rs              |  15 +
- src/arch/mips64/start.rs               | 275 ++++++++++++++++++
+ src/arch/mips64/start.rs               | 307 ++++++++++++++++++++
  src/arch/mips64/stop.rs                |  30 ++
  src/arch/mips64/time.rs                |  61 ++++
  src/arch/mod.rs                        |   6 +
@@ -57,7 +59,6 @@ Signed-off-by: belikh <io@jupiter.au>
  src/devices/mod.rs                     |   2 +
  src/devices/serial.rs                  |  13 +
  src/devices/uart_z85c30.rs             |  86 ++++++
- src/macros.rs                          |   2 +-
  src/main.rs                            |   1 +
  src/panic.rs                           |  15 +
  src/scheme/irq.rs                      |   2 +
@@ -67,12 +68,13 @@ Signed-off-by: belikh <io@jupiter.au>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 40 files changed, 2548 insertions(+), 13 deletions(-)
+ 40 files changed, 2786 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/consts.rs
  create mode 100644 src/arch/mips64/cp0.rs
  create mode 100644 src/arch/mips64/debug.rs
+ create mode 100644 src/arch/mips64/device/arcs.rs
  create mode 100644 src/arch/mips64/device/cpu/mod.rs
  create mode 100644 src/arch/mips64/device/mod.rs
  create mode 100644 src/arch/mips64/device/serial.rs
@@ -579,13 +581,13 @@ index 00000000..fe08c5ca
 +cp0_access!(read_context, write_context, 4);
 diff --git a/src/arch/mips64/debug.rs b/src/arch/mips64/debug.rs
 new file mode 100644
-index 00000000..b66a081c
+index 00000000..5d6cee9e
 --- /dev/null
 +++ b/src/arch/mips64/debug.rs
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,24 @@
 +use spin::MutexGuard;
 +
-+use crate::{arch::device::serial::COM1, devices::serial::SerialKind};
++use crate::{arch::device::{arcs, serial::COM1}, devices::serial::SerialKind};
 +
 +pub struct Writer<'a> {
 +    serial: MutexGuard<'a, SerialKind>,
@@ -599,8 +601,193 @@ index 00000000..b66a081c
 +    }
 +
 +    pub fn write(&mut self, buf: &[u8]) {
-+        self.serial.write(buf);
++        // The PROM console first: it is the screen on a machine with no
++        // serial cable. The lock above also serialises the firmware calls.
++        arcs::write(buf);
++        if arcs::direct_serial() {
++            self.serial.write(buf);
++        }
 +    }
++}
+diff --git a/src/arch/mips64/device/arcs.rs b/src/arch/mips64/device/arcs.rs
+new file mode 100644
+index 00000000..8b0991ba
+--- /dev/null
++++ b/src/arch/mips64/device/arcs.rs
+@@ -0,0 +1,174 @@
++//! Calls into the ARCS firmware (the Indy PROM).
++//!
++//! The PROM leaves a system parameter block at physical 0x1000. Its firmware
++//! vector is a table of 32-bit entry points: `GetMemoryDescriptor` is entry
++//! 18, `Write` 27 and `GetEnvironmentVariable` 30. File 1 is the PROM's
++//! console: the Newport screen, or Serial Port 1 when `ConsoleOut` is
++//! `serial(0)`.
++//!
++//! The PROM is 32-bit o32 code. It needs a 16-byte argument area at the stack
++//! pointer and it restores callee-saved registers with `lw`, which loses the
++//! upper half of a 64-bit value, so `arcs_call` saves them itself.
++//!
++//! The PROM is only callable while its own memory is intact, so `start`
++//! leaves every range the PROM reports as its own out of the frame allocator.
++
++use core::{
++    arch::naked_asm,
++    sync::atomic::{AtomicBool, Ordering},
++};
++
++use crate::arch::cp0;
++
++const SPB: *const u32 = 0xA000_1000 as *const u32;
++const SPB_SIGNATURE: u32 = 0x5343_5241;
++/// Word index of the firmware vector pointer in the parameter block.
++const SPB_FIRMWARE_VECTOR: usize = 8;
++
++const FN_GET_MEMORY_DESCRIPTOR: usize = 18;
++const FN_WRITE: usize = 27;
++const FN_GET_ENVIRONMENT_VARIABLE: usize = 30;
++
++const STDOUT: usize = 1;
++
++/// Memory descriptor types as SGI's ARCS numbers them.
++pub const MEM_FREE_CONTIGUOUS: u32 = 2;
++pub const MEM_FREE: u32 = 3;
++pub const MEM_LOADED_PROGRAM: u32 = 5;
++
++#[repr(C)]
++pub struct MemoryDescriptor {
++    pub kind: u32,
++    /// Physical page number, 4 KiB pages.
++    pub base_page: u32,
++    pub page_count: u32,
++}
++
++static PRESENT: AtomicBool = AtomicBool::new(false);
++/// The PROM console is the serial port: do not also write the port directly.
++static CONSOLE_IS_SERIAL: AtomicBool = AtomicBool::new(false);
++
++#[unsafe(naked)]
++unsafe extern "C" fn arcs_call(a0: usize, a1: usize, a2: usize, a3: usize, entry: usize) -> isize {
++    naked_asm!(
++        "
++        .set noreorder
++        addiu   $sp, $sp, -112
++        sd      $31, 104($sp)
++        sd      $16, 16($sp)
++        sd      $17, 24($sp)
++        sd      $18, 32($sp)
++        sd      $19, 40($sp)
++        sd      $20, 48($sp)
++        sd      $21, 56($sp)
++        sd      $22, 64($sp)
++        sd      $23, 72($sp)
++        sd      $30, 80($sp)
++        sd      $28, 88($sp)
++        move    $25, $8
++        jalr    $25
++        nop
++        ld      $31, 104($sp)
++        ld      $16, 16($sp)
++        ld      $17, 24($sp)
++        ld      $18, 32($sp)
++        ld      $19, 40($sp)
++        ld      $20, 48($sp)
++        ld      $21, 56($sp)
++        ld      $22, 64($sp)
++        ld      $23, 72($sp)
++        ld      $30, 80($sp)
++        ld      $28, 88($sp)
++        sll     $2, $2, 0
++        jr      $31
++        addiu   $sp, $sp, 112
++        .set reorder
++        "
++    )
++}
++
++/// Call firmware vector entry `index` with interrupts off: the PROM is not
++/// re-entrant and must not be preempted by our own handlers.
++unsafe fn call(index: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
++    unsafe {
++        let vector = SPB.add(SPB_FIRMWARE_VECTOR).read_volatile() as usize as *const u32;
++        let entry = vector.add(index).read_volatile() as usize;
++        let status = cp0::read_status();
++        cp0::write_status(status & !cp0::status::IE);
++        let ret = arcs_call(a0, a1, a2, a3, entry);
++        cp0::write_status(status);
++        ret
++    }
++}
++
++/// Look for the parameter block and read the `ConsoleOut` variable.
++pub unsafe fn init() {
++    unsafe {
++        if SPB.read_volatile() != SPB_SIGNATURE {
++            return;
++        }
++        PRESENT.store(true, Ordering::Relaxed);
++        let value = call(
++            FN_GET_ENVIRONMENT_VARIABLE,
++            b"ConsoleOut\0".as_ptr() as usize,
++            0,
++            0,
++            0,
++        ) as usize as *const u8;
++        // `serial(0)` or `video()`; headless, the PROM falls back to serial.
++        if !value.is_null() && value.read() == b's' {
++            CONSOLE_IS_SERIAL.store(true, Ordering::Relaxed);
++        }
++    }
++}
++
++pub fn present() -> bool {
++    PRESENT.load(Ordering::Relaxed)
++}
++
++/// True when the kernel should also drive Serial Port 1 itself.
++pub fn direct_serial() -> bool {
++    !present() || !CONSOLE_IS_SERIAL.load(Ordering::Relaxed)
++}
++
++fn write_raw(mut buf: &[u8]) {
++    while !buf.is_empty() {
++        let mut count: u32 = 0;
++        let status = unsafe {
++            call(
++                FN_WRITE,
++                STDOUT,
++                buf.as_ptr() as usize,
++                buf.len(),
++                &raw mut count as usize,
++            )
++        };
++        if status != 0 || count == 0 {
++            return;
++        }
++        buf = &buf[(count as usize).min(buf.len())..];
++    }
++}
++
++/// Write to the PROM console, sending CR LF for each LF.
++pub fn write(buf: &[u8]) {
++    if !present() {
++        return;
++    }
++    for (i, line) in buf.split(|&b| b == b'\n').enumerate() {
++        if i > 0 {
++            write_raw(b"\r\n");
++        }
++        write_raw(line);
++    }
++}
++
++/// The descriptor after `previous`, or the first one for `None`.
++pub fn memory_descriptor(previous: Option<&MemoryDescriptor>) -> Option<&'static MemoryDescriptor> {
++    if !present() {
++        return None;
++    }
++    let previous = previous.map_or(0, |d| d as *const MemoryDescriptor as usize);
++    let next = unsafe { call(FN_GET_MEMORY_DESCRIPTOR, previous, 0, 0, 0) } as usize;
++    unsafe { (next as *const MemoryDescriptor).as_ref() }
 +}
 diff --git a/src/arch/mips64/device/cpu/mod.rs b/src/arch/mips64/device/cpu/mod.rs
 new file mode 100644
@@ -621,14 +808,15 @@ index 00000000..e8c7e2c3
 +}
 diff --git a/src/arch/mips64/device/mod.rs b/src/arch/mips64/device/mod.rs
 new file mode 100644
-index 00000000..080c0e1f
+index 00000000..9d93a4ee
 --- /dev/null
 +++ b/src/arch/mips64/device/mod.rs
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,24 @@
 +//! Indy devices the kernel itself drives: the serial console and the CP0
 +//! timer. Everything else (HPC3, SCSI, Seeq Ethernet, Newport) is a userspace
 +//! scheme reached through fixed kseg1 addresses; there is no bus enumeration.
 +
++pub mod arcs;
 +pub mod cpu;
 +pub mod serial;
 +
@@ -670,10 +858,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..bf764181
+index 00000000..c6e18a7b
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,365 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -761,6 +949,17 @@ index 00000000..bf764181
 +        "
 +        .set noreorder
 +        .set noat
++        // Virtual coherency exceptions (R4000/R4400 with a secondary cache):
++        // the page was last cached under another virtual colour. Drop the
++        // primary line at this index, write the secondary line back and
++        // retry. Only $26/$27 are used, so no frame is needed.
++        mfc0    $26, $13
++        andi    $26, $26, 0x7c
++        xori    $27, $26, 0x7c          // 31: VCED
++        beqz    $27, 8f
++        xori    $27, $26, 0x38          // 14: VCEI
++        beqz    $27, 9f
++        nop
 +        move    $27, $sp
 +        mfc0    $26, $12
 +        andi    $26, $26, 0x18
@@ -800,6 +999,22 @@ index 00000000..bf764181
 +        ",
 +        pop_registers!(),
 +        "
++        eret
++        nop
++    8:
++        mfc0    $26, $8
++        li      $27, -4
++        and     $26, $26, $27
++        mtc0    $zero, $28
++        nop
++        cache   9, 0($26)               // Index_Store_Tag_D
++        cache   0x17, 0($26)            // Hit_Writeback_Inv_SD
++        eret
++        nop
++    9:
++        mfc0    $26, $8
++        nop
++        cache   0x17, 0($26)            // Hit_Writeback_Inv_SD
 +        eret
 +        nop
 +        .set at
@@ -1802,10 +2017,10 @@ index 00000000..62d40404
 +}
 diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
 new file mode 100644
-index 00000000..b7ea7466
+index 00000000..eea2d40d
 --- /dev/null
 +++ b/src/arch/mips64/start.rs
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,307 @@
 +//! Kernel entry from the SGI PROM.
 +//!
 +//! `boot -f bootp()redox` loads the ECOFF image at kseg0 0x8804_0000 and
@@ -1847,18 +2062,17 @@ index 00000000..b7ea7466
 +/// The environment handed to userspace through `sys:env`.
 +static ENV: &[u8] = b"BOOTSTRAP_LOG_LEVEL=info\n";
 +
-+static AREAS: SyncUnsafeCell<[AreaEntry; 2]> = SyncUnsafeCell::new([
-+    AreaEntry {
-+        base: 0,
-+        size: 0,
-+        kind: BootloaderMemoryKind::Null,
-+    },
-+    AreaEntry {
-+        base: 0,
-+        size: 0,
-+        kind: BootloaderMemoryKind::Null,
-+    },
-+]);
++const MAX_AREAS: usize = 16;
++
++static AREAS: SyncUnsafeCell<[AreaEntry; MAX_AREAS]> = SyncUnsafeCell::new(
++    [const {
++        AreaEntry {
++            base: 0,
++            size: 0,
++            kind: BootloaderMemoryKind::Null,
++        }
++    }; MAX_AREAS],
++);
 +
 +unsafe extern "C" {
 +    static __bss_start: u8;
@@ -1951,7 +2165,9 @@ index 00000000..b7ea7466
 +/// The entry to Rust, all things must be initialized
 +unsafe extern "C" fn start() -> ! {
 +    unsafe {
-+        // Set up serial debug
++        // The PROM console (the screen, or the serial port) and our own
++        // driver for Serial Port 1.
++        device::arcs::init();
 +        device::serial::init();
 +
 +        info!("Redox OS starting...");
@@ -2001,11 +2217,42 @@ index 00000000..b7ea7466
 +            size: consts::LOW_RESERVED_BYTES as u64,
 +            kind: BootloaderMemoryKind::Reserved,
 +        };
-+        areas[1] = AreaEntry {
-+            base: kernel_base as u64,
-+            size: (ram - consts::LOW_RESERVED_BYTES) as u64,
-+            kind: BootloaderMemoryKind::Free,
-+        };
++        let mut area_count = 1;
++        if device::arcs::present() {
++            // Take what the PROM calls free, and the image it loaded. Its own
++            // ranges stay out of the allocator so its console keeps working.
++            let floor = kernel_base as u64;
++            let ceiling = (consts::RAM_PHYS_BASE + ram) as u64;
++            let mut descriptor = device::arcs::memory_descriptor(None);
++            while let Some(d) = descriptor {
++                let start = (d.base_page as u64) << 12;
++                let end = start + ((d.page_count as u64) << 12);
++                info!("Indy: PROM memory type {} at {:#x}..{:#x}", d.kind, start, end);
++                let usable = matches!(
++                    d.kind,
++                    device::arcs::MEM_FREE
++                        | device::arcs::MEM_FREE_CONTIGUOUS
++                        | device::arcs::MEM_LOADED_PROGRAM
++                );
++                let (start, end) = (start.max(floor), end.min(ceiling));
++                if usable && start < end && area_count < MAX_AREAS {
++                    areas[area_count] = AreaEntry {
++                        base: start,
++                        size: end - start,
++                        kind: BootloaderMemoryKind::Free,
++                    };
++                    area_count += 1;
++                }
++                descriptor = device::arcs::memory_descriptor(Some(d));
++            }
++        } else {
++            areas[1] = AreaEntry {
++                base: kernel_base as u64,
++                size: (ram - consts::LOW_RESERVED_BYTES) as u64,
++                kind: BootloaderMemoryKind::Free,
++            };
++            area_count = 2;
++        }
 +
 +        let stack_base = STACK.get() as usize - PHYS_OFFSET;
 +        let args = KernelArgs {
@@ -2019,7 +2266,7 @@ index 00000000..b7ea7466
 +            hwdesc_size: 0,
 +            // Read directly, not through phys_to_virt: give the kseg0 address.
 +            areas_base: AREAS.get() as usize as u64,
-+            areas_size: size_of::<[AreaEntry; 2]>() as u64,
++            areas_size: (area_count * size_of::<AreaEntry>()) as u64,
 +            bootstrap_base: bootstrap_base as u64,
 +            bootstrap_size: bootstrap_size as u64,
 +        };
@@ -2582,19 +2829,6 @@ index 00000000..75bc3dc0
 +        }
 +    }
 +}
-diff --git a/src/macros.rs b/src/macros.rs
-index 2f81a3cb..34a5abd9 100644
---- a/src/macros.rs
-+++ b/src/macros.rs
-@@ -40,7 +40,7 @@ macro_rules! info {
- #[macro_export]
- macro_rules! debug {
-     ($($arg:tt)*) => {
--        if cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {
-+        if cfg!(any(target_arch = "aarch64", target_arch = "riscv64", target_arch = "mips64")) {
-             println!("{}:DEBUG -- {}", core::module_path!(), format_args!($($arg)*));
-         }
-     };
 diff --git a/src/main.rs b/src/main.rs
 index a29621fa..3f05f23d 100644
 --- a/src/main.rs

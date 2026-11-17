@@ -15,6 +15,7 @@
 #   WORK            working directory
 #   MONITOR_PORT    iris monitor port (default 18893); give concurrent runs their own
 #   SHELL_PORT      host port forwarded to the guest's TCP shell (default 12323)
+#   IRIS_ARGS       extra emulator options, e.g. "--cache full --cpu r5000"
 #   SHELL_CHECK     1 to also drive the TCP shell: run a command, then `reboot`
 #                   and wait for the PROM to come back
 set -euo pipefail
@@ -64,7 +65,7 @@ TOML
 
 IRIS_NO_IDLE=1 IRIS_TFTP_TRACE=1 "$IRIS" --config "$WORK/machine.toml" --ci \
   --ci-socket "$WORK/iris.sock" --monitor-port "$MONITOR_PORT" \
-  --serial-log "$WORK/serial.log" --headless --noaudio >"$WORK/iris.out" 2>&1 &
+  --serial-log "$WORK/serial.log" --headless --noaudio ${IRIS_ARGS:-} >"$WORK/iris.out" 2>&1 &
 IRIS_PID=$!
 
 cleanup() {
