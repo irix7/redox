@@ -160,6 +160,7 @@ file over the TCP shell. The gate image is built in `build/indy/webfs-gate`;
 
 Not covered: `mmap` of files on the scheme.
 
-On iris a request on a connection that sat idle for some seconds can stall until the
-client's 30 second I/O timeout, after which the retry on a new connection succeeds. The
-real machine does not show this.
+The client reuses a kept connection only within 2 seconds of its last exchange. The
+stalls seen on iris in November 2026 were first blamed on idle connections; the cause
+was the kernel's timer, which stopped for about a minute after a late tick (fixed in the
+kernel).

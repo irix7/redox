@@ -1,0 +1,16 @@
+[package]
+name = "kdbg"
+version = "0.1.0"
+edition = "2024"
+description = "GDB remote protocol server for inspecting the running Indy kernel"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+lto = true
+codegen-units = 1
+debug = false
+strip = "symbols"

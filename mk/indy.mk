@@ -70,6 +70,13 @@ RUST_SRC?=/mnt/europa/redox-rust-src/library
 $(SYSROOT)/lib/libc.a: FORCE
 	tools/relibc-indy.sh $(CURDIR)/$(SYSROOT)
 
+# kdbg: the GDB remote protocol server for tools/indy-gdb.sh.
+KDBG_ELF=tools/kdbg/target/mips64-sgi-redox/release/kdbg
+
+$(KDBG_ELF): $(SYSROOT)/lib/libc.a $(wildcard tools/kdbg/src/*.rs) tools/kdbg/Cargo.toml tools/kdbg/.cargo/config.toml
+	touch tools/kdbg/src/main.rs
+	cd tools/kdbg && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) __CARGO_TESTS_ONLY_SRC_ROOT=$(RUST_SRC) cargo build --release
+
 $(INIT_ELF): $(SYSROOT)/lib/libc.a $(wildcard tools/indy-sh/src/*.rs) tools/indy-sh/Cargo.toml tools/indy-sh/.cargo/config.toml
 	touch tools/indy-sh/src/main.rs
 	cd tools/indy-sh && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) __CARGO_TESTS_ONLY_SRC_ROOT=$(RUST_SRC) cargo build --release
@@ -125,12 +132,13 @@ indy: $(INDY_BUILD)/redox
 
 # The root tree: config/indy/root plus the programs, packed into the store.
 # Packing is incremental and only `root` changes for clients.
-indy-root: $(WEBFS_HOST) $(WEBFS_ELF) $(INIT_ELF) $(BASE_OUT)/init
+indy-root: $(WEBFS_HOST) $(WEBFS_ELF) $(INIT_ELF) $(KDBG_ELF) $(BASE_OUT)/init
 	rm -rf $(ROOT_DIR)
 	mkdir -p $(ROOT_DIR)/usr/bin
 	cp -r config/indy/root/. $(ROOT_DIR)/
 	for bin in $(ROOT_BINS); do install -m 0755 $(BASE_OUT)/$$bin $(ROOT_DIR)/usr/bin/$$bin; done
 	install -m 0755 $(INIT_ELF) $(ROOT_DIR)/usr/bin/sh
+	install -m 0755 $(KDBG_ELF) $(ROOT_DIR)/usr/bin/kdbg
 	install -m 0755 $(WEBFS_ELF) $(ROOT_DIR)/usr/bin/webfs
 	ln -s usr/bin $(ROOT_DIR)/bin
 	$(WEBFS_HOST) pack $(ROOT_DIR) $(INDY_STORE)

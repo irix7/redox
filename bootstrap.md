@@ -734,6 +734,10 @@ and none of them is on the critical path to "the machine runs our code".
   and an assembly handler serves the refills that need no cache work. A kernel-scheme
   syscall takes about 12 to 20 microseconds and webfs reads about 90 KiB/s. A call to a
   user scheme still takes about 1.8 ms, nearly all of it in the kernel's scheme path.
+  A debugger exists since 2026-11-18: `tools/indy-gdb.sh` attaches GDB to the running
+  machine through `kdbg` on TCP port 2159 (read-only: every context is a thread, kernel
+  stacks unwind with source lines, memory and statics can be read). Its first use found
+  the timer stopping for a minute after a late tick.
   Open: that IPC cost, no ASIDs (the TLB is flushed on every switch), the machine does not
   answer ping, the store server is started by hand.
 - **T9 — next.** First real-hardware boot and whatever it shows; shrink the initfs (4.4 MiB

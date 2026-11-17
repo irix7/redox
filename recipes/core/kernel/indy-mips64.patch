@@ -1,4 +1,4 @@
-From 7ad210bcc5719231b91a25637d972c9dc8b08ce8 Mon Sep 17 00:00:00 2001
+From 582c11db8645b5428c05f2d8d6c927cd9cf251a1 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -41,7 +41,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/device/cpu/mod.rs      |  11 +
  src/arch/mips64/device/mod.rs          |  24 +
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 746 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 753 +++++++++++++++++++++++++
  src/arch/mips64/interrupt/handler.rs   | 396 +++++++++++++
  src/arch/mips64/interrupt/irq.rs       |  90 +++
  src/arch/mips64/interrupt/mod.rs       |  47 ++
@@ -51,11 +51,11 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/misc.rs                |  60 ++
  src/arch/mips64/mod.rs                 |  92 +++
  src/arch/mips64/paging.rs              |  26 +
- src/arch/mips64/start.rs               | 347 ++++++++++++
+ src/arch/mips64/start.rs               | 355 ++++++++++++
  src/arch/mips64/stop.rs                |  47 ++
- src/arch/mips64/time.rs                | 160 ++++++
+ src/arch/mips64/time.rs                | 169 ++++++
  src/arch/mod.rs                        |   6 +
- src/context/arch/mips64.rs             | 226 ++++++++
+ src/context/arch/mips64.rs             | 235 ++++++++
  src/context/memory.rs                  |  44 +-
  src/context/mod.rs                     |   4 +
  src/devices/mod.rs                     |   2 +
@@ -66,14 +66,15 @@ Signed-off-by: belikh <io@belic.net>
  src/panic.rs                           |  15 +
  src/scheme/irq.rs                      |   2 +
  src/scheme/proc.rs                     |   8 +-
- src/scheme/sys/mod.rs                  |  17 +
+ src/scheme/sys/kdbg.rs                 | 165 ++++++
+ src/scheme/sys/mod.rs                  |  25 +
  src/scheme/user.rs                     |   4 +-
  src/startup/mod.rs                     |  20 +-
  syscall/src/arch/mips64.rs             | 232 ++++++++
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 +
- 45 files changed, 4030 insertions(+), 17 deletions(-)
+ 46 files changed, 4236 insertions(+), 17 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -99,6 +100,7 @@ Signed-off-by: belikh <io@belic.net>
  create mode 100644 src/arch/mips64/time.rs
  create mode 100644 src/context/arch/mips64.rs
  create mode 100644 src/devices/uart_z85c30.rs
+ create mode 100644 src/scheme/sys/kdbg.rs
  create mode 100644 syscall/src/arch/mips64.rs
  create mode 100644 targets/mips64-unknown-kernel.json
 
@@ -1437,10 +1439,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..8fa30ffb
+index 00000000..f447a113
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,746 @@
+@@ -0,0 +1,753 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -1951,7 +1953,14 @@ index 00000000..8fa30ffb
 +        // firmware call runs with interrupts off and polls the controller.
 +        static KEYBOARD_DIVIDER: core::sync::atomic::AtomicU32 =
 +            core::sync::atomic::AtomicU32::new(0);
-+        if KEYBOARD_DIVIDER.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 4 == 0 {
++        // A firmware poll costs about 3 ms with interrupts off, so it only
++        // runs when the keyboard controller (IOC2, status at 0xBFBD9847,
++        // bit 0: output buffer full) has something, and once a second
++        // regardless in case that test is wrong for some PROM.
++        const KEYBOARD_STATUS: *const u8 = 0xBFBD_9847 as *const u8;
++        let tick = KEYBOARD_DIVIDER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++        let waiting = unsafe { KEYBOARD_STATUS.read_volatile() } & 1 != 0;
++        if tick % 4 == 0 && (waiting || tick % 100 == 0) {
 +            let console = crate::arch::device::serial::COM1.lock();
 +            let mut any = false;
 +            for _ in 0..8 {
@@ -3001,10 +3010,10 @@ index 00000000..599f5488
 +}
 diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
 new file mode 100644
-index 00000000..df674afd
+index 00000000..3f5b5044
 --- /dev/null
 +++ b/src/arch/mips64/start.rs
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,355 @@
 +//! Kernel entry from the SGI PROM.
 +//!
 +//! `boot -f bootp()redox` loads the ECOFF image at kseg0 0x8804_0000 and
@@ -3201,6 +3210,7 @@ index 00000000..df674afd
 +        info!("Indy: BEV off, exceptions come to the kernel");
 +
 +        let ram = ram_bytes();
++        RAM_SIZE.store(ram, core::sync::atomic::Ordering::Relaxed);
 +        let kernel_base = consts::RAM_PHYS_BASE + consts::LOW_RESERVED_BYTES;
 +        let kernel_end_virt = &raw const __end as usize;
 +        let kernel_size = kernel_end_virt - crate::kernel_executable_offsets::KERNEL_OFFSET();
@@ -3352,6 +3362,13 @@ index 00000000..df674afd
 +}
 +
 +const PHYS_OFFSET: usize = <crate::arch::CurrentRmmArch as rmm::Arch>::PHYS_OFFSET;
++
++static RAM_SIZE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
++
++/// Bytes of RAM from `RAM_PHYS_BASE`, as sized at boot.
++pub fn ram_size() -> usize {
++    RAM_SIZE.load(core::sync::atomic::Ordering::Relaxed)
++}
 diff --git a/src/arch/mips64/stop.rs b/src/arch/mips64/stop.rs
 new file mode 100644
 index 00000000..49d7eee0
@@ -3407,10 +3424,10 @@ index 00000000..49d7eee0
 +}
 diff --git a/src/arch/mips64/time.rs b/src/arch/mips64/time.rs
 new file mode 100644
-index 00000000..0bbbbb0a
+index 00000000..411e3cdb
 --- /dev/null
 +++ b/src/arch/mips64/time.rs
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,169 @@
 +//! Monotonic time from CP0 Count.
 +//!
 +//! Count runs at half the pipeline clock. The PROM measures the CPU clock
@@ -3489,10 +3506,19 @@ index 00000000..0bbbbb0a
 +        COUNT_HIGH.fetch_add(1 << 32, Ordering::Relaxed);
 +    }
 +    LAST_COUNT.store(now, Ordering::Relaxed);
++    // Arm the next tick one period after the last. If the kernel kept
++    // interrupts off past that point, Count is already beyond it and the
++    // match would not come until Count wraps, about a minute later: start
++    // again from now. (Found with kdbg: TICKS stood at 1 a minute after
++    // boot.)
++    let period = COUNTS_PER_TICK.load(Ordering::Relaxed);
++    let mut next = cp0::read_compare().wrapping_add(period);
++    let ahead = next.wrapping_sub(cp0::read_count()) as i32;
++    if ahead < (period / 16) as i32 {
++        next = cp0::read_count().wrapping_add(period);
++    }
 +    unsafe {
-+        cp0::write_compare(
-+            cp0::read_compare().wrapping_add(COUNTS_PER_TICK.load(Ordering::Relaxed)),
-+        );
++        cp0::write_compare(next);
 +    }
 +}
 +
@@ -3587,10 +3613,10 @@ index 2aae6399..e5791c1e 100644
 +pub use self::mips64::*;
 diff --git a/src/context/arch/mips64.rs b/src/context/arch/mips64.rs
 new file mode 100644
-index 00000000..2d12d483
+index 00000000..c8d1533a
 --- /dev/null
 +++ b/src/context/arch/mips64.rs
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,235 @@
 +use crate::{
 +    arch::interrupt::InterruptStack, context::context::Kstack, memory::RmmA, percpu::PercpuBlock,
 +    syscall::FloatRegisters,
@@ -3631,6 +3657,15 @@ index 00000000..2d12d483
 +            status: crate::arch::cp0::status::IM_ENABLED as u64,
 +            ..Self::default()
 +        }
++    }
++
++    /// What `switch_to` saved, for the debugger: sp, ra, fp, gp, s0..s7,
++    /// status.
++    pub fn debug_regs(&self) -> [u64; 13] {
++        [
++            self.sp, self.ra, self.fp, self.gp, self.s0, self.s1, self.s2, self.s3, self.s4,
++            self.s5, self.s6, self.s7, self.status,
++        ]
 +    }
 +
 +    fn set_stack(&mut self, address: usize) {
@@ -4188,11 +4223,204 @@ index 4d974bf4..03da6c24 100644
                          src_page_count,
                          map.flags,
                          Some(&mut notify_files),
+diff --git a/src/scheme/sys/kdbg.rs b/src/scheme/sys/kdbg.rs
+new file mode 100644
+index 00000000..05282a3f
+--- /dev/null
++++ b/src/scheme/sys/kdbg.rs
+@@ -0,0 +1,165 @@
++//! Read-only inspection of the running kernel for a remote debugger.
++//!
++//! `tools/kdbg` on the Indy speaks the GDB remote protocol on a TCP port and
++//! answers from two files here. The kernel keeps running: this shows state,
++//! it does not stop anything.
++//!
++//! - `kdbg_ctx`: one line per context, all numbers hexadecimal:
++//!   `id pid running table kernel-registers(13) user(0|1) [user-registers(37)] name`.
++//!   Kernel registers are what `switch_to` saved: sp, ra, fp, gp, s0..s7,
++//!   status. They are stale for a context that is running. User registers
++//!   are `$1`..`$31`, then pc, status, cause, badvaddr, hi, lo from the trap
++//!   frame.
++//! - `kdbg_mem`: write `table address length`, then read up to that many
++//!   bytes. `table` is the physical address of a context's page table for a
++//!   user address, or 0. The read stops at the first page that is not
++//!   mapped RAM.
++
++use alloc::{string::String, vec::Vec};
++use core::{
++    fmt::Write,
++    sync::atomic::{AtomicUsize, Ordering},
++};
++
++use rmm::Arch;
++
++use crate::{
++    context::contexts,
++    memory::RmmA,
++    sync::CleanLockToken,
++    syscall::error::{Error, Result, EINVAL},
++};
++
++static REQUEST: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
++const MAX_READ: usize = 4096;
++
++pub fn contexts_resource(token: &mut CleanLockToken) -> Result<Vec<u8>> {
++    let mut out = String::new();
++    let mut contexts = contexts(token.downgrade());
++    let (contexts, mut token) = contexts.token_split();
++    for context_ref in contexts.iter() {
++        let context = context_ref.read(token.token());
++        let addr_space = context.addr_space().cloned();
++        let _ = write!(
++            out,
++            "{:x} {:x} {:x} ",
++            context.debug_id,
++            context.pid,
++            u8::from(context.running)
++        );
++        let kernel = context.arch.debug_regs();
++        let user = context.regs().map(|stack| {
++            let r = &stack.registers;
++            [
++                r.at, r.v0, r.v1, r.a0, r.a1, r.a2, r.a3, r.a4, r.a5, r.a6, r.a7, r.t0, r.t1,
++                r.t2, r.t3, r.s0, r.s1, r.s2, r.s3, r.s4, r.s5, r.s6, r.s7, r.t8, r.t9, r.k0,
++                r.k1, r.gp, r.sp, r.fp, r.ra, stack.iret.epc, stack.iret.status,
++                stack.iret.cause, stack.iret.badvaddr, stack.iret.hi, stack.iret.lo,
++            ]
++        });
++        let name = context.name;
++        drop(context);
++
++        let table = match addr_space {
++            Ok(addr_space) => {
++                let guard = addr_space.acquire_read(token.downgrade());
++                guard.table.utable.table().phys().data()
++            }
++            Err(_) => 0,
++        };
++        let _ = write!(out, "{:x}", table);
++        for value in kernel {
++            let _ = write!(out, " {:x}", value);
++        }
++        match user {
++            Some(regs) => {
++                out.push_str(" 1");
++                for value in regs {
++                    let _ = write!(out, " {:x}", value);
++                }
++            }
++            None => out.push_str(" 0"),
++        }
++        let _ = writeln!(out, " {}", name);
++    }
++    Ok(out.into_bytes())
++}
++
++pub fn mem_request(arg: &[u8], _token: &mut CleanLockToken) -> Result<usize> {
++    let text = core::str::from_utf8(arg).map_err(|_| Error::new(EINVAL))?;
++    let mut fields = text.split_ascii_whitespace();
++    for slot in &REQUEST {
++        let field = fields.next().ok_or(Error::new(EINVAL))?;
++        let value = usize::from_str_radix(field, 16).map_err(|_| Error::new(EINVAL))?;
++        slot.store(value, Ordering::Relaxed);
++    }
++    Ok(arg.len())
++}
++
++pub fn mem_resource(_token: &mut CleanLockToken) -> Result<Vec<u8>> {
++    let table = REQUEST[0].load(Ordering::Relaxed);
++    let mut addr = REQUEST[1].load(Ordering::Relaxed);
++    let mut left = REQUEST[2].load(Ordering::Relaxed).min(MAX_READ);
++    let mut out = Vec::with_capacity(left);
++    while left > 0 {
++        let Some(source) = resolve(table, addr) else {
++            break;
++        };
++        let chunk = left.min(RmmA::PAGE_SIZE - (addr & (RmmA::PAGE_SIZE - 1)));
++        for i in 0..chunk {
++            out.push(unsafe { (source as *const u8).add(i).read_volatile() });
++        }
++        addr = addr.wrapping_add(chunk);
++        left -= chunk;
++    }
++    Ok(out)
++}
++
++/// A kernel address through which the byte at `addr` can be read safely, or
++/// `None` when nothing readable is there.
++fn resolve(table: usize, addr: usize) -> Option<usize> {
++    const KSEG0: usize = 0x8000_0000;
++    const KSEG1: usize = 0xA000_0000;
++    const KSEG2: usize = 0xC000_0000;
++    const PROM: core::ops::Range<usize> = 0xBFC0_0000..0xBFC8_0000;
++    let ram = crate::arch::consts::RAM_PHYS_BASE
++        ..crate::arch::consts::RAM_PHYS_BASE + crate::arch::start::ram_size();
++    if (KSEG0..KSEG1).contains(&addr) {
++        let phys = addr - KSEG0;
++        return (phys < 0x8_0000 || ram.contains(&phys)).then_some(addr);
++    }
++    if (KSEG1..KSEG2).contains(&addr) {
++        // Devices have read side effects; only the PROM is offered.
++        return PROM.contains(&addr).then_some(addr);
++    }
++    // TLB-mapped: walk the table by hand, through kseg0.
++    let root = if table != 0 && addr < KSEG0 {
++        table
++    } else {
++        RmmA::table(rmm::TableKind::User).data()
++    };
++    if !ram.contains(&root) {
++        return None;
++    }
++    unsafe {
++        let directory = (root + KSEG0) as *const usize;
++        let pde = directory.add(addr >> 22).read_volatile();
++        if pde & RmmA::ENTRY_FLAG_PRESENT == 0 {
++            return None;
++        }
++        let table_phys =
++            ((pde >> RmmA::ENTRY_ADDRESS_SHIFT) & RmmA::ENTRY_ADDRESS_MASK) << RmmA::PAGE_SHIFT;
++        if !ram.contains(&table_phys) {
++            return None;
++        }
++        let pte = ((table_phys + KSEG0) as *const usize)
++            .add((addr >> 12) & 0x3ff)
++            .read_volatile();
++        if pte & RmmA::ENTRY_FLAG_PRESENT == 0 || pte & rmm::mips::PTE_UNCACHED != 0 {
++            return None;
++        }
++        let frame =
++            ((pte >> RmmA::ENTRY_ADDRESS_SHIFT) & RmmA::ENTRY_ADDRESS_MASK) << RmmA::PAGE_SHIFT;
++        ram.contains(&frame).then_some(frame + KSEG0 + (addr & 0xfff))
++    }
++}
 diff --git a/src/scheme/sys/mod.rs b/src/scheme/sys/mod.rs
-index f4c0dba6..8b4e4f19 100644
+index f4c0dba6..fdcbcc3b 100644
 --- a/src/scheme/sys/mod.rs
 +++ b/src/scheme/sys/mod.rs
-@@ -103,6 +103,23 @@ const FILES: &[(&str, Kind)] = &[
+@@ -31,6 +31,8 @@ mod cpu;
+ mod exe;
+ mod fdstat;
+ mod iostat;
++#[cfg(target_arch = "mips64")]
++mod kdbg;
+ mod irq;
+ mod log;
+ #[cfg(all(feature = "numa", target_arch = "x86_64"))]
+@@ -86,6 +88,12 @@ const FILES: &[(&str, Kind)] = &[
+     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+     ("spurious_irq", Rd(interrupt::irq::spurious_irq_resource)),
+     ("stat", Rd(stat::resource)),
++    #[cfg(target_arch = "mips64")]
++    ("kdbg_ctx", Rd(kdbg::contexts_resource)),
++    #[cfg(target_arch = "mips64")]
++    ("kdbg_mem", Rd(kdbg::mem_resource)),
++    #[cfg(target_arch = "mips64")]
++    ("kdbg_req", Wr(kdbg::mem_request)),
+     // Disabled because the debugger is inherently unsafe and probably will break the system.
+     /*
+     ("trigger_debugger", Rd(|token| unsafe {
+@@ -103,6 +111,23 @@ const FILES: &[(&str, Kind)] = &[
              match arg.trim_ascii() {
                  b"shutdown" => crate::stop::kstop(token),
                  b"reset" => crate::stop::kreset(),

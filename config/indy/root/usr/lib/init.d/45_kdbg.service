@@ -1,0 +1,7 @@
+[unit]
+description = "GDB remote protocol server on TCP port 2159: read-only kernel inspection"
+requires_weak = ["00_nulld.service"]
+
+[service]
+cmd = "kdbg"
+type = "oneshot_async"

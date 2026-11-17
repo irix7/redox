@@ -264,9 +264,10 @@ impl Client {
         };
         let tcp = TcpStream::connect((address, self.url.port))?;
         // Not every network stack has these options; the request still works.
+        // TCP_NODELAY is left alone: each request goes out in one write, and
+        // relibc on Redox logs a "TODO: setsockopt" line for the option.
         let _ = tcp.set_read_timeout(Some(IO_TIMEOUT));
         let _ = tcp.set_write_timeout(Some(IO_TIMEOUT));
-        let _ = tcp.set_nodelay(true);
         let stream = if self.url.tls {
             Stream::Tls(Box::new(TlsStream::connect(tcp, &self.url.host, &self.trust)?))
         } else {
