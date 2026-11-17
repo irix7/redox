@@ -1,4 +1,4 @@
-From 781a41dd8c530bbd7022fa30bff677e4ef270aab Mon Sep 17 00:00:00 2001
+From 2dee244c2d965014ba4d7eca8e697644b15dc885 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -30,27 +30,28 @@ Signed-off-by: belikh <io@belic.net>
 ---
  Makefile                               |   7 +
  linkers/mips64.ld                      |  60 ++++
- rmm/src/arch/mips.rs                   | 208 ++++++++++++++
+ rmm/src/arch/mips.rs                   | 208 +++++++++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
+ src/arch/mips64/cache.rs               |  93 ++++++
  src/arch/mips64/consts.rs              |  20 ++
- src/arch/mips64/cp0.rs                 | 112 ++++++++
+ src/arch/mips64/cp0.rs                 | 112 +++++++
  src/arch/mips64/debug.rs               |  24 ++
  src/arch/mips64/device/arcs.rs         | 174 +++++++++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
  src/arch/mips64/device/mod.rs          |  24 ++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 365 +++++++++++++++++++++++
- src/arch/mips64/interrupt/handler.rs   | 384 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 386 ++++++++++++++++++++++++
+ src/arch/mips64/interrupt/handler.rs   | 390 +++++++++++++++++++++++++
  src/arch/mips64/interrupt/irq.rs       |  90 ++++++
  src/arch/mips64/interrupt/mod.rs       |  47 +++
  src/arch/mips64/interrupt/syscall.rs   |   4 +
  src/arch/mips64/interrupt/trace.rs     |  19 ++
  src/arch/mips64/ipi.rs                 |  24 ++
  src/arch/mips64/misc.rs                |  60 ++++
- src/arch/mips64/mod.rs                 |  91 ++++++
- src/arch/mips64/paging.rs              |  25 ++
- src/arch/mips64/start.rs               | 307 ++++++++++++++++++++
+ src/arch/mips64/mod.rs                 |  92 ++++++
+ src/arch/mips64/paging.rs              |  26 ++
+ src/arch/mips64/start.rs               | 307 +++++++++++++++++++
  src/arch/mips64/stop.rs                |  30 ++
  src/arch/mips64/time.rs                |  61 ++++
  src/arch/mod.rs                        |   6 +
@@ -68,9 +69,10 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 40 files changed, 2831 insertions(+), 12 deletions(-)
+ 41 files changed, 2953 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
+ create mode 100644 src/arch/mips64/cache.rs
  create mode 100644 src/arch/mips64/consts.rs
  create mode 100644 src/arch/mips64/cp0.rs
  create mode 100644 src/arch/mips64/debug.rs
@@ -435,6 +437,105 @@ index 1f2c1a13..ccbee701 100644
  
  use core::ops::AddAssign;
  
+diff --git a/src/arch/mips64/cache.rs b/src/arch/mips64/cache.rs
+new file mode 100644
+index 00000000..cb70e2ca
+--- /dev/null
++++ b/src/arch/mips64/cache.rs
+@@ -0,0 +1,93 @@
++//! Primary cache flushing.
++//!
++//! The R4x00 and R5000 primary caches are indexed by virtual address and are
++//! larger per way than a 4 KiB page, so one frame reached through two
++//! addresses of different colour (kseg0 and a user mapping, or two user
++//! mappings) has two independent cached copies. The instruction cache also
++//! fills from RAM and does not see data still held in the data cache. Only
++//! an R4000/R4400 with a secondary cache traps on this (VCED/VCEI).
++//!
++//! The kernel keeps the copies apart in time. The data cache is written
++//! back and emptied when a trap from user mode is about to touch frames,
++//! and both caches are emptied before the return to user mode. User code
++//! therefore starts on RAM that is current, and the kernel reads frames the
++//! user's cached lines have already reached. A refill served from the page
++//! table touches no frame and skips both.
++//!
++//! This costs every trap two passes over the caches. It is the first
++//! correct version; tracking which frames are cached under which colour is
++//! the cheaper design to move to.
++
++use core::sync::atomic::{AtomicUsize, Ordering};
++
++use super::cp0;
++
++static DCACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
++static DCACHE_LINE: AtomicUsize = AtomicUsize::new(16);
++static ICACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
++static ICACHE_LINE: AtomicUsize = AtomicUsize::new(16);
++
++/// Index operations select the line (and the way, with the top index bit)
++/// from the address, so any kseg0 range of the cache's size reaches it all.
++const BASE: usize = 0x8000_0000;
++
++/// Read the primary cache geometry from Config: IC bits 11..9 and DC bits
++/// 8..6 give 4 KiB << n, IB bit 5 and DB bit 4 give 16- or 32-byte lines.
++pub fn init() {
++    let config = cp0::read_config();
++    let icache = 4096usize << ((config >> 9) & 7);
++    let dcache = 4096usize << ((config >> 6) & 7);
++    let iline = if config & (1 << 5) != 0 { 32 } else { 16 };
++    let dline = if config & (1 << 4) != 0 { 32 } else { 16 };
++    ICACHE_BYTES.store(icache, Ordering::Relaxed);
++    ICACHE_LINE.store(iline, Ordering::Relaxed);
++    DCACHE_BYTES.store(dcache, Ordering::Relaxed);
++    DCACHE_LINE.store(dline, Ordering::Relaxed);
++    info!(
++        "Indy: primary caches I {} KiB/{} B lines, D {} KiB/{} B lines",
++        icache >> 10,
++        iline,
++        dcache >> 10,
++        dline
++    );
++}
++
++/// Write back and invalidate every data cache line.
++pub fn flush_data() {
++    let line = DCACHE_LINE.load(Ordering::Relaxed);
++    let end = BASE + DCACHE_BYTES.load(Ordering::Relaxed);
++    let mut addr = BASE;
++    while addr < end {
++        unsafe {
++            core::arch::asm!(
++                "cache 1, 0({0})", // Index_Writeback_Inv_D
++                in(reg) addr,
++                options(nostack)
++            );
++        }
++        addr += line;
++    }
++}
++
++/// Invalidate every instruction cache line.
++pub fn flush_instructions() {
++    let line = ICACHE_LINE.load(Ordering::Relaxed);
++    let end = BASE + ICACHE_BYTES.load(Ordering::Relaxed);
++    let mut addr = BASE;
++    while addr < end {
++        unsafe {
++            core::arch::asm!(
++                "cache 0, 0({0})", // Index_Invalidate_I
++                in(reg) addr,
++                options(nostack)
++            );
++        }
++        addr += line;
++    }
++}
++
++/// Both caches, before user code runs.
++pub extern "C" fn flush_for_user() {
++    flush_data();
++    flush_instructions();
++}
 diff --git a/src/arch/mips64/consts.rs b/src/arch/mips64/consts.rs
 new file mode 100644
 index 00000000..84217eeb
@@ -858,10 +959,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..db11c806
+index 00000000..3eb5694a
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,386 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -1031,21 +1132,39 @@ index 00000000..db11c806
 +        let exc_code = (cause_reg & cause::EXC_CODE_MASK) >> cause::EXC_CODE_SHIFT;
 +        let user_mode = regs.iret.status as u32 & cp0::status::KSU_MASK != 0;
 +
-+        match exc_code {
-+            cause::EXC_INT => handle_interrupt(regs, cause_reg),
-+            cause::EXC_MOD | cause::EXC_TLBL | cause::EXC_TLBS => {
-+                if !tlb_fault(regs, exc_code, user_mode) {
-+                    if user_mode {
-+                        handle_user_exception(regs, exc_code);
-+                    } else {
-+                        handle_system_exception(regs, exc_code);
-+                    }
-+                }
++        // See arch::cache: frames are about to be touched on behalf of user
++        // code, except by a refill served from the page table.
++        let is_tlb = matches!(exc_code, cause::EXC_MOD | cause::EXC_TLBL | cause::EXC_TLBS);
++        if is_tlb {
++            match tlb_fault(regs, exc_code, user_mode) {
++                TlbOutcome::Refilled => return,
++                TlbOutcome::Handled => {}
++                TlbOutcome::Failed if user_mode => handle_user_exception(regs, exc_code),
++                TlbOutcome::Failed => handle_system_exception(regs, exc_code),
 +            }
-+            _ if user_mode => handle_user_exception(regs, exc_code),
-+            _ => handle_system_exception(regs, exc_code),
++        } else {
++            if user_mode {
++                crate::arch::cache::flush_data();
++            }
++            match exc_code {
++                cause::EXC_INT => handle_interrupt(regs, cause_reg),
++                _ if user_mode => handle_user_exception(regs, exc_code),
++                _ => handle_system_exception(regs, exc_code),
++            }
++        }
++        // The frame's own Status decides: a syscall may have replaced it.
++        if regs.iret.status as u32 & cp0::status::KSU_MASK != 0 {
++            crate::arch::cache::flush_for_user();
 +        }
 +    }
++}
++
++enum TlbOutcome {
++    /// The pair was in the page table; only the TLB was written.
++    Refilled,
++    /// The generic page fault handler changed the mapping.
++    Handled,
++    Failed,
 +}
 +
 +fn handle_interrupt(regs: &mut InterruptStack, cause_reg: u32) {
@@ -1157,7 +1276,7 @@ index 00000000..db11c806
 +
 +/// Serve a TLB exception from the page table; fall back to the generic page
 +/// fault handler. Returns true when execution can resume at EPC.
-+unsafe fn tlb_fault(regs: &mut InterruptStack, exc_code: u32, user_mode: bool) -> bool {
++unsafe fn tlb_fault(regs: &mut InterruptStack, exc_code: u32, user_mode: bool) -> TlbOutcome {
 +    unsafe {
 +        let badvaddr = regs.iret.badvaddr as usize;
 +        let page = badvaddr & !(RmmA::PAGE_SIZE - 1);
@@ -1192,7 +1311,7 @@ index 00000000..db11c806
 +            let lo0 = pte_to_entry_lo(table.add(even).read_volatile(), user_mode);
 +            let lo1 = pte_to_entry_lo(table.add(even + 1).read_volatile(), user_mode);
 +            rmm::mips::write_random(page, lo0, lo1);
-+            return true;
++            return TlbOutcome::Refilled;
 +        }
 +
 +        let present = pte.is_some_and(|pte| pte & RmmA::ENTRY_FLAG_PRESENT != 0);
@@ -1205,14 +1324,17 @@ index 00000000..db11c806
 +            regs.iret.epc as usize & !3 == badvaddr & !3,
 +        );
 +
++        crate::arch::cache::flush_data();
 +        let ok =
 +            crate::memory::page_fault_handler(regs, flags, VirtualAddress::new(badvaddr)).is_ok();
 +        if ok {
 +            // The handler changed the table; drop any stale TLB entry so the
 +            // retried access refills from the table.
 +            RmmA::invalidate(VirtualAddress::new(page));
++            TlbOutcome::Handled
++        } else {
++            TlbOutcome::Failed
 +        }
-+        ok
 +    }
 +}
 +
@@ -1229,10 +1351,10 @@ index 00000000..db11c806
 +}
 diff --git a/src/arch/mips64/interrupt/handler.rs b/src/arch/mips64/interrupt/handler.rs
 new file mode 100644
-index 00000000..e2040126
+index 00000000..3ae0fc84
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/handler.rs
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,390 @@
 +//! The trap frame. Every general register is saved as 64 bits, because n32
 +//! code keeps 64-bit values in registers even though pointers are 32 bits.
 +//!
@@ -1601,6 +1723,11 @@ index 00000000..e2040126
 +        move    $25, $23
 +        jalr    $25
 +        nop
++        // First entry to user mode: its code was written through other
++        // addresses, so start with empty caches.
++        la      $25, {flush}
++        jalr    $25
++        nop
 +        // Record this context's kernel stack top for the next user trap.
 +        la      $8, PERCPU_PTR
 +        lw      $8, 0($8)
@@ -1615,6 +1742,7 @@ index 00000000..e2040126
 +        .set reorder
 +        ",
 +        frame_size = const FRAME_SIZE,
++        flush = sym crate::arch::cache::flush_for_user,
 +    )
 +}
 diff --git a/src/arch/mips64/interrupt/irq.rs b/src/arch/mips64/interrupt/irq.rs
@@ -1899,10 +2027,10 @@ index 00000000..cff02765
 +}
 diff --git a/src/arch/mips64/mod.rs b/src/arch/mips64/mod.rs
 new file mode 100644
-index 00000000..5cd9dc7c
+index 00000000..7b971873
 --- /dev/null
 +++ b/src/arch/mips64/mod.rs
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,92 @@
 +//! SGI Indy (IP24): MIPS R4400, n32 kernel with 32-bit addresses, big-endian.
 +//!
 +//! Address space: useg (0..0x8000_0000) is user and TLB mapped; kseg0
@@ -1914,6 +2042,7 @@ index 00000000..5cd9dc7c
 +pub mod consts;
 +
 +/// CP0 register access
++pub mod cache;
 +pub mod cp0;
 +
 +/// Debugging support
@@ -1996,10 +2125,10 @@ index 00000000..5cd9dc7c
 +}
 diff --git a/src/arch/mips64/paging.rs b/src/arch/mips64/paging.rs
 new file mode 100644
-index 00000000..6822e66e
+index 00000000..599f5488
 --- /dev/null
 +++ b/src/arch/mips64/paging.rs
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,26 @@
 +//! TLB setup: 4 KiB pages, nothing wired, ASID 0, every entry cleared, and
 +//! the exception vectors in place so refills can be served.
 +
@@ -2016,6 +2145,7 @@ index 00000000..6822e66e
 +            cp0::read_config(),
 +            cp0::read_status()
 +        );
++        super::cache::init();
 +        cp0::write_entry_hi(0); // ASID 0
 +        rmm::mips::flush_all();
 +        info!("Indy: TLB cleared");
