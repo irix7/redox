@@ -1,4 +1,4 @@
-From bebca412a07463f5ccb69bee9fbcd35e05ad9b25 Mon Sep 17 00:00:00 2001
+From 4efa1ce9f5aebd470ee147a2aefba66bd3fb70e9 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -54,7 +54,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/stop.rs                |  30 ++
  src/arch/mips64/time.rs                |  61 ++++
  src/arch/mod.rs                        |   6 +
- src/context/arch/mips64.rs             | 216 ++++++++++++++
+ src/context/arch/mips64.rs             | 217 ++++++++++++++
  src/context/mod.rs                     |   4 +
  src/devices/mod.rs                     |   2 +
  src/devices/serial.rs                  |  13 +
@@ -68,7 +68,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 40 files changed, 2796 insertions(+), 12 deletions(-)
+ 40 files changed, 2797 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/consts.rs
@@ -2457,14 +2457,15 @@ index 2aae6399..e5791c1e 100644
 +pub use self::mips64::*;
 diff --git a/src/context/arch/mips64.rs b/src/context/arch/mips64.rs
 new file mode 100644
-index 00000000..f04c5b0e
+index 00000000..b8b3d4e8
 --- /dev/null
 +++ b/src/context/arch/mips64.rs
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,217 @@
 +use crate::{
 +    arch::interrupt::InterruptStack, context::context::Kstack, memory::RmmA, percpu::PercpuBlock,
 +    syscall::FloatRegisters,
 +};
++use crate::arch::interrupt::handler::sign_extend;
 +use core::{mem::offset_of, sync::atomic::AtomicBool};
 +use rmm::{Arch, VirtualAddress};
 +use spin::Once;
@@ -2503,15 +2504,15 @@ index 00000000..f04c5b0e
 +    }
 +
 +    fn set_stack(&mut self, address: usize) {
-+        self.sp = address as u64;
++        self.sp = sign_extend(address);
 +    }
 +
 +    fn set_ra(&mut self, address: usize) {
-+        self.ra = address as u64;
++        self.ra = sign_extend(address);
 +    }
 +
 +    fn set_s7(&mut self, address: usize) {
-+        self.s7 = address as u64;
++        self.s7 = sign_extend(address);
 +    }
 +
 +    pub(crate) fn setup_initial_call(
@@ -2573,7 +2574,7 @@ index 00000000..f04c5b0e
 +        if RmmA::virt_is_valid(VirtualAddress::new(regs.tp)) {
 +            match self.regs_mut() {
 +                Some(stack) => {
-+                    stack.registers.gp = regs.tp as u64;
++                    stack.registers.gp = sign_extend(regs.tp);
 +                    Ok(())
 +                }
 +                None => Err(Error::new(ESRCH)),
