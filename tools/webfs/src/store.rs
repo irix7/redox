@@ -24,6 +24,7 @@ pub enum Error {
     NotDir,
     IsDir,
     Loop,
+    CrossScheme,
     /// The store or the network failed; the text says how.
     Io(String),
 }
@@ -41,6 +42,7 @@ impl std::fmt::Display for Error {
             Error::NotDir => f.write_str("not a directory"),
             Error::IsDir => f.write_str("is a directory"),
             Error::Loop => f.write_str("too many symbolic links"),
+            Error::CrossScheme => f.write_str("symbolic link into another scheme"),
             Error::Io(text) => f.write_str(text),
         }
     }
@@ -247,6 +249,12 @@ impl Store {
                     return Err(Error::Loop);
                 }
                 let target = self.target(&entry)?;
+                // A link into another scheme (`/dev/null` -> `/scheme/null`)
+                // is not ours to follow: the caller reads the link and opens
+                // the target itself.
+                if target.starts_with("/scheme/") {
+                    return Err(Error::CrossScheme);
+                }
                 if target.starts_with('/') {
                     stack.truncate(1);
                 }

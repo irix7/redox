@@ -88,13 +88,13 @@ echo "webfs-gate: host checks pass"
 # so build/indy/redox stays as `make indy` left it.
 cd "$ROOT"
 B=build/indy
-cp -r "$B/initfs" "$WORK/initfs"
+cp -r "$B/initfs-gate" "$WORK/initfs"
 WEBFS_CA="$WORK/ca.pem" tools/webfs-unit.sh "$WORK/initfs" tools/webfs/target/mips64-sgi-redox/release/webfs \
   "https://webfs.test:$TLS_PORT" --connect "$GATEWAY"
 recipes/core/base/source/target/release/redox-initfs-ar "$WORK/initfs" \
   recipes/core/base/source/bootstrap/target/mips64-sgi-redox/release/bootstrap -o "$WORK/initfs.img"
 tools/ecoff/target/release/ecoff convert "$B/kernel/kernel" "$WORK/redox" --append "$WORK/initfs.img"
-ls -l "$B/redox" "$WORK/redox" "$WORK/initfs/bin/webfs"
+ls -l "$B/redox-gate" "$WORK/redox" "$WORK/initfs/bin/webfs"
 
 WORK="$WORK/gate" SHELL_CHECK=1 SHELL_WAIT="${SHELL_WAIT:-60}" \
   SHELL_EXPECT_CMD='cat /scheme/web/motd /scheme/web/data/large' SHELL_EXPECT='large file ends here' \

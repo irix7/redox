@@ -15,7 +15,9 @@ use redox_scheme::{CallRequest, CallerCtx, OpenResult, RequestKind, Response, Si
 use scheme_utils::FpathWriter;
 use syscall::data::{Stat, StatVfs};
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
-use syscall::error::{EBADF, EIO, EOPNOTSUPP, EISDIR, ELOOP, ENOENT, ENOTDIR, EROFS, Error, Result};
+use syscall::error::{
+    EBADF, EIO, EISDIR, ELOOP, ENOENT, ENOTDIR, EOPNOTSUPP, EROFS, EXDEV, Error, Result,
+};
 use syscall::flag::{
     MODE_DIR, MODE_FILE, MODE_SYMLINK, O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_STAT,
     O_SYMLINK, O_TRUNC,
@@ -56,6 +58,7 @@ fn errno(err: store::Error) -> Error {
         store::Error::NotDir => ENOTDIR,
         store::Error::IsDir => EISDIR,
         store::Error::Loop => ELOOP,
+        store::Error::CrossScheme => EXDEV,
         store::Error::Io(text) => {
             eprintln!("webfs: {text}");
             EIO
@@ -163,12 +166,22 @@ impl SchemeSync for WebScheme {
     ) -> Result<OpenResult> {
         let base = self.path(dirfd)?;
         let stat = flags & O_STAT != 0;
-        if !stat && (flags & O_ACCMODE != O_RDONLY || flags & (O_CREAT | O_TRUNC) != 0) {
-            return Err(Error::new(EROFS));
-        }
+        // An open with no access mode (O_SYMLINK alone, to read a link) is
+        // not a write.
+        let write = !stat && (flags & O_ACCMODE & !O_RDONLY != 0 || flags & (O_CREAT | O_TRUNC) != 0);
         let full = format!("{base}/{path}");
         let follow = flags & (O_SYMLINK | O_NOFOLLOW) == 0;
-        let entry = self.shared.store.resolve(&full, follow).map_err(errno)?;
+        // Resolve before refusing a write: a link into another scheme
+        // (`/dev/null`) must answer EXDEV so the caller opens the target,
+        // which may well be writable.
+        let entry = match self.shared.store.resolve(&full, follow) {
+            Ok(entry) => entry,
+            Err(store::Error::NotFound) if write => return Err(Error::new(EROFS)),
+            Err(err) => return Err(errno(err)),
+        };
+        if write {
+            return Err(Error::new(EROFS));
+        }
         if flags & O_DIRECTORY != 0 && entry.kind != Kind::Dir {
             return Err(Error::new(ENOTDIR));
         }
@@ -219,6 +232,18 @@ impl SchemeSync for WebScheme {
     }
 
     fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
+        // relibc follows a link into another scheme by opening the link
+        // itself and asking for its path: answer with the target.
+        let entry = self.entry(id)?;
+        if entry.kind == Kind::Link {
+            let target = self.shared.store.target(&entry).map_err(errno)?;
+            if target.starts_with("/scheme/") {
+                let bytes = target.as_bytes();
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                return Ok(n);
+            }
+        }
         let path = self.path(id)?;
         FpathWriter::with(buf, &self.shared.name, |writer| {
             writer.push_str(&path);

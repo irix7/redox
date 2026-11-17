@@ -1,7 +1,0 @@
-[unit]
-description = "Bring-up shell on the serial console and TCP port 23"
-requires_weak = ["20_netstack.service"]
-
-[service]
-cmd = "sh"
-type = "oneshot_async"

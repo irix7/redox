@@ -29,5 +29,5 @@ cmd = "webfs"
 args = [$args]
 type = { scheme = "web" }
 UNIT
-sed -i 's/^\( *\)"40_sh.service",$/&\n\1"50_webfs.service",/' "$DIR/lib/init.d/90_initfs.target"
+sed -i 's/^\( *\)"50_rootfs.service",$/&\n\1"50_webfs.service",/' "$DIR/lib/init.d/90_initfs.target"
 grep -q '"50_webfs.service"' "$DIR/lib/init.d/90_initfs.target"

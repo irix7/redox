@@ -1,4 +1,4 @@
-From 11d754090d16093366e8efc9e7b44a98ed011c55 Mon Sep 17 00:00:00 2001
+From 75b7287e9392151b250750c9c699fda81df8bd4e Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:40 +1000
 Subject: [PATCH] Indy (mips64 n32): bootstrap entry, Seeq 8003 driver,
@@ -32,8 +32,8 @@ Signed-off-by: belikh <io@belic.net>
  drivers/net/seeqd/Cargo.toml    |  19 ++
  drivers/net/seeqd/src/device.rs | 318 ++++++++++++++++++++++++++++++++
  drivers/net/seeqd/src/main.rs   | 113 ++++++++++++
- netstack/src/scheme/mod.rs      |   5 +-
- 13 files changed, 667 insertions(+), 74 deletions(-)
+ netstack/src/scheme/mod.rs      |  33 +++-
+ 13 files changed, 695 insertions(+), 74 deletions(-)
  create mode 100644 bootstrap/src/mips64.ld
  create mode 100644 bootstrap/src/mips64.rs
  create mode 100644 drivers/net/seeqd/Cargo.toml
@@ -1326,10 +1326,10 @@ index 0000000..d2467b3
 +    unreachable!()
 +}
 diff --git a/netstack/src/scheme/mod.rs b/netstack/src/scheme/mod.rs
-index ce7e3db..cd2de7f 100644
+index ce7e3db..4c159a7 100644
 --- a/netstack/src/scheme/mod.rs
 +++ b/netstack/src/scheme/mod.rs
-@@ -49,7 +49,10 @@ const MIN_DURATION: Duration = Duration::from_micros(0);
+@@ -49,11 +49,26 @@ const MIN_DURATION: Duration = Duration::from_micros(0);
  
  fn getcfg(key: &str) -> Result<String> {
      let mut value = String::new();
@@ -1341,6 +1341,45 @@ index ce7e3db..cd2de7f 100644
      file.read_to_string(&mut value)?;
      Ok(value.trim().to_string())
  }
+ 
++/// `NETADDR=a.b.c.d` in the kernel environment (`/scheme/sys/env`), as a
++/// /24. The Indy kernel copies it from the PROM's `netaddr`.
++fn boot_address() -> Option<IpCidr> {
++    let env = std::fs::read_to_string("/scheme/sys/env").ok()?;
++    let addr = env.lines().find_map(|line| line.strip_prefix("NETADDR="))?;
++    let addr = Ipv4Address::from_str(addr.trim()).ok()?;
++    if addr.is_unspecified() || addr.is_multicast() || addr.is_broadcast() {
++        return None;
++    }
++    Some(IpCidr::new(IpAddress::Ipv4(addr), 24))
++}
++
+ pub struct Smolnetd {
+     router_device: Tracer<Router>,
+     iface: Interface,
+@@ -125,6 +140,22 @@ impl Smolnetd {
+         });
+         eth0.set_mac_address(hardware_addr);
+ 
++        // A netbooted machine: the firmware already holds an address for
++        // this interface. Start with it; a DHCP lease replaces it later.
++        if let Some(cidr) = boot_address() {
++            eth0.set_ip_address(cidr);
++            iface
++                .borrow_mut()
++                .update_ip_addrs(|addrs| addrs.insert(0, cidr).unwrap());
++            let IpCidr::Ipv4(v4_cidr) = cidr;
++            route_table.borrow_mut().insert_rule(Rule::new(
++                IpCidr::Ipv4(v4_cidr.network()),
++                None,
++                Rc::clone(eth0.name()),
++                cidr.address(),
++            ));
++        }
++
+         devices.borrow_mut().push(loopback);
+         devices.borrow_mut().push(eth0);
+ 
 -- 
 2.56.0
 

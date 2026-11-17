@@ -8,12 +8,12 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
 const TCP_PORT: u16 = 23;
-const BIN_DIR: &str = "/scheme/initfs/bin";
+const BIN_DIR: &str = "/usr/bin";
 
 fn read_trim(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
@@ -28,7 +28,7 @@ fn net_line() -> String {
 fn help(out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "commands:\r\n  help               this list\r\n  echo TEXT          print TEXT\r\n  ls [DIR]           list a directory (default {BIN_DIR})\r\n  cat FILE           print a file\r\n  ps                 contexts (/scheme/sys/context)\r\n  mem                memory (/scheme/sys/memory... if present)\r\n  net                interface address\r\n  uname              kernel identification\r\n  dmesg              kernel log\r\n  reboot             reset to the PROM\r\n  PROGRAM [ARGS]     run {BIN_DIR}/PROGRAM\r"
+        "commands:\r\n  help               this list\r\n  echo TEXT          print TEXT\r\n  ls [DIR]           list a directory (default {BIN_DIR})\r\n  cat FILE           print a file\r\n  ps                 contexts (/scheme/sys/context)\r\n  mem                memory (/scheme/sys/memory... if present)\r\n  net                interface address\r\n  uname              kernel identification\r\n  dmesg              kernel log\r\n  sum FILE           size and CRC-32 of a file\r\n  peek ADDR [LEN]    hex dump of physical memory\r\n  sleep SECONDS      wait; checks the timer against a wall clock\r\n  bench              time a compute loop, syscalls and page faults\r\n  reboot             reset to the PROM\r\n  PROGRAM [ARGS]     run {BIN_DIR}/PROGRAM\r"
     );
 }
 
@@ -92,6 +92,18 @@ fn run(line: &str, out: &mut dyn Write) -> bool {
                 }
             }
         }
+        "sum" => match args.first() {
+            Some(path) => sum(out, path),
+            None => {
+                let _ = writeln!(out, "usage: sum FILE\r");
+            }
+        },
+        "sleep" => {
+            let seconds = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+            thread::sleep(Duration::from_secs(seconds));
+            let _ = writeln!(out, "slept {seconds} s\r");
+        }
+        "bench" => bench(out),
         "reboot" => {
             let _ = writeln!(out, "rebooting to the PROM\r");
             let _ = out.flush();
@@ -107,14 +119,31 @@ fn run(line: &str, out: &mut dyn Write) -> bool {
             } else {
                 format!("{BIN_DIR}/{program}")
             };
-            match Command::new(&path).args(&args).output() {
-                Ok(result) => {
-                    let text = String::from_utf8_lossy(&result.stdout).replace('\n', "\r\n");
+            // One pipe, read to its end, then wait. `Command::output` reads two
+            // pipes with poll(), which fails here with EOPNOTSUPP and panics
+            // inside std. The program's stderr goes to the console.
+            let child = Command::new(&path)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn();
+            match child {
+                Ok(mut child) => {
+                    let mut text = Vec::new();
+                    if let Some(mut stdout) = child.stdout.take() {
+                        let _ = stdout.read_to_end(&mut text);
+                    }
+                    let text = String::from_utf8_lossy(&text).replace('\n', "\r\n");
                     let _ = write!(out, "{text}");
-                    let text = String::from_utf8_lossy(&result.stderr).replace('\n', "\r\n");
-                    let _ = write!(out, "{text}");
-                    if !result.status.success() {
-                        let _ = writeln!(out, "{program}: {}\r", result.status);
+                    match child.wait() {
+                        Ok(status) if status.success() => {}
+                        Ok(status) => {
+                            let _ = writeln!(out, "{program}: {status}\r");
+                        }
+                        Err(err) => {
+                            let _ = writeln!(out, "{program}: wait: {err}\r");
+                        }
                     }
                 }
                 Err(err) => {
@@ -191,38 +220,10 @@ fn tcp_server() {
     }
 }
 
-/// True when the interface has a usable address.
-fn has_address() -> bool {
-    match read_trim("/scheme/netcfg/ifaces/eth0/addr/list") {
-        Some(addr) => {
-            !addr.is_empty() && !addr.starts_with("0.0.0.0") && !addr.starts_with("Not")
-        }
-        None => false,
-    }
-}
-
-/// Seconds to wait for DHCP before using the static address from the initfs.
-const DHCP_WAIT_SECS: u32 = 20;
-const STATIC_ADDR_FILE: &str = "/scheme/initfs/etc/net/ip";
-
 fn reporter() {
     let mut reported = String::new();
-    let mut waited = 0;
-    let mut fallback_done = false;
     loop {
         thread::sleep(Duration::from_secs(2));
-        waited += 2;
-        // A network whose server answers BOOTP only (the lab netboot server)
-        // gives no DHCP lease: fall back to the configured static address.
-        if !fallback_done && waited >= DHCP_WAIT_SECS && !has_address() {
-            fallback_done = true;
-            if let Some(addr) = read_trim(STATIC_ADDR_FILE) {
-                match fs::write("/scheme/netcfg/ifaces/eth0/addr/set", &addr) {
-                    Ok(()) => println!("REDOX-INDY-NET: no DHCP lease, static {addr}\r"),
-                    Err(err) => println!("REDOX-INDY-NET: static {addr} failed: {err}\r"),
-                }
-            }
-        }
         let line = net_line();
         if line != reported {
             println!("REDOX-INDY-NET: {line}\r");
@@ -293,4 +294,81 @@ fn peek(out: &mut dyn Write, addr: usize, len: usize) {
     }
     let _ = out.flush();
     unsafe { munmap(map, span) };
+}
+
+/// Three timings in milliseconds, to compare kernels on the real machine:
+/// a compute loop that stays in user mode, 2000 small file reads (each is
+/// several scheme round trips), and first touches of 256 fresh pages.
+fn bench(out: &mut dyn Write) {
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let mut x: u32 = 1;
+    for i in 0..20_000_000u32 {
+        x = x.wrapping_mul(1_664_525).wrapping_add(i);
+    }
+    let compute = start.elapsed().as_millis();
+
+    let start = Instant::now();
+    let mut bytes = 0;
+    for _ in 0..2000 {
+        bytes += fs::read("/scheme/sys/uname").map(|d| d.len()).unwrap_or(0);
+    }
+    let syscalls = start.elapsed().as_millis();
+
+    let start = Instant::now();
+    let mut pages = vec![0u8; 0];
+    pages.reserve_exact(256 * 4096);
+    unsafe { pages.set_len(256 * 4096) };
+    let mut sum = 0u32;
+    for page in 0..256 {
+        pages[page * 4096] = page as u8;
+        sum += pages[page * 4096] as u32;
+    }
+    let faults = start.elapsed().as_millis();
+
+    let _ = writeln!(
+        out,
+        "bench: compute {compute} ms ({x:#x}), 2000 reads {syscalls} ms ({bytes} bytes), 256 page touches {faults} ms ({sum})\r"
+    );
+}
+
+/// Size, CRC-32 (the zlib polynomial) and read time of a file, read in
+/// 16 KiB pieces. Compare with `python3 -c "import zlib,sys;..."` on the host.
+fn sum(out: &mut dyn Write, path: &str) {
+    let start = std::time::Instant::now();
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = writeln!(out, "sum: {path}: {err}\r");
+            return;
+        }
+    };
+    let mut crc: u32 = !0;
+    let mut size = 0usize;
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                size += n;
+                for &byte in &buf[..n] {
+                    crc ^= byte as u32;
+                    for _ in 0..8 {
+                        crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = writeln!(out, "sum: {path}: {err} after {size} bytes\r");
+                return;
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "{size} bytes, crc32 {:08x}, {} ms\r",
+        !crc,
+        start.elapsed().as_millis()
+    );
 }

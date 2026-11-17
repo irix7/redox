@@ -15,6 +15,8 @@
 #   WORK            working directory
 #   MONITOR_PORT    iris monitor port (default 18893); give concurrent runs their own
 #   SHELL_PORT      host port forwarded to the guest's TCP shell (default 12323)
+#   ROOT_STORE      webfs store to serve as the image's root filesystem, on
+#                   127.0.0.1:ROOT_PORT (default 8735)
 #   IRIS_ARGS       extra emulator options, e.g. "--cache full --cpu r5000"
 #   SHELL_CHECK     1 to also drive the TCP shell: run a command, then `reboot`
 #                   and wait for the PROM to come back
@@ -66,6 +68,13 @@ guest_port = 23
 bind = "localhost"
 TOML
 
+ROOT_PID=
+if [ -n "${ROOT_STORE:-}" ]; then
+  "$(dirname "$0")/webfs/target/release/webfs" serve "$ROOT_STORE" \
+    --listen "127.0.0.1:${ROOT_PORT:-8735}" --quiet 2>"$WORK/root-serve.log" &
+  ROOT_PID=$!
+fi
+
 IRIS_NO_IDLE=1 IRIS_TFTP_TRACE=1 "$IRIS" --config "$WORK/machine.toml" --ci \
   --ci-socket "$WORK/iris.sock" --monitor-port "$MONITOR_PORT" \
   --serial-log "$WORK/serial.log" --headless --noaudio ${IRIS_ARGS:-} >"$WORK/iris.out" 2>&1 &
@@ -74,6 +83,7 @@ IRIS_PID=$!
 cleanup() {
   local status=$?
   trap - EXIT
+  [ -z "$ROOT_PID" ] || kill "$ROOT_PID" 2>/dev/null || true
   kill "$IRIS_PID" 2>/dev/null || true
   wait "$IRIS_PID" 2>/dev/null || true
   if [ "$status" -ne 0 ]; then
@@ -109,7 +119,9 @@ if [ "${SHELL_CHECK:-0}" = 1 ]; then
     echo "indy-gate: \"$SHELL_EXPECT_CMD\" printed \"$SHELL_EXPECT\""
   fi
   (printf 'reboot\r\n'; sleep 2) | socat - "TCP:127.0.0.1:$SHELL_PORT" >/dev/null || true
-  ic serial-wait 'System Maintenance Menu' --timeout 120
+  # The kernel reboots through the firmware's Reboot call, which goes
+  # straight to the PROM's autoboot.
+  ic serial-wait 'Starting up the system' --timeout 120
   echo "indy-gate: reboot returned to the PROM"
 fi
 

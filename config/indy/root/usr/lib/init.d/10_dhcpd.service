@@ -1,0 +1,6 @@
+[unit]
+description = "Configure the network with DHCP; the PROM's address stays without a lease"
+
+[service]
+cmd = "dhcpd"
+type = "oneshot_async"

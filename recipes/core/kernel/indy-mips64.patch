@@ -1,4 +1,4 @@
-From 499921f9753e22945265c959ae73eb61fafb7420 Mon Sep 17 00:00:00 2001
+From 2eeb14dd0a48b7994850833589aecad5df02d4d7 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -37,7 +37,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/consts.rs              |  24 ++
  src/arch/mips64/cp0.rs                 | 112 ++++++
  src/arch/mips64/debug.rs               |  24 ++
- src/arch/mips64/device/arcs.rs         | 218 ++++++++++++
+ src/arch/mips64/device/arcs.rs         | 238 +++++++++++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
  src/arch/mips64/device/mod.rs          |  24 ++
  src/arch/mips64/device/serial.rs       |  14 +
@@ -51,9 +51,9 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/misc.rs                |  60 ++++
  src/arch/mips64/mod.rs                 |  92 +++++
  src/arch/mips64/paging.rs              |  26 ++
- src/arch/mips64/start.rs               | 321 +++++++++++++++++
+ src/arch/mips64/start.rs               | 347 +++++++++++++++++++
  src/arch/mips64/stop.rs                |  47 +++
- src/arch/mips64/time.rs                |  61 ++++
+ src/arch/mips64/time.rs                |  89 +++++
  src/arch/mod.rs                        |   6 +
  src/context/arch/mips64.rs             | 217 ++++++++++++
  src/context/mod.rs                     |   4 +
@@ -69,7 +69,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 41 files changed, 3139 insertions(+), 12 deletions(-)
+ 41 files changed, 3213 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -744,10 +744,10 @@ index 00000000..5d6cee9e
 +}
 diff --git a/src/arch/mips64/device/arcs.rs b/src/arch/mips64/device/arcs.rs
 new file mode 100644
-index 00000000..a2de95f6
+index 00000000..df1981f2
 --- /dev/null
 +++ b/src/arch/mips64/device/arcs.rs
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,238 @@
 +//! Calls into the ARCS firmware (the Indy PROM).
 +//!
 +//! The PROM leaves a system parameter block at physical 0x1000. Its firmware
@@ -964,6 +964,26 @@ index 00000000..a2de95f6
 +            &raw mut count as usize,
 +        );
 +        (status == 0 && count == 1).then_some(byte)
++    }
++}
++
++/// The value of a PROM environment variable. `name` ends with a NUL byte.
++/// The string lives in the PROM's memory, which the kernel never reuses.
++pub fn env(name: &'static [u8]) -> Option<&'static [u8]> {
++    if !present() || name.last() != Some(&0) {
++        return None;
++    }
++    unsafe {
++        let value =
++            call(FN_GET_ENVIRONMENT_VARIABLE, name.as_ptr() as usize, 0, 0, 0) as usize as *const u8;
++        if value.is_null() {
++            return None;
++        }
++        let mut len = 0;
++        while len < 128 && value.add(len).read() != 0 {
++            len += 1;
++        }
++        Some(core::slice::from_raw_parts(value, len))
 +    }
 +}
 diff --git a/src/arch/mips64/device/cpu/mod.rs b/src/arch/mips64/device/cpu/mod.rs
@@ -2312,10 +2332,10 @@ index 00000000..599f5488
 +}
 diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
 new file mode 100644
-index 00000000..dd570a1d
+index 00000000..df674afd
 --- /dev/null
 +++ b/src/arch/mips64/start.rs
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,347 @@
 +//! Kernel entry from the SGI PROM.
 +//!
 +//! `boot -f bootp()redox` loads the ECOFF image at kseg0 0x8804_0000 and
@@ -2355,7 +2375,32 @@ index 00000000..dd570a1d
 +}
 +
 +/// The environment handed to userspace through `sys:env`.
-+static ENV: &[u8] = b"BOOTSTRAP_LOG_LEVEL=info\n";
++/// `NETADDR` is the address the PROM got from the boot server (`netaddr`),
++/// so a netbooted machine needs no address of its own in the image.
++const ENV_BASE: &[u8] = b"BOOTSTRAP_LOG_LEVEL=info\n";
++static ENV: SyncUnsafeCell<[u8; 128]> = SyncUnsafeCell::new([0; 128]);
++
++/// Fill `ENV`; returns its length.
++unsafe fn build_env() -> usize {
++    unsafe {
++        let env = &mut *ENV.get();
++        let mut len = 0;
++        let mut push = |bytes: &[u8]| {
++            let n = bytes.len().min(env.len() - len);
++            env[len..len + n].copy_from_slice(&bytes[..n]);
++            len += n;
++        };
++        push(ENV_BASE);
++        if let Some(addr) = device::arcs::env(b"netaddr\0") {
++            if !addr.is_empty() && addr.len() <= 15 {
++                push(b"NETADDR=");
++                push(addr);
++                push(b"\n");
++            }
++        }
++        len
++    }
++}
 +
 +const MAX_AREAS: usize = 16;
 +
@@ -2563,14 +2608,15 @@ index 00000000..dd570a1d
 +            area_count = 2;
 +        }
 +
++        let env_len = build_env();
 +        let stack_base = STACK.get() as usize - PHYS_OFFSET;
 +        let args = KernelArgs {
 +            kernel_base: kernel_base as u64,
 +            kernel_size: kernel_size as u64,
 +            stack_base: stack_base as u64,
 +            stack_size: STACK_SIZE as u64,
-+            env_base: (ENV.as_ptr() as usize - PHYS_OFFSET) as u64,
-+            env_size: ENV.len() as u64,
++            env_base: (ENV.get() as usize - PHYS_OFFSET) as u64,
++            env_size: env_len as u64,
 +            hwdesc_base: 0,
 +            hwdesc_size: 0,
 +            // Read directly, not through phys_to_virt: give the kseg0 address.
@@ -2692,27 +2738,52 @@ index 00000000..49d7eee0
 +}
 diff --git a/src/arch/mips64/time.rs b/src/arch/mips64/time.rs
 new file mode 100644
-index 00000000..58685027
+index 00000000..c5dfe2b9
 --- /dev/null
 +++ b/src/arch/mips64/time.rs
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,89 @@
 +//! Monotonic time from CP0 Count.
 +//!
-+//! Count runs at half the pipeline clock on the R4400. The emulator's default
-+//! is 33 MHz; a real Indy must be calibrated against the IOC's 8254 at boot.
-+//! Until that calibration exists the frequency is a constant.
++//! Count runs at half the pipeline clock. The PROM measures the CPU clock
++//! and publishes it in MHz as the `cpufreq` variable (133 on an R4600PC
++//! Indy), so the rate comes from there. Without a PROM value the rate is
++//! 33 MHz, which is what the emulator runs at by default.
 +
-+use core::sync::atomic::{AtomicU64, Ordering};
++use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 +
 +use super::cp0;
 +use crate::sync::CleanLockToken;
 +
-+/// CP0 Count increments per second.
-+pub const COUNT_HZ: u64 = 33_000_000;
-+
 +/// Scheduler tick rate.
 +pub const TICKS_PER_SECOND: u64 = 100;
-+pub const COUNTS_PER_TICK: u32 = (COUNT_HZ / TICKS_PER_SECOND) as u32;
++
++const DEFAULT_COUNT_HZ: u64 = 33_000_000;
++
++/// CP0 Count increments per second.
++static COUNT_HZ: AtomicU64 = AtomicU64::new(DEFAULT_COUNT_HZ);
++static COUNTS_PER_TICK: AtomicU32 = AtomicU32::new((DEFAULT_COUNT_HZ / TICKS_PER_SECOND) as u32);
++
++fn count_hz() -> u64 {
++    COUNT_HZ.load(Ordering::Relaxed)
++}
++
++/// Take the Count rate from the PROM's `cpufreq` (CPU MHz, decimal).
++fn calibrate() {
++    let mhz = super::device::arcs::env(b"cpufreq\0")
++        .and_then(|text| core::str::from_utf8(text).ok())
++        .and_then(|text| text.trim().parse::<u64>().ok())
++        .filter(|mhz| (20..=400).contains(mhz));
++    if let Some(mhz) = mhz {
++        let hz = mhz * 1_000_000 / 2;
++        COUNT_HZ.store(hz, Ordering::Relaxed);
++        COUNTS_PER_TICK.store((hz / TICKS_PER_SECOND) as u32, Ordering::Relaxed);
++    }
++    info!(
++        "Indy: PROM cpufreq {:?} MHz, Count at {} Hz",
++        mhz,
++        count_hz()
++    );
++}
 +
 +/// Count value extended to 64 bits across wraps by the timer interrupt.
 +static COUNT_HIGH: AtomicU64 = AtomicU64::new(0);
@@ -2727,15 +2798,18 @@ index 00000000..58685027
 +    }
 +    LAST_COUNT.store(now, Ordering::Relaxed);
 +    unsafe {
-+        cp0::write_compare(cp0::read_compare().wrapping_add(COUNTS_PER_TICK));
++        cp0::write_compare(
++            cp0::read_compare().wrapping_add(COUNTS_PER_TICK.load(Ordering::Relaxed)),
++        );
 +    }
 +}
 +
 +/// Start the Count/Compare timer and unmask IP7.
 +pub unsafe fn init() {
++    calibrate();
 +    unsafe {
 +        cp0::write_count(0);
-+        cp0::write_compare(COUNTS_PER_TICK);
++        cp0::write_compare(COUNTS_PER_TICK.load(Ordering::Relaxed));
 +        LAST_COUNT.store(0, Ordering::Relaxed);
 +        cp0::write_status(cp0::read_status() | cp0::status::IM7);
 +    }
@@ -2751,11 +2825,11 @@ index 00000000..58685027
 +}
 +
 +pub fn monotonic_absolute(_token: &mut CleanLockToken) -> u128 {
-+    count64() as u128 * 1_000_000_000u128 / COUNT_HZ as u128
++    count64() as u128 * 1_000_000_000u128 / count_hz() as u128
 +}
 +
 +pub fn monotonic_resolution() -> u128 {
-+    1_000_000_000u128 / COUNT_HZ as u128
++    1_000_000_000u128 / count_hz() as u128
 +}
 diff --git a/src/arch/mod.rs b/src/arch/mod.rs
 index 2aae6399..e5791c1e 100644

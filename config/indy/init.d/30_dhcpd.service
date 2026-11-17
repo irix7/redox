@@ -1,7 +1,0 @@
-[unit]
-description = "Configure network using DHCP"
-requires_weak = ["20_netstack.service"]
-
-[service]
-cmd = "dhcpd"
-type = "oneshot_async"

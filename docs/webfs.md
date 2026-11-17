@@ -1,10 +1,10 @@
 # webfs: a read-only filesystem over HTTP and HTTPS
 
 `tools/webfs` is one Rust crate with two builds. On the build host it packs a directory
-into a store and serves it. On the Indy it is the scheme daemon that mounts the store at
-`/scheme/web`. Status 2026-11-17: `make indy-webfs-gate` passes on iris (32 MiB
-`indy_ip24`, TLS to a server on the host). It has not run on the real machine or against
-Cloudflare from the guest.
+into a store and serves it. On the Indy it is the scheme daemon that mounts the store as
+the root filesystem (scheme `file`). `make indy-gate` and `make indy-webfs-gate` pass on
+iris, and the plain HTTP path runs on the real Indy. TLS has not run on the real machine
+or against Cloudflare from the guest.
 
 ## Store format (version 1)
 
@@ -64,13 +64,42 @@ Check with `curl -sI https://indy.example.com/root`: the second request shows
 
 ## The client on the Indy
 
+The store is the Indy's root filesystem. The last initfs unit, `50_rootfs.service`
+(written by `tools/indy-image.sh`), runs `webfs mount --name file URL`, which registers
+scheme `file`. init then switches root to `/usr` and `/etc` and starts every unit in
+`/usr/lib/init.d`.
+
 ```sh
-make indy INDY_WEBFS_URL=https://indy.example.com
+make indy            # kernel + initfs: init, randd, seeqd, netstack, webfs
+make indy-root       # build/indy/root, packed into build/indy/store
+tools/webfs/target/release/webfs serve build/indy/store --listen 0.0.0.0:8734
 ```
 
-With `INDY_WEBFS_URL` set, the initfs gains `bin/webfs` and
-`lib/init.d/50_webfs.service` (`tools/webfs-unit.sh`). Without it the image is unchanged.
-`INDY_WEBFS_ARGS` passes mount options and `INDY_WEBFS_CA` adds a certificate file.
+| Variable | Default | Meaning |
+|---|---|---|
+| `INDY_ROOT_URL` | `http://10.1.1.3:8734/` | where the machine finds the store |
+| `INDY_ROOT_ARGS` | `--connect 10.1.1.3` | `webfs mount` options |
+| `INDY_STORE` | `build/indy/store` | where `make indy-root` packs the tree |
+
+The root tree is `config/indy/root` plus the programs: `usr/bin/{sh,dhcpd,zerod,webfs}`,
+`usr/lib/init.d` (null and zero devices, dhcpd, the shell) and `dev/{null,zero,random,
+urandom}`, links to `/scheme/null` and so on. A changed program needs `make indy-root`
+and a reboot; the netboot image only changes when the kernel or the five initfs
+programs do.
+
+A link whose target starts with `/scheme/` leaves the store. `open` answers `EXDEV` and
+`fpath` on the link itself (opened with `O_SYMLINK`) returns the target, which is how
+relibc follows `/dev/null`.
+
+Status 2026-11-18 on the real Indy (R4600, 32 MiB): the store mounts as the root, files
+of 46 bytes to 2 MiB read back with the right CRC-32, and programs run from `/usr/bin`.
+Reading runs at about 45 KiB/s; the kernel's cache flushing on every trap is the main
+cost.
+
+A second store can be mounted beside the root with `tools/webfs-unit.sh`, which adds
+`50_webfs.service` for `/scheme/web`; the gate uses it for the TLS path.
+
+Mount options:
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -129,5 +158,8 @@ boots an image with webfs on iris and reads `/scheme/web/motd` (a link) and the 
 file over the TCP shell. The gate image is built in `build/indy/webfs-gate`;
 `build/indy/redox` is left alone.
 
-Not covered: `mmap` of files on the scheme, running a program from `/scheme/web`, and the
-scheme registered as `file` to serve as the root filesystem.
+Not covered: `mmap` of files on the scheme.
+
+On iris a request on a connection that sat idle for some seconds can stall until the
+client's 30 second I/O timeout, after which the retry on a new connection succeeds. The
+real machine does not show this.
