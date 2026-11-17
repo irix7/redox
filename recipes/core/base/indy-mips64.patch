@@ -1,4 +1,4 @@
-From 1e537a72a69922b2b7e9e771c5eac56973f1019e Mon Sep 17 00:00:00 2001
+From 959c3bcac3622fb9b06a5163ea38ac3b9b76951c Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:40 +1000
 Subject: [PATCH] bootstrap: add the mips64 (SGI Indy) entry and point at local
@@ -61,7 +61,7 @@ index f79cba6..8455fd7 100644
   "bitflags",
  ]
 diff --git a/bootstrap/Cargo.toml b/bootstrap/Cargo.toml
-index ba46940..df49a08 100644
+index ba46940..ab8f91a 100644
 --- a/bootstrap/Cargo.toml
 +++ b/bootstrap/Cargo.toml
 @@ -23,8 +23,8 @@ slab = { version = "0.4.9", default-features = false }
@@ -84,7 +84,7 @@ index ba46940..df49a08 100644
 +#redox_syscall = { git = "https://gitlab.redox-os.org/redox-os/kernel/" }
 +# The Indy port: the 0.9.5 crate with a mips64 arch file, and libc with Redox
 +# mips64 definitions (bootstrap.md, Provenance).
-+redox_syscall = { path = "../../../../../vendor/redox_syscall-0.9.5" }
++redox_syscall = { path = "../../../../../vendor/redox_syscall-0.9.6" }
 +libc = { path = "../../../../../vendor/libc-0.2.190" }
 diff --git a/bootstrap/src/main.rs b/bootstrap/src/main.rs
 index 58b6b34..6c4628d 100644

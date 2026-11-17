@@ -1,0 +1,35 @@
+diff -ruN libc-0.2.191/src/unix/redox/mod.rs libc-0.2.191/src/unix/redox/mod.rs
+--- libc-0.2.191/src/unix/redox/mod.rs	2006-07-24 11:21:28.000000000 +1000
++++ libc-0.2.191/src/unix/redox/mod.rs	2026-11-17 10:11:55.549480514 +1000
+@@ -38,7 +38,8 @@
+     target_arch = "x86",
+     target_arch = "x86_64",
+     target_arch = "aarch64",
+-    target_arch = "riscv64"
++    target_arch = "riscv64",
++    target_arch = "mips64"
+ ))]
+ pub type mcontext_t = mcontext;
+ 
+@@ -334,7 +335,7 @@
+         ))]
+         _pad: [c_ulong; 1], // pad from 7*8 to 64
+ 
+-        #[cfg(target_arch = "x86")]
++        #[cfg(any(target_arch = "x86", target_arch = "mips64"))]
+         _pad: [c_ulong; 3], // pad from 9*4 to 12*4
+ 
+         pub uc_link: *mut ucontext_t,
+@@ -384,6 +385,12 @@
+     pub struct mcontext {
+         _opaque: [c_uchar; 520],
+     }
++
++    // MIPS n32 (SGI Indy): 31 general registers, pc, hi, lo as u64, 16 bytes spare.
++    #[cfg(target_arch = "mips64")]
++    pub struct mcontext {
++        _opaque: [c_uchar; 288],
++    }
+ }
+ 
+ impl siginfo_t {

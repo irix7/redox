@@ -25,3 +25,4 @@ target
 wget-log
 /vendor/*/
 !/vendor/patches/
+!/vendor/redox_syscall-0.9.6/

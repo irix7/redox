@@ -1,4 +1,4 @@
-From 370aa1c929465a9c50d82614e3bbedf7764f11a8 Mon Sep 17 00:00:00 2001
+From 20202d7baf0bb5811a5e8a6da7f27b6df70e6440 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:49 +1000
 Subject: [PATCH] redox-rt, generic-rt: add mips64 n32 (SGI Indy)
@@ -14,16 +14,94 @@ is read at -8($28). Static code with no GOT leaves $gp free.
 
 Signed-off-by: belikh <io@jupiter.au>
 ---
- generic-rt/src/lib.rs       |  18 +++
- redox-rt/src/arch/mips64.rs | 287 ++++++++++++++++++++++++++++++++++++
- redox-rt/src/arch/mod.rs    |   5 +
- redox-rt/src/lib.rs         |  12 +-
- redox-rt/src/proc.rs        |   6 +-
- 5 files changed, 325 insertions(+), 3 deletions(-)
+ Cargo.lock                                 |   3 -
+ Cargo.toml                                 |   6 +-
+ Makefile                                   |   5 +
+ generic-rt/src/lib.rs                      |  19 ++
+ redox-rt/src/arch/mips64.rs                | 289 +++++++++++++++++++++
+ redox-rt/src/arch/mod.rs                   |   5 +
+ redox-rt/src/lib.rs                        |  32 ++-
+ redox-rt/src/proc.rs                       |   6 +-
+ redox-rt/src/signal.rs                     |   2 +-
+ src/casting.rs                             |  14 +-
+ src/crt0/src/lib.rs                        |  17 ++
+ src/header/arch_mips64_user/cbindgen.toml  |  16 ++
+ src/header/arch_mips64_user/mod.rs         |  23 ++
+ src/header/mod.rs                          |   1 +
+ src/header/netdb/mod.rs                    |   2 +-
+ src/header/setjmp/impl/mipsn32/sigsetjmp.S |  23 ++
+ src/header/setjmp/mod.rs                   |   1 +
+ src/header/signal/redox.rs                 |  16 +-
+ src/header/stdio/printf.rs                 |   5 +
+ src/header/stdlib/mod.rs                   |   4 +-
+ src/header/sys_procfs/mod.rs               |   2 +
+ src/header/time/mod.rs                     |   4 +-
+ src/header/unistd/mod.rs                   |   4 +-
+ src/ld_so/dso.rs                           |  37 ++-
+ src/ld_so/linker.rs                        |   6 +-
+ src/ld_so/mod.rs                           |   7 +
+ src/lib.rs                                 |   1 +
+ src/platform/redox/ptrace.rs               |  12 +
+ 28 files changed, 533 insertions(+), 29 deletions(-)
  create mode 100644 redox-rt/src/arch/mips64.rs
+ create mode 100644 src/header/arch_mips64_user/cbindgen.toml
+ create mode 100644 src/header/arch_mips64_user/mod.rs
+ create mode 100644 src/header/setjmp/impl/mipsn32/sigsetjmp.S
 
+diff --git a/Cargo.lock b/Cargo.lock
+index 90b0969..a1510b3 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -268,8 +268,6 @@ version = "0.1.0"
+ [[package]]
+ name = "libc"
+ version = "0.2.191"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+ 
+ [[package]]
+ name = "libm"
+@@ -517,7 +515,6 @@ dependencies = [
+ [[package]]
+ name = "redox_syscall"
+ version = "0.9.6"
+-source = "git+https://gitlab.redox-os.org/redox-os/kernel/#7824a967b630d4a81c0dbe75a3e50a2a3657cacd"
+ dependencies = [
+  "bitflags",
+ ]
+diff --git a/Cargo.toml b/Cargo.toml
+index 400489e..de725f5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -152,4 +152,8 @@ panic = "abort"
+ panic = "abort"
+ 
+ [patch.crates-io]
+-redox_syscall = {git = "https://gitlab.redox-os.org/redox-os/kernel/"}
++# The Indy port builds against the fork's vendored crates, which carry the
++# mips64 architecture files (irix7/redox vendor/patches).
++redox_syscall = { path = "../../../../vendor/redox_syscall-0.9.6" }
++libc = { path = "../../../../vendor/libc-0.2.191" }
++#redox_syscall = {git = "https://gitlab.redox-os.org/redox-os/kernel/"}
+diff --git a/Makefile b/Makefile
+index 4534cf8..ba4c6e1 100644
+--- a/Makefile
++++ b/Makefile
+@@ -13,7 +13,12 @@ export OBJCOPY?=objcopy
+ 
+ export CARGO_TARGET_DIR?=$(shell pwd)/target
+ BUILD?=$(CARGO_TARGET_DIR)/$(TARGET)
++# A custom target: TARGET names the build directory, TARGET_SPEC the JSON file.
++ifneq ($(TARGET_SPEC),)
++CARGOFLAGS+=--target=$(TARGET_SPEC)
++else
+ CARGOFLAGS+=--target=$(TARGET)
++endif
+ EXCEPT_MATH=-not -name "math"
+ FEATURE_MATH=
+ ifneq ($(USE_RUST_LIBM),)
 diff --git a/generic-rt/src/lib.rs b/generic-rt/src/lib.rs
-index 226c366..e706951 100644
+index 226c366..738cd2b 100644
 --- a/generic-rt/src/lib.rs
 +++ b/generic-rt/src/lib.rs
 @@ -1,4 +1,5 @@
@@ -32,19 +110,20 @@ index 226c366..e706951 100644
  #![allow(internal_features)]
  #![deny(unsafe_op_in_unsafe_fn)]
  
-@@ -84,6 +85,23 @@ impl<Os> GenericTcb<Os> {
+@@ -84,6 +85,24 @@ impl<Os> GenericTcb<Os> {
          value
      }
  
 +    /// Architecture specific code to read a usize from the TCB - mips64 n32.
-+    /// `$gp` holds `&tcb_ptr + 8`; pointers are 32 bits.
++    /// `$gp` is the MIPS thread pointer (`tls_start + 0x7000`); the TCB
++    /// address sits in the word below the TLS block. Pointers are 32 bits.
 +    #[expect(unsafe_op_in_unsafe_fn)]
 +    #[inline(always)]
 +    #[cfg(target_arch = "mips64")]
 +    unsafe fn arch_read(offset: usize) -> usize {
 +        let value;
 +        asm!(
-+            "lw {value}, -8($28)", // TCB
++            "lw {value}, -28676($28)", // TCB address at tls_start - 4
 +            "addu {value}, {value}, {offset}",
 +            "lw {value}, 0({value})",
 +            value = out(reg) value,
@@ -58,15 +137,17 @@ index 226c366..e706951 100644
          let tcb_len = unsafe { Self::arch_read(offset_of!(Self, tcb_len)) };
 diff --git a/redox-rt/src/arch/mips64.rs b/redox-rt/src/arch/mips64.rs
 new file mode 100644
-index 0000000..71b4b44
+index 0000000..54a6e7a
 --- /dev/null
 +++ b/redox-rt/src/arch/mips64.rs
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,289 @@
 +//! MIPS n32 (SGI Indy). Registers are 64 bits wide, pointers 32.
 +//!
-+//! Thread pointer: `$gp` (`$28`) holds `&tcb_ptr + 8`, so the TCB pointer is
-+//! at `-8($28)` (see `generic_rt::GenericTcb::arch_read`). Compiled code is
-+//! static with no GOT, so `$gp` is otherwise unused.
++//! Thread pointer: `$gp` (`$28`) is the MIPS thread pointer
++//! (`tls_start + 0x7000`, variant I); the word below the TLS block holds the
++//! TCB address (see `generic_rt::GenericTcb::arch_read`). Compiled code is
++//! static with no GOT, so `$gp` is otherwise unused. The kernel emulates
++//! `rdhwr $rt, $29` with this register for compiled thread-local accesses.
 +//!
 +//! The signal trampoline is not implemented yet: `__relibc_internal_sigentry`
 +//! traps. Fork and thread start are complete.
@@ -366,7 +447,7 @@ index e763dc9..d1be614 100644
  #[repr(C)]
  pub struct ForkScratchpad {
 diff --git a/redox-rt/src/lib.rs b/redox-rt/src/lib.rs
-index b6935b6..7c793d5 100644
+index b6935b6..0740d68 100644
 --- a/redox-rt/src/lib.rs
 +++ b/redox-rt/src/lib.rs
 @@ -2,6 +2,7 @@
@@ -377,7 +458,33 @@ index b6935b6..7c793d5 100644
  #![forbid(unreachable_patterns)]
  
  use core::cell::UnsafeCell;
-@@ -182,11 +183,20 @@ pub unsafe fn initialize_freestanding(this_thr_fd: FdGuardUpper) -> &'static FdG
+@@ -141,6 +142,25 @@ pub unsafe fn tcb_activate(_tcb: &RtTcb, tls_end: usize, tls_len: usize) {
+     TLS_ACTIVATED.store(true, core::sync::atomic::Ordering::Relaxed);
+ }
+ 
++/// OS and architecture specific code to activate TLS - Redox mips64 n32
++///
++/// MIPS TLS variant I: the thread pointer is `tls_start + 0x7000`, and the
++/// linker biases `%tprel` relocations by -0x7000. The word just below the TLS
++/// block holds the TCB address, which `GenericTcb::arch_read` loads from
++/// `-0x7004($28)`.
++#[allow(unsafe_op_in_unsafe_fn)]
++#[cfg(target_arch = "mips64")]
++pub unsafe fn tcb_activate(_tcb: &RtTcb, tls_end: usize, tls_len: usize) {
++    let tls_start = tls_end - tls_len;
++    let abi_ptr = tls_start - 4;
++    core::ptr::write(abi_ptr as *mut u32, tls_end as u32);
++    core::arch::asm!(
++        "move $28, {}",
++        in(reg) tls_start + 0x7000
++    );
++    TLS_ACTIVATED.store(true, core::sync::atomic::Ordering::Relaxed);
++}
++
+ /// Initialize redox-rt in situations where relibc is not used
+ #[allow(unsafe_op_in_unsafe_fn)]
+ #[cfg(not(feature = "proc"))]
+@@ -182,11 +202,21 @@ pub unsafe fn initialize_freestanding(this_thr_fd: FdGuardUpper) -> &'static FdG
      // Make sure to use ptr::write to prevent dropping the existing FdGuard
      page.os_specific.thr_fd.get().write(Some(this_thr_fd));
  
@@ -393,8 +500,9 @@ index b6935b6..7c793d5 100644
      }
 +    #[cfg(target_arch = "mips64")]
 +    unsafe {
++        // No TLS block: point $28 so that -0x7004($28) is tcb_ptr.
 +        let abi_ptr = core::ptr::addr_of_mut!(page.tcb_ptr) as usize;
-+        core::arch::asm!("move $28, {}", in(reg) (abi_ptr + 8));
++        core::arch::asm!("move $28, {}", in(reg) (abi_ptr + 0x7004));
 +    }
      #[cfg(target_arch = "aarch64")]
      unsafe {
@@ -423,6 +531,504 @@ index 3fb375f..5d94e3b 100644
              ))]
              let buf = create_set_addr_space_buf_for_fork(
                  new_addr_space_fd.as_raw_fd(),
+diff --git a/redox-rt/src/signal.rs b/redox-rt/src/signal.rs
+index 19e7edb..afa63fc 100644
+--- a/redox-rt/src/signal.rs
++++ b/redox-rt/src/signal.rs
+@@ -46,7 +46,7 @@ pub struct SigStack {
+     ))]
+     _pad: [usize; 1], // pad from 7*8 to 64
+ 
+-    #[cfg(target_arch = "x86")]
++    #[cfg(any(target_arch = "x86", target_arch = "mips64"))]
+     _pad: [usize; 3], // pad from 9*4 to 12*4
+ 
+     pub link: *mut SigStack,
+diff --git a/src/casting.rs b/src/casting.rs
+index 154dede..eb587df 100644
+--- a/src/casting.rs
++++ b/src/casting.rs
+@@ -26,7 +26,7 @@ impl ByteLiteral {
+         match input {
+             b' '..=b'~' => {
+                 // `c_char` is an `i8` on these arches
+-                #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
++                #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "mips64"))]
+                 {
+                     // Casting `u8` to `i8` is always safe when within the
+                     // printable ascii range
+@@ -56,7 +56,7 @@ impl U8PtrToCCharPtr {
+     /// Unsupported architectures will panic.
+     pub fn cast_const(input: *const u8) -> *const c_char {
+         // `c_char` is an `i8` on these arches
+-        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
++        #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "mips64"))]
+         {
+             return input.cast();
+         }
+@@ -76,7 +76,7 @@ impl U8PtrToCCharPtr {
+     /// Unsupported architectures will panic.
+     pub fn cast_mut(input: *const u8) -> *mut c_char {
+         // `c_char` is an `i8` on these arches
+-        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
++        #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "mips64"))]
+         {
+             // TODO replace `as` casting with something better
+             return input as *mut _;
+@@ -103,7 +103,7 @@ impl CCharPtrToU8Ptr {
+     /// Unsupported architectures will panic.
+     pub fn cast_const(input: *const c_char) -> *const u8 {
+         // `c_char` is an `i8` on these arches
+-        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
++        #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "mips64"))]
+         {
+             return input.cast();
+         }
+@@ -123,7 +123,7 @@ impl CCharPtrToU8Ptr {
+     /// Unsupported architectures will panic.
+     pub fn cast_mut(input: *const c_char) -> *mut u8 {
+         // `c_char` is an `i8` on these arches
+-        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
++        #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "mips64"))]
+         {
+             // TODO replace `as` casting with something better
+             return input as *mut _;
+@@ -153,7 +153,7 @@ impl CCharPtrToU8 {
+     /// `input` must not be null.
+     pub unsafe fn from_const(input: *const c_char) -> u8 {
+         // `c_char` is an `i8` on these arches
+-        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
++        #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "mips64"))]
+         {
+             return unsafe { *input }.cast_unsigned();
+         }
+@@ -179,7 +179,7 @@ impl CCharToU8 {
+     /// Unsupported architectures will panic.
+     pub fn cast(input: c_char) -> u8 {
+         // `c_char` is an `i8` on these arches
+-        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
++        #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "mips64"))]
+         {
+             return input.cast_unsigned();
+         }
+diff --git a/src/crt0/src/lib.rs b/src/crt0/src/lib.rs
+index fef86f6..841ed85 100644
+--- a/src/crt0/src/lib.rs
++++ b/src/crt0/src/lib.rs
+@@ -2,6 +2,7 @@
+ 
+ #![no_std]
+ #![feature(linkage)]
++#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
+ 
+ use core::{
+     arch::global_asm,
+@@ -63,6 +64,22 @@ _start:
+ "
+ );
+ 
++#[cfg(target_arch = "mips64")]
++global_asm!(
++    "
++    .set noreorder
++    .globl _start
++_start:
++    move    $4, $sp
++    li      $8, -16
++    and     $sp, $sp, $8
++    la      $25, relibc_crt0
++    jalr    $25
++    nop
++    .set reorder
++"
++);
++
+ #[cfg(target_arch = "riscv64")]
+ global_asm!(
+     "
+diff --git a/src/header/arch_mips64_user/cbindgen.toml b/src/header/arch_mips64_user/cbindgen.toml
+new file mode 100644
+index 0000000..2723267
+--- /dev/null
++++ b/src/header/arch_mips64_user/cbindgen.toml
+@@ -0,0 +1,16 @@
++sys_includes = []
++include_guard = "_MIPS64_USER_H"
++language = "C"
++style = "Tag"
++
++[enum]
++prefix_with_name = true
++
++[export]
++include = [
++  "user_regs_struct",
++  "user_fpregs_struct",
++  "elf_gregset_t",
++  "elf_greg_t",
++  "elf_fpregset_t",
++]
+diff --git a/src/header/arch_mips64_user/mod.rs b/src/header/arch_mips64_user/mod.rs
+new file mode 100644
+index 0000000..1075f12
+--- /dev/null
++++ b/src/header/arch_mips64_user/mod.rs
+@@ -0,0 +1,23 @@
++//! `sys/user.h` register sets for MIPS n32 (SGI Indy). Registers are 64 bits
++//! wide; the FPU is disabled, so the float set is a placeholder.
++
++use crate::platform::types::{c_double, c_uint, c_ulonglong};
++
++#[repr(C)]
++pub struct user_regs_struct {
++    /// `$1`..`$31`
++    pub regs: [c_ulonglong; 31],
++    pub pc: c_ulonglong,
++    pub hi: c_ulonglong,
++    pub lo: c_ulonglong,
++}
++
++#[repr(C)]
++pub struct user_fpregs_struct {
++    pub fpregs: [c_double; 32],
++    pub fcsr: c_uint,
++}
++
++pub type elf_greg_t = c_ulonglong;
++pub type elf_gregset_t = user_regs_struct;
++pub type elf_fpregset_t = user_fpregs_struct;
+diff --git a/src/header/mod.rs b/src/header/mod.rs
+index dffef13..e13fad7 100644
+--- a/src/header/mod.rs
++++ b/src/header/mod.rs
+@@ -176,6 +176,7 @@ pub mod sys_timeb;
+ //pub mod sys_times;
+ pub mod arch_aarch64_user;
+ pub mod arch_riscv64_user;
++pub mod arch_mips64_user;
+ pub mod arch_x64_user;
+ #[cfg(not(target_arch = "x86"))] // TODO: x86
+ pub mod sys_procfs;
+diff --git a/src/header/netdb/mod.rs b/src/header/netdb/mod.rs
+index 1a44bf2..14a5b31 100644
+--- a/src/header/netdb/mod.rs
++++ b/src/header/netdb/mod.rs
+@@ -374,7 +374,7 @@ pub unsafe extern "C" fn gethostbyaddr(
+             }
+             let mut cp_slice: [c_char; 4] = [0; 4];
+             unsafe { (*cp).copy_to(cp_slice.as_mut_ptr(), 4) };
+-            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
++            #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "mips64"))]
+             let cp_s_addr = unsafe { mem::transmute::<[c_char; 4], u32>(cp_slice) };
+             #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+             let cp_s_addr = u32::from_ne_bytes(cp_slice);
+diff --git a/src/header/setjmp/impl/mipsn32/sigsetjmp.S b/src/header/setjmp/impl/mipsn32/sigsetjmp.S
+new file mode 100644
+index 0000000..3e56b9b
+--- /dev/null
++++ b/src/header/setjmp/impl/mipsn32/sigsetjmp.S
+@@ -0,0 +1,23 @@
++.set	noreorder
++.global	sigsetjmp
++.global	__sigsetjmp
++.type	sigsetjmp,@function
++.type	__sigsetjmp,@function
++sigsetjmp:
++__sigsetjmp:
++	beq	$5, $0, 1f
++	nop
++	sd	$ra, 160($4)
++	sd	$16, 168($4)
++	move	$16, $4
++	jal	setjmp
++	nop
++	move	$5, $2
++	move	$4, $16
++	ld	$ra, 160($4)
++	ld	$16, 168($4)
++	.hidden	__sigsetjmp_tail
++	j	__sigsetjmp_tail
++	nop
++1:	j	setjmp
++	nop
+diff --git a/src/header/setjmp/mod.rs b/src/header/setjmp/mod.rs
+index e915bf2..f56afec 100644
+--- a/src/header/setjmp/mod.rs
++++ b/src/header/setjmp/mod.rs
+@@ -24,6 +24,7 @@ platform_specific! {
+     "x86","i386","s";
+     "x86_64","x86_64","s";
+     "riscv64", "riscv64", "S";
++    "mips64", "mipsn32", "S";
+ }
+ 
+ //Each platform has different sizes for sigjmp_buf, currently only x86_64 is supported
+diff --git a/src/header/signal/redox.rs b/src/header/signal/redox.rs
+index 66d0c00..9995388 100644
+--- a/src/header/signal/redox.rs
++++ b/src/header/signal/redox.rs
+@@ -1,6 +1,11 @@
+ use redox_rt::signal::SiginfoAbi;
+ 
+-#[cfg(any(target_arch = "x86", target_arch = "aarch64", target_arch = "riscv64"))]
++#[cfg(any(
++    target_arch = "x86",
++    target_arch = "aarch64",
++    target_arch = "riscv64",
++    target_arch = "mips64"
++))]
+ use crate::platform::types::c_uchar;
+ use crate::platform::types::{c_uint, c_ulong};
+ 
+@@ -53,7 +58,7 @@ pub struct ucontext {
+     ))]
+     _pad: [c_ulong; 1], // pad from 7*8 to 64
+ 
+-    #[cfg(target_arch = "x86")]
++    #[cfg(any(target_arch = "x86", target_arch = "mips64"))]
+     _pad: [c_ulong; 3], // pad from 9*4 to 12*4
+ 
+     /// Pointer to the context that is resumed when this context returns.
+@@ -114,6 +119,13 @@ pub struct mcontext {
+     _opaque: [c_uchar; 520],
+ }
+ 
++/// MIPS n32: $1..$31, pc, hi, lo as 64-bit values, 16 bytes spare.
++#[cfg(target_arch = "mips64")]
++#[repr(C)]
++pub struct mcontext {
++    _opaque: [c_uchar; 288],
++}
++
+ impl From<SiginfoAbi> for siginfo_t {
+     fn from(value: SiginfoAbi) -> Self {
+         unsafe { core::mem::transmute(value) }
+diff --git a/src/header/stdio/printf.rs b/src/header/stdio/printf.rs
+index e439427..e383c07 100644
+--- a/src/header/stdio/printf.rs
++++ b/src/header/stdio/printf.rs
+@@ -249,6 +249,11 @@ impl VaArg {
+         todo_skip!(0, "long double in variadic printf is not supported");
+         0u128
+     }
++    #[cfg(target_arch = "mips64")]
++    unsafe fn extract_longdouble(_ap: &mut core::ffi::VaList) -> c_longdouble {
++        todo_skip!(0, "long double in variadic printf is not supported");
++        [0u32; 3]
++    }
+     unsafe fn transmute(&self, fmtkind: FmtKind, intkind: IntKind) -> VaArg {
+         // At this point, there are conflicting printf arguments. An
+         // example of this is:
+diff --git a/src/header/stdlib/mod.rs b/src/header/stdlib/mod.rs
+index 08bbc00..c1c2bd4 100644
+--- a/src/header/stdlib/mod.rs
++++ b/src/header/stdlib/mod.rs
+@@ -1194,9 +1194,9 @@ pub unsafe extern "C" fn random() -> c_long {
+ 
+     /* Both branches of this function result in a "u31", which will
+      * always fit in a c_long. */
+-    #[cfg(not(target_arch = "x86"))]
++    #[cfg(not(any(target_arch = "x86", target_arch = "mips64")))]
+     return c_long::from(k);
+-    #[cfg(target_arch = "x86")] // c_long on x86 is i32 so not infallible cast
++    #[cfg(any(target_arch = "x86", target_arch = "mips64"))] // c_long is i32 so not infallible cast
+     c_long::try_from(k).unwrap()
+ }
+ 
+diff --git a/src/header/sys_procfs/mod.rs b/src/header/sys_procfs/mod.rs
+index 0bc4a88..63708a3 100644
+--- a/src/header/sys_procfs/mod.rs
++++ b/src/header/sys_procfs/mod.rs
+@@ -2,6 +2,8 @@
+ use crate::header::arch_aarch64_user::{elf_fpregset_t, elf_gregset_t};
+ #[cfg(target_arch = "riscv64")]
+ use crate::header::arch_riscv64_user::{elf_fpregset_t, elf_gregset_t};
++#[cfg(target_arch = "mips64")]
++use crate::header::arch_mips64_user::{elf_fpregset_t, elf_gregset_t};
+ #[cfg(target_arch = "x86_64")]
+ use crate::header::arch_x64_user::{elf_fpregset_t, elf_gregset_t};
+ use crate::platform::types::{
+diff --git a/src/header/time/mod.rs b/src/header/time/mod.rs
+index fd3db59..2c030ca 100755
+--- a/src/header/time/mod.rs
++++ b/src/header/time/mod.rs
+@@ -225,10 +225,10 @@ pub extern "C" fn clock() -> clock_t {
+     }
+     let ts = unsafe { ts.assume_init() };
+ 
+-    #[cfg(target_arch = "x86")]
++    #[cfg(any(target_arch = "x86", target_arch = "mips64"))]
+     let clocks = ts.tv_sec * i64::from(CLOCKS_PER_SEC)
+         + i64::from(ts.tv_nsec / (1_000_000_000 / CLOCKS_PER_SEC));
+-    #[cfg(not(target_arch = "x86"))]
++    #[cfg(not(any(target_arch = "x86", target_arch = "mips64")))]
+     let clocks = ts.tv_sec * CLOCKS_PER_SEC + (ts.tv_nsec / (1_000_000_000 / CLOCKS_PER_SEC));
+     clock_t::try_from(clocks).unwrap_or(-1)
+ }
+diff --git a/src/header/unistd/mod.rs b/src/header/unistd/mod.rs
+index 6ac9123..9d65922 100644
+--- a/src/header/unistd/mod.rs
++++ b/src/header/unistd/mod.rs
+@@ -1403,9 +1403,9 @@ pub unsafe extern "C" fn unlinkat(fd: c_int, path: *const c_char, flags: c_int)
+ #[expect(deprecated)]
+ #[unsafe(no_mangle)]
+ pub extern "C" fn usleep(useconds: useconds_t) -> c_int {
+-    #[cfg(not(target_arch = "x86"))]
++    #[cfg(not(any(target_arch = "x86", target_arch = "mips64")))]
+     let tv_nsec = c_long::from((useconds % 1_000_000) * 1000);
+-    #[cfg(target_arch = "x86")]
++    #[cfg(any(target_arch = "x86", target_arch = "mips64"))]
+     let tv_nsec = ((useconds % 1_000_000) * 1000) as c_long;
+     let rqtp = timespec {
+         tv_sec: time_t::from(useconds / 1_000_000),
+diff --git a/src/ld_so/dso.rs b/src/ld_so/dso.rs
+index 21849f4..8e5774f 100644
+--- a/src/ld_so/dso.rs
++++ b/src/ld_so/dso.rs
+@@ -269,6 +269,22 @@ impl RelocationKind {
+         }
+     }
+ 
++    #[cfg(target_arch = "mips64")]
++    pub fn new(kind: u32) -> Self {
++        //WARNING: Only use R_MIPS_* constants here! Static binaries only today.
++        match kind {
++            elf::R_MIPS_COPY => Self::COPY,
++            elf::R_MIPS_TLS_DTPMOD32 => Self::DTPMOD,
++            elf::R_MIPS_TLS_DTPREL32 => Self::DTPOFF,
++            elf::R_MIPS_GLOB_DAT => Self::GOT,
++            elf::R_MIPS_JUMP_SLOT => Self::PLT,
++            elf::R_MIPS_REL32 => Self::RELATIVE,
++            elf::R_MIPS_32 => Self::SYMBOLIC,
++            elf::R_MIPS_TLS_TPREL32 => Self::TPOFF,
++            _ => Self::UNKNOWN(kind),
++        }
++    }
++
+     #[cfg(target_arch = "riscv64")]
+     pub fn new(kind: u32) -> Self {
+         //WARNING: Only use R_RISCV_* constants here!
+@@ -1068,7 +1084,7 @@ impl DSO {
+         let strtab_offset = strtab_offset.expect("DT_STRTAB must be present");
+         let strtab_size = strtab_size.expect("DT_STRSZ must be present");
+ 
+-        #[cfg(target_arch = "x86")]
++        #[cfg(any(target_arch = "x86", target_arch = "mips64"))]
+         let dynstrtab = StringTable::new(
+             unsafe {
+                 slice::from_raw_parts(
+@@ -1079,7 +1095,7 @@ impl DSO {
+             0,
+             u64::from(strtab_size),
+         );
+-        #[cfg(not(target_arch = "x86"))]
++        #[cfg(not(any(target_arch = "x86", target_arch = "mips64")))]
+         let dynstrtab = StringTable::new(
+             unsafe {
+                 slice::from_raw_parts(
+@@ -1565,6 +1581,23 @@ unsafe extern "C" fn __tlsdesc_static() {
+     core::arch::naked_asm!("ld a0, 8(a0)", "ret");
+ }
+ 
++// n32: the descriptor's second word is 4 bytes in.
++#[cfg(target_arch = "mips64")]
++#[unsafe(naked)]
++unsafe extern "C" fn __tlsdesc_static() {
++    core::arch::naked_asm!(".set noreorder", "lw $4, 4($4)", "jr $31", "nop", ".set reorder");
++}
++
++// Dynamic TLS descriptors are not supported on mips64 yet.
++#[cfg(target_arch = "mips64")]
++core::arch::global_asm!(
++    "
++.global __tlsdesc_dynamic
++__tlsdesc_dynamic:
++    break 0
++"
++);
++
+ unsafe extern "C" {
+     fn __tlsdesc_dynamic();
+ }
+diff --git a/src/ld_so/linker.rs b/src/ld_so/linker.rs
+index 1fb2244..f132905 100644
+--- a/src/ld_so/linker.rs
++++ b/src/ld_so/linker.rs
+@@ -6,7 +6,7 @@ use alloc::{
+     vec::Vec,
+ };
+ use object::elf;
+-#[cfg(not(target_arch = "x86"))]
++#[cfg(not(any(target_arch = "x86", target_arch = "mips64")))]
+ use object::{
+     NativeEndian,
+     read::elf::{Rela as _, Sym},
+@@ -34,10 +34,10 @@ use crate::{
+     sync::rwlock::RwLock,
+ };
+ 
+-#[cfg(not(target_arch = "x86"))]
++#[cfg(not(any(target_arch = "x86", target_arch = "mips64")))]
+ use crate::{ld_so::dso::resolve_sym, platform::types::c_uint};
+ 
+-#[cfg(not(target_arch = "x86"))]
++#[cfg(not(any(target_arch = "x86", target_arch = "mips64")))]
+ use super::dso::Rela;
+ use super::{
+     PATH_SEP,
+diff --git a/src/ld_so/mod.rs b/src/ld_so/mod.rs
+index af5b90e..2f85d6e 100644
+--- a/src/ld_so/mod.rs
++++ b/src/ld_so/mod.rs
+@@ -184,6 +184,13 @@ pub unsafe fn init(
+             out(reg) tp,
+         );
+     }
++    #[cfg(all(target_os = "redox", target_arch = "mips64"))]
++    unsafe {
++        core::arch::asm!(
++            "move {}, $28",
++            out(reg) tp,
++        );
++    }
+ 
+     if tp == 0 {
+         static_init(
+diff --git a/src/lib.rs b/src/lib.rs
+index 4d9415a..3772556 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,6 +7,7 @@
+ //! Currently, Linux and Redox syscall backends are supported.
+ 
+ #![no_std]
++#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
+ #![feature(alloc_error_handler)]
+ #![feature(c_variadic)]
+ #![feature(core_intrinsics)]
+diff --git a/src/platform/redox/ptrace.rs b/src/platform/redox/ptrace.rs
+index f70c00f..7a3003a 100644
+--- a/src/platform/redox/ptrace.rs
++++ b/src/platform/redox/ptrace.rs
+@@ -267,6 +267,18 @@ unsafe fn inner_ptrace(
+     }
+ }
+ 
++#[cfg(target_arch = "mips64")]
++#[expect(unused_variables, reason = "function not yet implemented")]
++fn inner_ptrace(
++    request: c_int,
++    pid: pid_t,
++    addr: *mut c_void,
++    data: *mut c_void,
++) -> io::Result<c_int> {
++    //TODO: mips64
++    unimplemented!("inner_ptrace not implemented on mips64");
++}
++
+ #[cfg(target_arch = "riscv64")]
+ #[expect(unused_variables, reason = "function not yet implemented")]
+ fn inner_ptrace(
 -- 
 2.56.0
 
