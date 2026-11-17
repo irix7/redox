@@ -1,4 +1,4 @@
-From ee26081bde853fa17bd377b5e36af4d4c90a5bd9 Mon Sep 17 00:00:00 2001
+From 6669c6bbd91aba26acf1ad6f638770c561f99dc7 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -37,7 +37,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/consts.rs              |  24 ++
  src/arch/mips64/cp0.rs                 | 112 +++++++
  src/arch/mips64/debug.rs               |  24 ++
- src/arch/mips64/device/arcs.rs         | 174 ++++++++++
+ src/arch/mips64/device/arcs.rs         | 189 +++++++++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
  src/arch/mips64/device/mod.rs          |  24 ++
  src/arch/mips64/device/serial.rs       |  14 +
@@ -52,7 +52,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/mod.rs                 |  92 +++++
  src/arch/mips64/paging.rs              |  26 ++
  src/arch/mips64/start.rs               | 321 ++++++++++++++++++
- src/arch/mips64/stop.rs                |  43 +++
+ src/arch/mips64/stop.rs                |  47 +++
  src/arch/mips64/time.rs                |  61 ++++
  src/arch/mod.rs                        |   6 +
  src/context/arch/mips64.rs             | 217 ++++++++++++
@@ -69,7 +69,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 41 files changed, 3072 insertions(+), 12 deletions(-)
+ 41 files changed, 3091 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -744,10 +744,10 @@ index 00000000..5d6cee9e
 +}
 diff --git a/src/arch/mips64/device/arcs.rs b/src/arch/mips64/device/arcs.rs
 new file mode 100644
-index 00000000..8b0991ba
+index 00000000..b2e564f5
 --- /dev/null
 +++ b/src/arch/mips64/device/arcs.rs
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,189 @@
 +//! Calls into the ARCS firmware (the Indy PROM).
 +//!
 +//! The PROM leaves a system parameter block at physical 0x1000. Its firmware
@@ -775,6 +775,7 @@ index 00000000..8b0991ba
 +/// Word index of the firmware vector pointer in the parameter block.
 +const SPB_FIRMWARE_VECTOR: usize = 8;
 +
++const FN_REBOOT: usize = 6;
 +const FN_GET_MEMORY_DESCRIPTOR: usize = 18;
 +const FN_WRITE: usize = 27;
 +const FN_GET_ENVIRONMENT_VARIABLE: usize = 30;
@@ -921,6 +922,20 @@ index 00000000..8b0991ba
 +    let previous = previous.map_or(0, |d| d as *const MemoryDescriptor as usize);
 +    let next = unsafe { call(FN_GET_MEMORY_DESCRIPTOR, previous, 0, 0, 0) } as usize;
 +    unsafe { (next as *const MemoryDescriptor).as_ref() }
++}
++
++/// Ask the firmware to restart the machine (`Reboot`, entry 6): it resets
++/// the devices itself and then autoboots if `AutoLoad` says so. Returns only
++/// if there is no firmware or the call comes back.
++pub unsafe fn reboot() {
++    if !present() {
++        return;
++    }
++    unsafe {
++        // The PROM's own vectors, interrupts off and masked.
++        cp0::write_status(cp0::status::BEV);
++        call(FN_REBOOT, 0, 0, 0, 0);
++    }
 +}
 diff --git a/src/arch/mips64/device/cpu/mod.rs b/src/arch/mips64/device/cpu/mod.rs
 new file mode 100644
@@ -2576,10 +2591,10 @@ index 00000000..dd570a1d
 +const PHYS_OFFSET: usize = <crate::arch::CurrentRmmArch as rmm::Arch>::PHYS_OFFSET;
 diff --git a/src/arch/mips64/stop.rs b/src/arch/mips64/stop.rs
 new file mode 100644
-index 00000000..586521b6
+index 00000000..49d7eee0
 --- /dev/null
 +++ b/src/arch/mips64/stop.rs
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,47 @@
 +use crate::sync::CleanLockToken;
 +
 +/// Reset the machine through the memory controller: CPUCTRL0 bit 4 (SYSINIT)
@@ -2596,6 +2611,10 @@ index 00000000..586521b6
 +    const SYSINIT: u32 = 0x10;
 +    unsafe {
 +        super::interrupt::disable();
++        // First choice: the firmware's own Reboot. On the real machine both
++        // the SYSINIT reset and a jump to the PROM entry left the screen off
++        // and the PROM not running.
++        super::device::arcs::reboot();
 +        MC_CPUCTRL0.write_volatile(MC_CPUCTRL0.read_volatile() | SYSINIT);
 +        // The reset takes effect within a few bus cycles. If it does not,
 +        // fall back to the PROM's entry with its own vectors selected.
