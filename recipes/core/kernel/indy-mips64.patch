@@ -1,4 +1,4 @@
-From 2c7bfa874dcb3258367c19ed8b9dfaca6841dab0 Mon Sep 17 00:00:00 2001
+From 7105ca37cd9e70bd651ae15481554fc820444345 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -30,7 +30,7 @@ Signed-off-by: belikh <io@belic.net>
 ---
  Makefile                               |   7 +
  linkers/mips64.ld                      |  60 ++++
- rmm/src/arch/mips.rs                   | 208 +++++++++++++
+ rmm/src/arch/mips.rs                   | 230 +++++++++++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
  src/arch/mips64/cache.rs               |  93 ++++++
@@ -69,7 +69,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 41 files changed, 2961 insertions(+), 12 deletions(-)
+ 41 files changed, 2983 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -198,10 +198,10 @@ index 00000000..b6bf3827
 +}
 diff --git a/rmm/src/arch/mips.rs b/rmm/src/arch/mips.rs
 new file mode 100644
-index 00000000..eadd5dfa
+index 00000000..45279bcf
 --- /dev/null
 +++ b/rmm/src/arch/mips.rs
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,230 @@
 +//! MIPS R4000-class paging for the SGI Indy (R4400, n32 kernel, 32-bit addresses).
 +//!
 +//! The TLB is refilled by software. `rmm` keeps a two-level table of 4-byte
@@ -285,24 +285,46 @@ index 00000000..eadd5dfa
 +    }
 +}
 +
-+/// Write a random TLB entry for the pair of pages containing `virt`.
++/// Write the TLB entry for the pair of pages containing `virt`.
++///
++/// The TLB is probed first. A pair can already be present with this half
++/// invalid (its neighbour was refilled before this page was mapped), and a
++/// second entry for the same pair is a duplicate match: real R4x00 CPUs give
++/// undefined translations or shut the TLB down. A present entry is replaced
++/// in place; otherwise a random one is taken.
 +///
 +/// # Safety
 +/// Changes address translation for the whole CPU.
 +pub unsafe fn write_random(virt: usize, entry_lo0: usize, entry_lo1: usize) {
 +    unsafe {
 +        asm!(
++            ".set push",
++            ".set noreorder",
 +            "mtc0 {hi}, $10",
++            "nop",
++            "nop",
++            "tlbp",
++            "nop",
++            "nop",
++            "mfc0 {probe}, $0",
 +            "mtc0 {lo0}, $2",
 +            "mtc0 {lo1}, $3",
 +            "nop",
++            "bltz {probe}, 2f",
 +            "nop",
++            "tlbwi",
++            "b 3f",
++            "nop",
++            "2:",
 +            "tlbwr",
++            "3:",
 +            "nop",
 +            "nop",
++            ".set pop",
 +            hi = in(reg) virt & !0x1fff,
 +            lo0 = in(reg) entry_lo0,
 +            lo1 = in(reg) entry_lo1,
++            probe = out(reg) _,
 +            options(nostack),
 +        );
 +    }
