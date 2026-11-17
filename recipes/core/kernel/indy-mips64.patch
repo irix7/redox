@@ -1,4 +1,4 @@
-From 6669c6bbd91aba26acf1ad6f638770c561f99dc7 Mon Sep 17 00:00:00 2001
+From 499921f9753e22945265c959ae73eb61fafb7420 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -33,25 +33,25 @@ Signed-off-by: belikh <io@belic.net>
  rmm/src/arch/mips.rs                   | 236 +++++++++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
- src/arch/mips64/cache.rs               |  93 ++++++
+ src/arch/mips64/cache.rs               |  93 +++++
  src/arch/mips64/consts.rs              |  24 ++
- src/arch/mips64/cp0.rs                 | 112 +++++++
+ src/arch/mips64/cp0.rs                 | 112 ++++++
  src/arch/mips64/debug.rs               |  24 ++
- src/arch/mips64/device/arcs.rs         | 189 +++++++++++
+ src/arch/mips64/device/arcs.rs         | 218 ++++++++++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
  src/arch/mips64/device/mod.rs          |  24 ++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 442 +++++++++++++++++++++++++
- src/arch/mips64/interrupt/handler.rs   | 394 ++++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 461 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/handler.rs   | 394 +++++++++++++++++++++
  src/arch/mips64/interrupt/irq.rs       |  90 +++++
  src/arch/mips64/interrupt/mod.rs       |  47 +++
  src/arch/mips64/interrupt/syscall.rs   |   4 +
- src/arch/mips64/interrupt/trace.rs     |  19 ++
+ src/arch/mips64/interrupt/trace.rs     |  19 +
  src/arch/mips64/ipi.rs                 |  24 ++
  src/arch/mips64/misc.rs                |  60 ++++
  src/arch/mips64/mod.rs                 |  92 +++++
  src/arch/mips64/paging.rs              |  26 ++
- src/arch/mips64/start.rs               | 321 ++++++++++++++++++
+ src/arch/mips64/start.rs               | 321 +++++++++++++++++
  src/arch/mips64/stop.rs                |  47 +++
  src/arch/mips64/time.rs                |  61 ++++
  src/arch/mod.rs                        |   6 +
@@ -69,7 +69,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 41 files changed, 3091 insertions(+), 12 deletions(-)
+ 41 files changed, 3139 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -744,10 +744,10 @@ index 00000000..5d6cee9e
 +}
 diff --git a/src/arch/mips64/device/arcs.rs b/src/arch/mips64/device/arcs.rs
 new file mode 100644
-index 00000000..b2e564f5
+index 00000000..a2de95f6
 --- /dev/null
 +++ b/src/arch/mips64/device/arcs.rs
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,218 @@
 +//! Calls into the ARCS firmware (the Indy PROM).
 +//!
 +//! The PROM leaves a system parameter block at physical 0x1000. Its firmware
@@ -777,9 +777,12 @@ index 00000000..b2e564f5
 +
 +const FN_REBOOT: usize = 6;
 +const FN_GET_MEMORY_DESCRIPTOR: usize = 18;
++const FN_READ: usize = 25;
++const FN_GET_READ_STATUS: usize = 26;
 +const FN_WRITE: usize = 27;
 +const FN_GET_ENVIRONMENT_VARIABLE: usize = 30;
 +
++const STDIN: usize = 0;
 +const STDOUT: usize = 1;
 +
 +/// Memory descriptor types as SGI's ARCS numbers them.
@@ -937,6 +940,32 @@ index 00000000..b2e564f5
 +        call(FN_REBOOT, 0, 0, 0, 0);
 +    }
 +}
++
++/// One character from the PROM console's keyboard, if one is waiting.
++///
++/// Only when the PROM console is the screen: with a serial console the
++/// kernel reads Serial Port 1 itself. `GetReadStatus` returns 0 when `Read`
++/// would not block. The caller holds the console lock.
++pub fn read_byte() -> Option<u8> {
++    if !present() || CONSOLE_IS_SERIAL.load(Ordering::Relaxed) {
++        return None;
++    }
++    unsafe {
++        if call(FN_GET_READ_STATUS, STDIN, 0, 0, 0) != 0 {
++            return None;
++        }
++        let mut byte: u8 = 0;
++        let mut count: u32 = 0;
++        let status = call(
++            FN_READ,
++            STDIN,
++            &raw mut byte as usize,
++            1,
++            &raw mut count as usize,
++        );
++        (status == 0 && count == 1).then_some(byte)
++    }
++}
 diff --git a/src/arch/mips64/device/cpu/mod.rs b/src/arch/mips64/device/cpu/mod.rs
 new file mode 100644
 index 00000000..e8c7e2c3
@@ -1006,10 +1035,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..56a68846
+index 00000000..ac8d7259
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,461 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -1272,6 +1301,25 @@ index 00000000..56a68846
 +        // The console's receive side is polled from the tick: the serial
 +        // interrupt arrives through INT3's mappable lines, not routed yet.
 +        crate::arch::device::serial::COM1.lock().receive(&mut token);
++        // The keyboard, through the PROM console, every fourth tick: the
++        // firmware call runs with interrupts off and polls the controller.
++        static KEYBOARD_DIVIDER: core::sync::atomic::AtomicU32 =
++            core::sync::atomic::AtomicU32::new(0);
++        if KEYBOARD_DIVIDER.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 4 == 0 {
++            let console = crate::arch::device::serial::COM1.lock();
++            let mut any = false;
++            for _ in 0..8 {
++                let Some(byte) = crate::arch::device::arcs::read_byte() else {
++                    break;
++                };
++                crate::scheme::debug::debug_input(byte, &mut token);
++                any = true;
++            }
++            drop(console);
++            if any {
++                crate::scheme::debug::debug_notify(&mut token);
++            }
++        }
 +        crate::context::timeout::trigger(&mut token);
 +        crate::context::switch::tick(&mut token);
 +    }

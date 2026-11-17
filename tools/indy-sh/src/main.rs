@@ -82,6 +82,16 @@ fn run(line: &str, out: &mut dyn Write) -> bool {
         "net" => {
             let _ = writeln!(out, "{}\r", net_line());
         }
+        "peek" => {
+            let addr = args.first().copied().and_then(parse_number);
+            let len = args.get(1).copied().and_then(parse_number).unwrap_or(256);
+            match addr {
+                Some(addr) => peek(out, addr, len),
+                None => {
+                    let _ = writeln!(out, "usage: peek PHYS_ADDR [LEN]\r");
+                }
+            }
+        }
         "reboot" => {
             let _ = writeln!(out, "rebooting to the PROM\r");
             let _ = out.flush();
@@ -232,4 +242,55 @@ fn main() {
         // Console input ended or failed: wait and offer the prompt again.
         thread::sleep(Duration::from_secs(5));
     }
+}
+
+fn parse_number(text: &str) -> Option<usize> {
+    match text.strip_prefix("0x") {
+        Some(hex) => usize::from_str_radix(hex, 16).ok(),
+        None => text.parse().ok(),
+    }
+}
+
+unsafe extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+}
+
+/// Hex dump of physical memory, 32 bytes to a line, each line prefixed with
+/// its address. Maps the range through `/scheme/memory/physical@dev`
+/// (uncached), the way the drivers reach device registers.
+fn peek(out: &mut dyn Write, addr: usize, len: usize) {
+    use std::os::fd::AsRawFd;
+    const PROT_READ: i32 = 0x0004;
+    const MAP_SHARED: i32 = 0x0001;
+    let file = match fs::File::open("/scheme/memory/physical@dev") {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = writeln!(out, "peek: {err}\r");
+            return;
+        }
+    };
+    let base = addr & !0xfff;
+    let span = (addr + len - base + 0xfff) & !0xfff;
+    let map = unsafe {
+        mmap(core::ptr::null_mut(), span, PROT_READ, MAP_SHARED, file.as_raw_fd(), base as i64)
+    };
+    if map as usize == usize::MAX {
+        let _ = writeln!(out, "peek: cannot map {base:#x}+{span:#x}\r");
+        return;
+    }
+    let mut line = String::with_capacity(80);
+    for offset in (0..len).step_by(32) {
+        line.clear();
+        line.push_str(&format!("{:08x}:", addr + offset));
+        for i in offset..(offset + 32).min(len) {
+            let byte = unsafe { map.add(addr - base + i).read_volatile() };
+            line.push_str(&format!("{byte:02x}"));
+        }
+        if writeln!(out, "{line}\r").is_err() {
+            break;
+        }
+    }
+    let _ = out.flush();
+    unsafe { munmap(map, span) };
 }
