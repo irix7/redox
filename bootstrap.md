@@ -728,9 +728,14 @@ and none of them is on the critical path to "the machine runs our code".
   netstack and webfs; the shell, dhcpd and zerod load from the store. Programs spawn from
   `/usr/bin`. `poll()` works (upstream's event kcall is applied on the kernel pin) and
   signals are delivered through a real trampoline (the kernel preserves `$k1` for it);
-  `sigtest` and `polltest` in the shell check both. Open: cache flushing on every trap is
-  slow (reads at about 45 KiB/s), the machine does not answer ping, the store server is
-  started by hand.
+  `sigtest` and `polltest` in the shell check both. Cache handling is by page colour since 2026-11-18
+  (`arch/mips64/cache.rs`): frames are allocated on the colour of the page they back,
+  borrowed mappings keep their source's colour, off-colour pages are written back at traps,
+  and an assembly handler serves the refills that need no cache work. A kernel-scheme
+  syscall takes about 12 to 20 microseconds and webfs reads about 90 KiB/s. A call to a
+  user scheme still takes about 1.8 ms, nearly all of it in the kernel's scheme path.
+  Open: that IPC cost, no ASIDs (the TLB is flushed on every switch), the machine does not
+  answer ping, the store server is started by hand.
 - **T9 — next.** First real-hardware boot and whatever it shows; shrink the initfs (4.4 MiB
   against a 2 MiB budget); an entropy source for `randd`; the serial interrupt (INT3
   mappable lines) instead of polling; `ion` in place of the bring-up shell.

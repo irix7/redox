@@ -1,4 +1,4 @@
-From 962dd0d136b820a7ec1fd4260c25d5d5d9ca57be Mon Sep 17 00:00:00 2001
+From 7ad210bcc5719231b91a25637d972c9dc8b08ce8 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -29,47 +29,51 @@ Signed-off-by: belikh <io@jupiter.au>
 Signed-off-by: belikh <io@belic.net>
 ---
  Makefile                               |   7 +
- linkers/mips64.ld                      |  60 ++++
- rmm/src/arch/mips.rs                   | 236 +++++++++++++
+ linkers/mips64.ld                      |  60 ++
+ rmm/src/arch/mips.rs                   | 247 ++++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
- src/arch/mips64/cache.rs               |  93 +++++
- src/arch/mips64/consts.rs              |  24 ++
- src/arch/mips64/cp0.rs                 | 112 ++++++
- src/arch/mips64/debug.rs               |  24 ++
- src/arch/mips64/device/arcs.rs         | 238 +++++++++++++
+ src/arch/mips64/cache.rs               | 460 +++++++++++++++
+ src/arch/mips64/consts.rs              |  24 +
+ src/arch/mips64/cp0.rs                 | 112 ++++
+ src/arch/mips64/debug.rs               |  24 +
+ src/arch/mips64/device/arcs.rs         | 238 ++++++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
- src/arch/mips64/device/mod.rs          |  24 ++
+ src/arch/mips64/device/mod.rs          |  24 +
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 469 +++++++++++++++++++++++++
- src/arch/mips64/interrupt/handler.rs   | 396 +++++++++++++++++++++
- src/arch/mips64/interrupt/irq.rs       |  90 +++++
- src/arch/mips64/interrupt/mod.rs       |  47 +++
+ src/arch/mips64/interrupt/exception.rs | 746 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/handler.rs   | 396 +++++++++++++
+ src/arch/mips64/interrupt/irq.rs       |  90 +++
+ src/arch/mips64/interrupt/mod.rs       |  47 ++
  src/arch/mips64/interrupt/syscall.rs   |   4 +
  src/arch/mips64/interrupt/trace.rs     |  19 +
- src/arch/mips64/ipi.rs                 |  24 ++
- src/arch/mips64/misc.rs                |  60 ++++
- src/arch/mips64/mod.rs                 |  92 +++++
- src/arch/mips64/paging.rs              |  26 ++
- src/arch/mips64/start.rs               | 347 ++++++++++++++++++
- src/arch/mips64/stop.rs                |  47 +++
- src/arch/mips64/time.rs                |  89 +++++
+ src/arch/mips64/ipi.rs                 |  24 +
+ src/arch/mips64/misc.rs                |  60 ++
+ src/arch/mips64/mod.rs                 |  92 +++
+ src/arch/mips64/paging.rs              |  26 +
+ src/arch/mips64/start.rs               | 347 ++++++++++++
+ src/arch/mips64/stop.rs                |  47 ++
+ src/arch/mips64/time.rs                | 160 ++++++
  src/arch/mod.rs                        |   6 +
- src/context/arch/mips64.rs             | 217 ++++++++++++
+ src/context/arch/mips64.rs             | 226 ++++++++
+ src/context/memory.rs                  |  44 +-
  src/context/mod.rs                     |   4 +
  src/devices/mod.rs                     |   2 +
  src/devices/serial.rs                  |  13 +
- src/devices/uart_z85c30.rs             | 120 +++++++
+ src/devices/uart_z85c30.rs             | 120 ++++
  src/main.rs                            |   1 +
+ src/memory/mod.rs                      |   7 +-
  src/panic.rs                           |  15 +
  src/scheme/irq.rs                      |   2 +
- src/scheme/proc.rs                     |   3 +-
+ src/scheme/proc.rs                     |   8 +-
+ src/scheme/sys/mod.rs                  |  17 +
+ src/scheme/user.rs                     |   4 +-
  src/startup/mod.rs                     |  20 +-
- syscall/src/arch/mips64.rs             | 232 ++++++++++++
+ syscall/src/arch/mips64.rs             | 232 ++++++++
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
- targets/mips64-unknown-kernel.json     |  31 ++
- 41 files changed, 3223 insertions(+), 12 deletions(-)
+ targets/mips64-unknown-kernel.json     |  31 +
+ 45 files changed, 4030 insertions(+), 17 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -198,10 +202,10 @@ index 00000000..b6bf3827
 +}
 diff --git a/rmm/src/arch/mips.rs b/rmm/src/arch/mips.rs
 new file mode 100644
-index 00000000..825109da
+index 00000000..467d7cbc
 --- /dev/null
 +++ b/rmm/src/arch/mips.rs
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,247 @@
 +//! MIPS R4000-class paging for the SGI Indy (R4400, n32 kernel, 32-bit addresses).
 +//!
 +//! The TLB is refilled by software. `rmm` keeps a two-level table of 4-byte
@@ -227,6 +231,9 @@ index 00000000..825109da
 +#[derive(Clone, Copy)]
 +pub struct MipsArch;
 +
++/// Whole-TLB flushes since the last statistics read.
++pub static TLB_FLUSHES: AtomicUsize = AtomicUsize::new(0);
++
 +/// Physical address of the table the refill handler walks.
 +pub static CURRENT_TABLE: AtomicUsize = AtomicUsize::new(0);
 +
@@ -235,6 +242,13 @@ index 00000000..825109da
 +
 +/// Software bit: build the EntryLo with the uncached cache coherency code.
 +pub const PTE_UNCACHED: usize = 1 << 29;
++/// Software bits the slow refill path sets on a leaf entry to tell the
++/// assembly refill handler that installing it needs no cache work. Each is
++/// only honoured with the protection it was decided for: `PTE_FAST_DATA`
++/// on a no-execute entry, `PTE_FAST_TEXT` on an executable read-only one.
++/// A changed protection therefore sends the entry back to the slow path.
++pub const PTE_FAST_DATA: usize = 1 << 26;
++pub const PTE_FAST_TEXT: usize = 1 << 27;
 +/// The bits of a leaf entry the hardware understands: frame number, D, V.
 +pub const PTE_HARDWARE_MASK: usize = 0x03ff_ffc6;
 +/// EntryLo coherency field: cacheable, noncoherent.
@@ -341,6 +355,7 @@ index 00000000..825109da
 +/// # Safety
 +/// Changes address translation for the whole CPU.
 +pub unsafe fn flush_all() {
++    TLB_FLUSHES.fetch_add(1, Ordering::Relaxed);
 +    unsafe {
 +        asm!(
 +            "mtc0 $zero, $5", // PageMask: 4 KiB
@@ -467,31 +482,54 @@ index 1f2c1a13..ccbee701 100644
  
 diff --git a/src/arch/mips64/cache.rs b/src/arch/mips64/cache.rs
 new file mode 100644
-index 00000000..cb70e2ca
+index 00000000..972fd8af
 --- /dev/null
 +++ b/src/arch/mips64/cache.rs
-@@ -0,0 +1,93 @@
-+//! Primary cache flushing.
+@@ -0,0 +1,460 @@
++//! Primary cache coherence.
 +//!
-+//! The R4x00 and R5000 primary caches are indexed by virtual address and are
-+//! larger per way than a 4 KiB page, so one frame reached through two
-+//! addresses of different colour (kseg0 and a user mapping, or two user
-+//! mappings) has two independent cached copies. The instruction cache also
-+//! fills from RAM and does not see data still held in the data cache. Only
-+//! an R4000/R4400 with a secondary cache traps on this (VCED/VCEI).
++//! The R4x00 and R5000 primary caches are indexed by virtual address, and a
++//! way is larger than a 4 KiB page: 8 KiB on the R4600 (two colours), 16 KiB
++//! on the R4400 and R5000 (four). A frame reached through two addresses of
++//! different colour has two independent cached copies. The instruction cache
++//! fills from RAM and never sees a store. Only an R4000/R4400 with a
++//! secondary cache traps on the first problem (VCED/VCEI).
 +//!
-+//! The kernel keeps the copies apart in time. The data cache is written
-+//! back and emptied when a trap from user mode is about to touch frames,
-+//! and both caches are emptied before the return to user mode. User code
-+//! therefore starts on RAM that is current, and the kernel reads frames the
-+//! user's cached lines have already reached. A refill served from the page
-+//! table touches no frame and skips both.
++//! The kernel reaches frames through kseg0, so its colour is the frame's
++//! own. The design keeps user mappings on that colour and pays only for the
++//! ones that are not:
 +//!
-+//! This costs every trap two passes over the caches. It is the first
-+//! correct version; tracking which frames are cached under which colour is
-+//! the cheaper design to move to.
++//! - A frame allocated in a page fault is picked to have the colour of the
++//!   faulting address (`recolour`), and a mapping borrowed from another
++//!   address space is placed on the colour of its source
++//!   (`Grants::find_free_near`). Such mappings share their cache lines with
++//!   kseg0 and need nothing.
++//! - A mapping on another colour is handled where its TLB entry is written
++//!   (`installing`): the frame's kseg0 lines are written back first, and a
++//!   user page is put on a short list. On the next trap that can touch
++//!   frames (`before_frames`), the listed pages' lines are written back and
++//!   their TLB entries dropped, so the next use comes through `installing`
++//!   again. A refill served from the page table touches no frame and does
++//!   neither.
++//! - Instruction fetch: one bit per frame says the instruction cache holds
++//!   nothing stale for it. A refill that maps the frame executable with the
++//!   bit clear writes the frame's data lines back and invalidates its
++//!   instruction lines under every colour, then sets the bit. A refill that
++//!   maps it writable, and a new allocation, clear the bit.
++//!
++//! Limits: a frame mapped under two colours in one address space and used
++//! through both without a trap in between is not kept coherent, and code
++//! written through a mapping whose TLB entry predates an executable mapping
++//! of the same frame is not noticed.
 +
-+use core::sync::atomic::{AtomicUsize, Ordering};
++use core::{
++    cell::SyncUnsafeCell,
++    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
++};
++
++use rmm::Arch;
++
++use crate::memory::{Frame, RmmA};
 +
 +use super::cp0;
 +
@@ -516,13 +554,266 @@ index 00000000..cb70e2ca
 +    ICACHE_LINE.store(iline, Ordering::Relaxed);
 +    DCACHE_BYTES.store(dcache, Ordering::Relaxed);
 +    DCACHE_LINE.store(dline, Ordering::Relaxed);
++    // Two ways on the R4600, R4700, R4650 and R5000 (PRId implementation
++    // 0x20..0x23); the R4000 and R4400 are direct mapped.
++    let ways = match (cp0::read_prid() >> 8) & 0xff {
++        0x20..=0x23 | 0x28 => 2,
++        _ => 1,
++    };
++    WAYS.store(ways, Ordering::Relaxed);
++    DCACHE_WAY.store(dcache / ways, Ordering::Relaxed);
++    COLOUR_MASK.store((dcache / ways / 4096).max(1) - 1, Ordering::Relaxed);
++    ICACHE_WAY.store(icache / ways, Ordering::Relaxed);
 +    info!(
-+        "Indy: primary caches I {} KiB/{} B lines, D {} KiB/{} B lines",
++        "Indy: primary caches I {} KiB/{} B lines, D {} KiB/{} B lines, {} way(s), {} colours",
 +        icache >> 10,
 +        iline,
 +        dcache >> 10,
-+        dline
++        dline,
++        ways,
++        colours()
 +    );
++}
++
++static WAYS: AtomicUsize = AtomicUsize::new(1);
++static DCACHE_WAY: AtomicUsize = AtomicUsize::new(4096);
++static ICACHE_WAY: AtomicUsize = AtomicUsize::new(4096);
++
++const PAGE: usize = 4096;
++
++/// Page colours of the data cache: pages per way.
++pub fn colours() -> usize {
++    (DCACHE_WAY.load(Ordering::Relaxed) / PAGE).max(1)
++}
++
++/// The data cache colour of an address, virtual or physical.
++pub fn colour(addr: usize) -> usize {
++    (addr / PAGE) & (colours() - 1)
++}
++
++/// Write back and invalidate the data cache lines a page at `addr` can
++/// occupy, in every way. Index operations: no TLB entry is needed and they
++/// do not depend on what the lines hold.
++fn flush_data_page(addr: usize) {
++    let line = DCACHE_LINE.load(Ordering::Relaxed);
++    let way = DCACHE_WAY.load(Ordering::Relaxed);
++    let offset = addr & (way - 1) & !(PAGE - 1);
++    for w in 0..WAYS.load(Ordering::Relaxed) {
++        let start = BASE + w * way + offset;
++        let mut at = start;
++        while at < start + PAGE {
++            unsafe {
++                core::arch::asm!("cache 1, 0({0})", in(reg) at, options(nostack));
++            }
++            at += line;
++        }
++    }
++}
++
++/// One byte per frame of the first 64 MiB of RAM. Bit 0: the instruction
++/// cache holds nothing stale for the frame; bit 1 below. Frames above that have no
++/// state and are flushed every time.
++const TRACKED_FRAMES: usize = 64 * 1024 * 1024 / PAGE;
++static FRAME_STATE: [AtomicU8; TRACKED_FRAMES] = [const { AtomicU8::new(0) }; TRACKED_FRAMES];
++const ICACHE_CLEAN: u8 = 1;
++/// Bit 1: a kernel page's kseg0 lines were written back after allocation.
++const KSEG0_SETTLED: u8 = 2;
++
++fn frame_state(phys: usize) -> Option<&'static AtomicU8> {
++    let index = phys.checked_sub(super::consts::RAM_PHYS_BASE)? / PAGE;
++    FRAME_STATE.get(index)
++}
++
++/// User pages mapped on another colour than their frame since the last
++/// `before_frames`. Single CPU, and only touched with interrupts off.
++const LIST_LEN: usize = 24;
++static LIST: SyncUnsafeCell<[usize; LIST_LEN]> = SyncUnsafeCell::new([0; LIST_LEN]);
++static LIST_USED: AtomicUsize = AtomicUsize::new(0);
++static LIST_OVERFLOW: AtomicBool = AtomicBool::new(false);
++
++/// Counters for `dmesg`-side inspection through the info line at boot and
++/// for tuning: refills seen, off-colour installs, executable flushes.
++pub static STAT_OFF_COLOUR: AtomicUsize = AtomicUsize::new(0);
++pub static STAT_EXEC_FLUSH: AtomicUsize = AtomicUsize::new(0);
++pub static STAT_ENTRY_PAGES: AtomicUsize = AtomicUsize::new(0);
++pub static STAT_OVERFLOW: AtomicUsize = AtomicUsize::new(0);
++
++/// A TLB entry for `page` -> `pte` is about to be written. Returns the fast
++/// bit to set on the entry when installing it again will need no work here
++/// (rmm::mips::PTE_FAST_*), or 0.
++pub fn installing(page: usize, pte: usize) -> usize {
++    STAT_REFILLS.fetch_add(1, Ordering::Relaxed);
++    let phys = ((pte >> RmmA::ENTRY_ADDRESS_SHIFT) & RmmA::ENTRY_ADDRESS_MASK) << RmmA::PAGE_SHIFT;
++    let writable = pte & RmmA::ENTRY_FLAG_READWRITE != 0;
++    let executable = pte & RmmA::ENTRY_FLAG_NO_EXEC == 0;
++    let user = page < crate::USER_END_OFFSET;
++    let mut data_flushed = false;
++
++    let state = frame_state(phys);
++    if colour(page) != colour(phys) {
++        // A kernel (kseg2) page is only ever used through this mapping once
++        // it is mapped, so its kseg0 lines need writing back once.
++        let settled =
++            !user && state.is_some_and(|s| s.load(Ordering::Relaxed) & KSEG0_SETTLED != 0);
++        if !settled {
++            STAT_OFF_COLOUR.fetch_add(1, Ordering::Relaxed);
++            note_off_colour(page, writable, executable);
++            flush_data_page(phys);
++            data_flushed = true;
++            if let (false, Some(state)) = (user, state) {
++                state.fetch_or(KSEG0_SETTLED, Ordering::Relaxed);
++            }
++        }
++        if user {
++            let used = LIST_USED.load(Ordering::Relaxed);
++            let list = unsafe { &mut *LIST.get() };
++            if !list[..used].contains(&page) {
++                if used < LIST_LEN {
++                    list[used] = page;
++                    LIST_USED.store(used + 1, Ordering::Relaxed);
++                } else {
++                    LIST_OVERFLOW.store(true, Ordering::Relaxed);
++                }
++            }
++        }
++    }
++
++    if user && executable {
++        let clean = state.is_some_and(|s| s.load(Ordering::Relaxed) & ICACHE_CLEAN != 0);
++        if !clean || writable {
++            STAT_EXEC_FLUSH.fetch_add(1, Ordering::Relaxed);
++            if !data_flushed {
++                flush_data_page(phys);
++            }
++            flush_instruction_page(phys);
++        }
++    }
++    if let Some(state) = state {
++        if writable {
++            state.fetch_and(!ICACHE_CLEAN, Ordering::Relaxed);
++        } else if user && executable {
++            state.fetch_or(ICACHE_CLEAN, Ordering::Relaxed);
++        }
++    }
++
++    if pte & rmm::mips::PTE_UNCACHED != 0 {
++        return 0;
++    }
++    let on_colour = colour(page) == colour(phys);
++    if !user {
++        // Kernel pages: on colour, or off colour with kseg0 settled.
++        let settled = state.is_some_and(|s| s.load(Ordering::Relaxed) & KSEG0_SETTLED != 0);
++        return if on_colour || settled { rmm::mips::PTE_FAST_DATA } else { 0 };
++    }
++    if !on_colour || pte & RmmA::ENTRY_FLAG_PAGE_USER == 0 {
++        return 0;
++    }
++    if !executable {
++        rmm::mips::PTE_FAST_DATA
++    } else if !writable && state.is_some() {
++        rmm::mips::PTE_FAST_TEXT
++    } else {
++        0
++    }
++}
++
++/// Colours minus one, for the assembly refill handler.
++pub static COLOUR_MASK: AtomicUsize = AtomicUsize::new(0);
++
++/// Invalidate the instruction cache lines of one page offset under every
++/// colour and way.
++fn flush_instruction_page(phys: usize) {
++    let line = ICACHE_LINE.load(Ordering::Relaxed);
++    let way = ICACHE_WAY.load(Ordering::Relaxed);
++    let _ = phys;
++    for w in 0..WAYS.load(Ordering::Relaxed) {
++        let mut colour_base = BASE + w * way;
++        let end = colour_base + way;
++        while colour_base < end {
++            let mut at = colour_base;
++            while at < colour_base + PAGE {
++                unsafe {
++                    core::arch::asm!("cache 0, 0({0})", in(reg) at, options(nostack));
++                }
++                at += line;
++            }
++            colour_base += PAGE;
++        }
++    }
++}
++
++/// The kernel is about to touch frames on behalf of a trap: bring the
++/// off-colour user pages back to RAM and make their next use a refill.
++pub fn before_frames() {
++    STAT_TRAPS.fetch_add(1, Ordering::Relaxed);
++    if LIST_OVERFLOW.swap(false, Ordering::Relaxed) {
++        STAT_OVERFLOW.fetch_add(1, Ordering::Relaxed);
++        LIST_USED.store(0, Ordering::Relaxed);
++        flush_data();
++        RmmA::invalidate_all();
++        return;
++    }
++    let used = LIST_USED.swap(0, Ordering::Relaxed);
++    if used == 0 {
++        return;
++    }
++    STAT_ENTRY_PAGES.fetch_add(used, Ordering::Relaxed);
++    let list = unsafe { &*LIST.get() };
++    for &page in &list[..used] {
++        flush_data_page(page);
++        RmmA::invalidate(rmm::VirtualAddress::new(page));
++    }
++}
++
++/// Colour wanted for frames allocated right now: the faulting address's,
++/// while the page fault handler runs. `usize::MAX` is no preference.
++static ALLOC_COLOUR: AtomicUsize = AtomicUsize::new(usize::MAX);
++
++pub fn set_alloc_colour(addr: Option<usize>) {
++    ALLOC_COLOUR.store(addr.map_or(usize::MAX, colour), Ordering::Relaxed);
++}
++
++/// Called with every newly allocated single frame. Resets the frame's
++/// state, and swaps the frame for one of the wanted colour when the first
++/// is not. Returns the frame to use.
++pub fn recolour(first: Frame, must_be_zero: bool) -> Frame {
++    let reset = |frame: Frame| {
++        if let Some(state) = frame_state(frame.base().data()) {
++            state.store(0, Ordering::Relaxed);
++        }
++    };
++    let want = ALLOC_COLOUR.load(Ordering::Relaxed);
++    if want == usize::MAX || colour(first.base().data()) == want {
++        reset(first);
++        return first;
++    }
++    // The buddy allocator hands out neighbours, so a few tries reach every
++    // colour. The rejects go back afterwards.
++    STAT_RECOLOUR.fetch_add(1, Ordering::Relaxed);
++    let mut rejects: [Option<Frame>; 6] = [None; 6];
++    let mut chosen = None;
++    for slot in rejects.iter_mut() {
++        let Some(frame) = crate::memory::allocate_p2frame(0, must_be_zero) else {
++            break;
++        };
++        if colour(frame.base().data()) == want {
++            chosen = Some(frame);
++            break;
++        }
++        *slot = Some(frame);
++    }
++    let (keep, spare) = match chosen {
++        Some(frame) => (frame, Some(first)),
++        None => {
++            STAT_RECOLOUR_FAILED.fetch_add(1, Ordering::Relaxed);
++            (first, None)
++        }
++    };
++    for frame in rejects.into_iter().flatten().chain(spare) {
++        unsafe { crate::memory::deallocate_frame(frame) };
++    }
++    reset(keep);
++    keep
 +}
 +
 +/// Write back and invalidate every data cache line.
@@ -564,6 +855,97 @@ index 00000000..cb70e2ca
 +    flush_data();
 +    flush_instructions();
 +}
++
++/// Counters since boot, for `echo cachestat > /scheme/sys/kstop`.
++pub fn log_stats() {
++    log_notes();
++    let mut line = alloc::string::String::new();
++    for code in 0..96 {
++        let count = STAT_BY_CODE[code].swap(0, Ordering::Relaxed);
++        let ticks = STAT_TICKS[code].swap(0, Ordering::Relaxed);
++        if count != 0 || ticks != 0 {
++            use core::fmt::Write;
++            if code < 32 {
++                let _ = write!(line, " code{}:{}x{}k", code, count, ticks / 1000);
++            } else {
++                let number = STAT_SYSCALL[code - 32].load(Ordering::Relaxed);
++                let _ = write!(line, " sys{:#x}:{}x{}k", number, count, ticks / 1000);
++            }
++        }
++    }
++    info!(
++        "Indy: events: {} switches, {} fast refills, {} TLB flushes;{}",
++        STAT_SWITCHES.swap(0, Ordering::Relaxed),
++        STAT_FAST_REFILLS.swap(0, Ordering::Relaxed),
++        rmm::mips::TLB_FLUSHES.swap(0, Ordering::Relaxed),
++        line
++    );
++    info!(
++        "Indy: cache: {} off-colour installs, {} executable flushes, {} pages written back at traps, {} list overflows, {} traps with frames, {} refills, {} recolours tried, {} failed",
++        STAT_OFF_COLOUR.load(Ordering::Relaxed),
++        STAT_EXEC_FLUSH.load(Ordering::Relaxed),
++        STAT_ENTRY_PAGES.load(Ordering::Relaxed),
++        STAT_OVERFLOW.load(Ordering::Relaxed),
++        STAT_TRAPS.load(Ordering::Relaxed),
++        STAT_REFILLS.load(Ordering::Relaxed),
++        STAT_RECOLOUR.load(Ordering::Relaxed),
++        STAT_RECOLOUR_FAILED.load(Ordering::Relaxed),
++    );
++}
++pub static STAT_TRAPS: AtomicUsize = AtomicUsize::new(0);
++pub static STAT_REFILLS: AtomicUsize = AtomicUsize::new(0);
++pub static STAT_RECOLOUR: AtomicUsize = AtomicUsize::new(0);
++pub static STAT_RECOLOUR_FAILED: AtomicUsize = AtomicUsize::new(0);
++
++/// The off-colour pages seen most, for tuning: (page | flags, count).
++const NOTE_LEN: usize = 48;
++static NOTES: SyncUnsafeCell<[(usize, u32); NOTE_LEN]> = SyncUnsafeCell::new([(0, 0); NOTE_LEN]);
++
++fn note_off_colour(page: usize, writable: bool, executable: bool) {
++    let key = page | usize::from(writable) | (usize::from(executable) << 1);
++    let notes = unsafe { &mut *NOTES.get() };
++    let mut weakest = 0;
++    for (i, note) in notes.iter_mut().enumerate() {
++        if note.0 == key {
++            note.1 = note.1.saturating_add(1);
++            return;
++        }
++        if note.1 < unsafe { (*NOTES.get())[weakest].1 } {
++            weakest = i;
++        }
++    }
++    notes[weakest] = (key, 1);
++}
++
++pub fn log_notes() {
++    let notes = unsafe { &*NOTES.get() };
++    let mut sorted = *notes;
++    sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
++    for chunk in sorted.chunks(6) {
++        let mut line = alloc::string::String::new();
++        for (key, count) in chunk {
++            use core::fmt::Write;
++            let _ = write!(line, " {:#x}{}{}x{}", key & !0xfff, if key & 1 != 0 { "w" } else { "" }, if key & 2 != 0 { "x" } else { "" }, count);
++        }
++        info!("Indy: off-colour:{}", line);
++    }
++}
++
++/// Charge kernel time to trap codes and syscall numbers (the `events` line
++/// of the statistics). Costs two Count reads and a few stores per trap, so
++/// it is off unless a kernel is being tuned.
++pub const TRAP_TIMING: bool = false;
++
++/// Event counts for tuning, logged with the cache counters.
++pub static STAT_SWITCHES: AtomicUsize = AtomicUsize::new(0);
++pub static STAT_FAST_REFILLS: AtomicUsize = AtomicUsize::new(0);
++pub static STAT_BY_CODE: [AtomicUsize; 96] = [const { AtomicUsize::new(0) }; 96];
++/// The syscall number behind each of buckets 32..96.
++pub static STAT_SYSCALL: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
++/// CP0 Count ticks spent between a trap's entry and its return, by code.
++/// A trap that blocks counts the time until its context runs again.
++pub static STAT_TICKS: [AtomicUsize; 96] = [const { AtomicUsize::new(0) }; 96];
++pub static STAT_TLB_FLUSHES: AtomicUsize = AtomicUsize::new(0);
 diff --git a/src/arch/mips64/consts.rs b/src/arch/mips64/consts.rs
 new file mode 100644
 index 00000000..947305d1
@@ -1055,10 +1437,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..d8c805ef
+index 00000000..8fa30ffb
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,746 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -1099,8 +1481,14 @@ index 00000000..d8c805ef
 +/// workaround early R4600 revisions need for that operation.
 +pub unsafe fn install_vectors() {
 +    unsafe {
-+        let stub = vector_stub as usize as *const u32;
 +        for vector in [VECTOR_TLB_REFILL, VECTOR_XTLB_REFILL, VECTOR_GENERAL] {
++            // Refills go to the assembly handler, everything else to the
++            // general entry.
++            let stub = if vector == VECTOR_GENERAL {
++                vector_stub as usize
++            } else {
++                refill_stub as usize
++            } as *const u32;
 +            let _ = (vector as *const u32).read_volatile();
 +            core::arch::asm!(
 +                "cache 21, 0({0})", // Hit_Writeback_Inv_D
@@ -1137,6 +1525,184 @@ index 00000000..d8c805ef
 +        .set reorder
 +        ",
 +        entry = sym exception_entry,
++    )
++}
++
++#[unsafe(naked)]
++unsafe extern "C" fn refill_stub() {
++    naked_asm!(
++        "
++        .set noreorder
++        .set noat
++        la      $26, {entry}
++        jr      $26
++        nop
++        .set at
++        .set reorder
++        ",
++        entry = sym refill_entry,
++    )
++}
++
++/// `$1`..`$4` of the interrupted code while `refill_entry` runs. The handler
++/// runs at exception level on one CPU, so one copy is enough.
++static REFILL_SCRATCH: core::cell::SyncUnsafeCell<[u64; 4]> =
++    core::cell::SyncUnsafeCell::new([0; 4]);
++
++/// TLB refill in assembly, for the entries the slow path has marked as
++/// needing no cache work (rmm::mips::PTE_FAST_*). It walks the two-level
++/// table through kseg0, checks both halves of the pair and writes a random
++/// entry. A refill exception means no entry matches, so no probe is needed.
++/// Anything else goes to `exception_entry` with every register as it came.
++///
++/// A half is taken when it is not present (EntryLo 0), or present, cached,
++/// and one of: a kernel address with FAST_DATA; a user page (USER bit) on
++/// its frame's colour with NO_EXEC and FAST_DATA; the same with execute
++/// permission, not writable, and FAST_TEXT.
++#[unsafe(naked)]
++unsafe extern "C" fn refill_entry() {
++    naked_asm!(
++        "
++        .set noreorder
++        .set noat
++        dmtc0   $27, $30                // keep the user's k1 (see exception_entry)
++        la      $26, {scratch}
++        sd      $1, 0($26)
++        sd      $2, 8($26)
++        sd      $3, 16($26)
++        sd      $4, 24($26)
++
++        mfc0    $1, $8                  // BadVAddr
++        la      $27, {table}
++        lw      $27, 0($27)             // directory, physical
++        srl     $2, $1, 22
++        sll     $2, $2, 2
++        addu    $27, $27, $2
++        lui     $3, 0x8000
++        or      $27, $27, $3
++        lw      $27, 0($27)             // directory entry
++        andi    $2, $27, 2
++        beqz    $2, 9f
++        lui     $2, 0x03ff
++        ori     $2, $2, 0xffc0
++        and     $27, $27, $2
++        sll     $27, $27, 6
++        or      $27, $27, $3            // table, kseg0
++        srl     $2, $1, 13
++        andi    $2, $2, 0x1ff
++        sll     $2, $2, 3
++        addu    $27, $27, $2            // the even entry of the pair
++        la      $26, {colour_mask}
++        lw      $26, 0($26)
++
++        // Even half.
++        lw      $2, 0($27)
++        andi    $3, $2, 2
++        beqz    $3, 2f
++        move    $4, $zero               // not present: EntryLo 0
++        lui     $3, 0x2000              // uncached pages take the slow path
++        and     $3, $3, $2
++        bnez    $3, 9f
++        nop
++        bltz    $1, 1f                  // kernel address: FAST_DATA is enough
++        nop
++        bgez    $2, 9f                  // user address without the USER bit
++        srl     $3, $1, 13
++        sll     $3, $3, 1               // page number, even half
++        srl     $4, $2, 6
++        xor     $3, $3, $4
++        and     $3, $3, $26
++        bnez    $3, 9f                  // off colour
++        sll     $3, $2, 1
++        bltz    $3, 1f                  // NO_EXEC: a data page
++        andi    $3, $2, 4
++        bnez    $3, 9f                  // writable and executable
++        lui     $3, 0x0800
++        and     $3, $3, $2
++        beqz    $3, 9f                  // text not marked FAST_TEXT
++        nop
++        b       3f
++        nop
++    1:  lui     $3, 0x0400
++        and     $3, $3, $2
++        beqz    $3, 9f                  // not marked FAST_DATA
++        nop
++    3:  lui     $3, 0x03ff
++        ori     $3, $3, 0xffc6
++        and     $4, $2, $3
++        ori     $4, $4, 0x18            // cacheable, noncoherent
++    2:  mtc0    $4, $2                  // EntryLo0
++
++        // Odd half.
++        lw      $2, 4($27)
++        andi    $3, $2, 2
++        beqz    $3, 2f
++        move    $4, $zero
++        lui     $3, 0x2000
++        and     $3, $3, $2
++        bnez    $3, 9f
++        nop
++        bltz    $1, 1f
++        nop
++        bgez    $2, 9f
++        srl     $3, $1, 13
++        sll     $3, $3, 1
++        ori     $3, $3, 1               // page number, odd half
++        srl     $4, $2, 6
++        xor     $3, $3, $4
++        and     $3, $3, $26
++        bnez    $3, 9f
++        sll     $3, $2, 1
++        bltz    $3, 1f
++        andi    $3, $2, 4
++        bnez    $3, 9f
++        lui     $3, 0x0800
++        and     $3, $3, $2
++        beqz    $3, 9f
++        nop
++        b       3f
++        nop
++    1:  lui     $3, 0x0400
++        and     $3, $3, $2
++        beqz    $3, 9f
++        nop
++    3:  lui     $3, 0x03ff
++        ori     $3, $3, 0xffc6
++        and     $4, $2, $3
++        ori     $4, $4, 0x18
++    2:  mtc0    $4, $3                  // EntryLo1
++        la      $26, {fast_count}
++        lw      $2, 0($26)
++        addiu   $2, $2, 1
++        sw      $2, 0($26)
++        tlbwr
++        nop
++        la      $26, {scratch}
++        ld      $1, 0($26)
++        ld      $2, 8($26)
++        ld      $3, 16($26)
++        ld      $4, 24($26)
++        dmfc0   $27, $30
++        eret
++        nop
++
++        // The slow path, with every register restored.
++    9:  la      $26, {scratch}
++        ld      $1, 0($26)
++        ld      $2, 8($26)
++        ld      $3, 16($26)
++        ld      $4, 24($26)
++        la      $26, {slow}
++        jr      $26
++        dmfc0   $27, $30
++        .set at
++        .set reorder
++        ",
++        scratch = sym REFILL_SCRATCH,
++        table = sym rmm::mips::CURRENT_TABLE,
++        colour_mask = sym crate::arch::cache::COLOUR_MASK,
++        fast_count = sym crate::arch::cache::STAT_FAST_REFILLS,
++        slow = sym exception_entry,
 +    )
 +}
 +
@@ -1235,9 +1801,10 @@ index 00000000..d8c805ef
 +        let cause_reg = regs.iret.cause as u32;
 +        let exc_code = (cause_reg & cause::EXC_CODE_MASK) >> cause::EXC_CODE_SHIFT;
 +        let user_mode = regs.iret.status as u32 & cp0::status::KSU_MASK != 0;
++        let _timing = TrapTiming::start(exc_code as usize, user_mode);
 +
-+        // See arch::cache: frames are about to be touched on behalf of user
-+        // code, except by a refill served from the page table.
++        // See arch::cache: frames are about to be touched, except by a refill
++        // served from the page table.
 +        let is_tlb = matches!(exc_code, cause::EXC_MOD | cause::EXC_TLBL | cause::EXC_TLBS);
 +        if is_tlb {
 +            match tlb_fault(regs, exc_code, user_mode) {
@@ -1247,18 +1814,12 @@ index 00000000..d8c805ef
 +                TlbOutcome::Failed => handle_system_exception(regs, exc_code),
 +            }
 +        } else {
-+            if user_mode {
-+                crate::arch::cache::flush_data();
-+            }
++            crate::arch::cache::before_frames();
 +            match exc_code {
 +                cause::EXC_INT => handle_interrupt(regs, cause_reg),
 +                _ if user_mode => handle_user_exception(regs, exc_code),
 +                _ => handle_system_exception(regs, exc_code),
 +            }
-+        }
-+        // The frame's own Status decides: a syscall may have replaced it.
-+        if regs.iret.status as u32 & cp0::status::KSU_MASK != 0 {
-+            crate::arch::cache::flush_for_user();
 +        }
 +    }
 +}
@@ -1310,6 +1871,59 @@ index 00000000..d8c805ef
 +    }
 +}
 +
++/// Kernel time by trap code, in CP0 Count ticks, for tuning. Time is
++/// charged from a stamp: set at trap entry and when a context is switched
++/// in, charged at trap exit and at switch-out. Bucket 31 is time after a
++/// switch-in, when the code of the resumed trap is not known here.
++pub static TIMING_STAMP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++pub static TIMING_CODE: core::sync::atomic::AtomicUsize =
++    core::sync::atomic::AtomicUsize::new(31);
++
++pub fn timing_charge() {
++    use core::sync::atomic::Ordering;
++    if !crate::arch::cache::TRAP_TIMING {
++        return;
++    }
++    let now = cp0::read_count();
++    let ticks = now.wrapping_sub(TIMING_STAMP.swap(now, Ordering::Relaxed)) as usize;
++    let code = TIMING_CODE.load(Ordering::Relaxed) % 96;
++    crate::arch::cache::STAT_TICKS[code].fetch_add(ticks, Ordering::Relaxed);
++}
++
++struct TrapTiming {
++    outer: usize,
++}
++
++impl TrapTiming {
++    fn start(code: usize, from_user: bool) -> Self {
++        use core::sync::atomic::Ordering;
++        if !crate::arch::cache::TRAP_TIMING {
++            return TrapTiming { outer: 0 };
++        }
++        if from_user {
++            TIMING_STAMP.store(cp0::read_count(), Ordering::Relaxed);
++        } else {
++            // A trap taken in kernel mode interrupts another trap's time.
++            timing_charge();
++        }
++        crate::arch::cache::STAT_BY_CODE[code & 31].fetch_add(1, Ordering::Relaxed);
++        TrapTiming {
++            outer: TIMING_CODE.swap(code, Ordering::Relaxed),
++        }
++    }
++}
++
++impl Drop for TrapTiming {
++    fn drop(&mut self) {
++        use core::sync::atomic::Ordering;
++        if !crate::arch::cache::TRAP_TIMING {
++            return;
++        }
++        timing_charge();
++        TIMING_CODE.store(self.outer, Ordering::Relaxed);
++    }
++}
++
 +enum TlbOutcome {
 +    /// The pair was in the page table; only the TLB was written.
 +    Refilled,
@@ -1325,6 +1939,10 @@ index 00000000..d8c805ef
 +        unsafe { super::irq::handle(pending, &mut token) };
 +    }
 +    if pending & cause::IP7 != 0 {
++        crate::arch::time::profile_sample(
++            regs.iret.epc as usize,
++            regs.iret.status as u32 & cp0::status::KSU_MASK != 0,
++        );
 +        crate::arch::time::tick();
 +        // The console's receive side is polled from the tick: the serial
 +        // interrupt arrives through INT3's mappable lines, not routed yet.
@@ -1361,9 +1979,21 @@ index 00000000..d8c805ef
 +        { regs.iret.badvaddr }
 +    );
 +    regs.dump();
-+    loop {
-+        unsafe { super::halt() }
++    // Leave the report on the screen for about a minute, then restart
++    // through the PROM: a machine nobody is sitting at comes back by itself
++    // with whatever image the boot server holds by then.
++    println!("Indy: restarting through the PROM in about a minute");
++    let start = crate::arch::cp0::read_count();
++    let per_second = crate::arch::time::count_hz() as u32;
++    for _ in 0..60 {
++        while crate::arch::cp0::read_count().wrapping_sub(start) % per_second
++            < per_second / 2
++        {}
++        while crate::arch::cp0::read_count().wrapping_sub(start) % per_second
++            >= per_second / 2
++        {}
 +    }
++    unsafe { crate::arch::stop::emergency_reset() }
 +}
 +
 +unsafe fn handle_user_exception(regs: &mut InterruptStack, exc_code: u32) {
@@ -1374,6 +2004,17 @@ index 00000000..d8c805ef
 +            let r = &mut regs.registers;
 +            // Skip the syscall instruction. LLVM never places it in a branch delay slot.
 +            regs.iret.epc += 4;
++            // Kernel time per syscall number (buckets 32..96 of the stats).
++            let number = r.v0 as usize;
++            let bucket = 32 + ((number ^ (number >> 8) ^ (number >> 16) ^ (number >> 24)) & 63);
++            if crate::arch::cache::TRAP_TIMING {
++                timing_charge();
++                TIMING_CODE.store(bucket, core::sync::atomic::Ordering::Relaxed);
++                crate::arch::cache::STAT_SYSCALL[bucket - 32]
++                    .store(number, core::sync::atomic::Ordering::Relaxed);
++                crate::arch::cache::STAT_BY_CODE[bucket]
++                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++            }
 +            let ret = syscall::syscall(
 +                r.v0 as usize,
 +                r.a0 as usize,
@@ -1385,6 +2026,10 @@ index 00000000..d8c805ef
 +                &mut token,
 +            );
 +            r.v0 = super::handler::sign_extend(ret);
++            if crate::arch::cache::TRAP_TIMING {
++                timing_charge();
++                TIMING_CODE.store(8, core::sync::atomic::Ordering::Relaxed);
++            }
 +            return;
 +        }
 +
@@ -1481,8 +2126,24 @@ index 00000000..d8c805ef
 +            let table = RmmA::phys_to_virt(rmm::PhysicalAddress::new(table_phys)).data()
 +                as *const usize;
 +            let even = (page >> 12) & 0x3fe;
-+            let lo0 = pte_to_entry_lo(table.add(even).read_volatile(), user_mode);
-+            let lo1 = pte_to_entry_lo(table.add(even + 1).read_volatile(), user_mode);
++            let pte0 = table.add(even).read_volatile();
++            let pte1 = table.add(even + 1).read_volatile();
++            let lo0 = pte_to_entry_lo(pte0, user_mode);
++            let lo1 = pte_to_entry_lo(pte1, user_mode);
++            // Both halves become usable: bring each one's caches in order.
++            let pair = page & !0x1fff;
++            if lo0 != 0 {
++                let fast = crate::arch::cache::installing(pair, pte0);
++                if fast != 0 && pte0 & fast == 0 {
++                    (table.add(even) as *mut usize).write_volatile(pte0 | fast);
++                }
++            }
++            if lo1 != 0 {
++                let fast = crate::arch::cache::installing(pair + 0x1000, pte1);
++                if fast != 0 && pte1 & fast == 0 {
++                    (table.add(even + 1) as *mut usize).write_volatile(pte1 | fast);
++                }
++            }
 +            rmm::mips::write_random(page, lo0, lo1);
 +            return TlbOutcome::Refilled;
 +        }
@@ -1497,15 +2158,13 @@ index 00000000..d8c805ef
 +            regs.iret.epc as usize & !3 == badvaddr & !3,
 +        );
 +
-+        crate::arch::cache::flush_data();
++        // The handler reads and fills frames through kseg0; a frame it
++        // allocates should have the colour of the faulting page.
++        crate::arch::cache::before_frames();
++        crate::arch::cache::set_alloc_colour(Some(badvaddr));
 +        let ok =
 +            crate::memory::page_fault_handler(regs, flags, VirtualAddress::new(badvaddr)).is_ok();
-+        // The handler filled the frame through kseg0. If this fault came from
-+        // the kernel copying to user memory, the copy continues through the
-+        // user address, which can be another colour: two dirty lines for one
-+        // piece of RAM, and the write-back order would pick the winner. Put
-+        // the kseg0 lines in RAM now.
-+        crate::arch::cache::flush_data();
++        crate::arch::cache::set_alloc_colour(None);
 +        if ok {
 +            // The handler changed the table; drop any stale TLB entry so the
 +            // retried access refills from the table.
@@ -2748,10 +3407,10 @@ index 00000000..49d7eee0
 +}
 diff --git a/src/arch/mips64/time.rs b/src/arch/mips64/time.rs
 new file mode 100644
-index 00000000..c5dfe2b9
+index 00000000..0bbbbb0a
 --- /dev/null
 +++ b/src/arch/mips64/time.rs
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,160 @@
 +//! Monotonic time from CP0 Count.
 +//!
 +//! Count runs at half the pipeline clock. The PROM measures the CPU clock
@@ -2773,7 +3432,7 @@ index 00000000..c5dfe2b9
 +static COUNT_HZ: AtomicU64 = AtomicU64::new(DEFAULT_COUNT_HZ);
 +static COUNTS_PER_TICK: AtomicU32 = AtomicU32::new((DEFAULT_COUNT_HZ / TICKS_PER_SECOND) as u32);
 +
-+fn count_hz() -> u64 {
++pub fn count_hz() -> u64 {
 +    COUNT_HZ.load(Ordering::Relaxed)
 +}
 +
@@ -2799,8 +3458,31 @@ index 00000000..c5dfe2b9
 +static COUNT_HIGH: AtomicU64 = AtomicU64::new(0);
 +static LAST_COUNT: AtomicU64 = AtomicU64::new(0);
 +
++/// Boot deadman, for testing kernels on a machine nobody is sitting at: if
++/// nothing writes `disarm` to `/scheme/sys/kstop` within this many seconds
++/// of boot, the kernel reboots through the PROM, which loads whatever image
++/// the boot server holds by then. The bring-up shell disarms it once its
++/// TCP port is open. Zero turns the deadman off.
++const DEADMAN_SECONDS: u64 = 300;
++static DEADMAN_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
++static TICKS: AtomicU64 = AtomicU64::new(0);
++
++pub fn disarm_deadman() {
++    if DEADMAN_ARMED.swap(false, Ordering::Relaxed) {
++        info!("Indy: boot deadman disarmed");
++    }
++}
++
 +/// Called from the timer interrupt: track Count wrap-around and arm the next tick.
 +pub fn tick() {
++    let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
++    if DEADMAN_SECONDS != 0
++        && ticks == DEADMAN_SECONDS * TICKS_PER_SECOND
++        && DEADMAN_ARMED.load(Ordering::Relaxed)
++    {
++        println!("Indy: boot deadman: no disarm in {} s, rebooting", DEADMAN_SECONDS);
++        unsafe { crate::arch::stop::emergency_reset() }
++    }
 +    let now = cp0::read_count() as u64;
 +    let last = LAST_COUNT.load(Ordering::Relaxed);
 +    if now < last {
@@ -2841,6 +3523,54 @@ index 00000000..c5dfe2b9
 +pub fn monotonic_resolution() -> u128 {
 +    1_000_000_000u128 / count_hz() as u128
 +}
++
++/// A sampling profile of the timer interrupt: where the interrupted code
++/// was. Kernel text in 256-byte buckets from the image base, one counter
++/// for user mode. `echo profile > /scheme/sys/kstop` logs the busiest
++/// buckets and clears the counts.
++const PROFILE_BUCKETS: usize = 8192;
++static PROFILE: [core::sync::atomic::AtomicU16; PROFILE_BUCKETS] =
++    [const { core::sync::atomic::AtomicU16::new(0) }; PROFILE_BUCKETS];
++static PROFILE_USER: AtomicU32 = AtomicU32::new(0);
++static PROFILE_OTHER: AtomicU32 = AtomicU32::new(0);
++const PROFILE_BASE: usize = 0x8804_0000;
++
++pub fn profile_sample(epc: usize, user: bool) {
++    if user {
++        PROFILE_USER.fetch_add(1, Ordering::Relaxed);
++    } else if let Some(bucket) = epc.checked_sub(PROFILE_BASE).and_then(|o| PROFILE.get(o >> 8)) {
++        bucket.fetch_add(1, Ordering::Relaxed);
++    } else {
++        PROFILE_OTHER.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++pub fn profile_log() {
++    let mut top = [(0u16, 0usize); 24];
++    let mut total = 0u32;
++    for (i, bucket) in PROFILE.iter().enumerate() {
++        let count = bucket.swap(0, Ordering::Relaxed);
++        total += count as u32;
++        if count > top[23].0 {
++            top[23] = (count, i);
++            top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
++        }
++    }
++    info!(
++        "Indy: profile: {} kernel, {} user, {} other samples",
++        total,
++        PROFILE_USER.swap(0, Ordering::Relaxed),
++        PROFILE_OTHER.swap(0, Ordering::Relaxed)
++    );
++    for chunk in top.chunks(6) {
++        let mut line = alloc::string::String::new();
++        for (count, bucket) in chunk {
++            use core::fmt::Write;
++            let _ = write!(line, " {:#x}:{}", PROFILE_BASE + (bucket << 8), count);
++        }
++        info!("Indy: profile:{}", line);
++    }
++}
 diff --git a/src/arch/mod.rs b/src/arch/mod.rs
 index 2aae6399..e5791c1e 100644
 --- a/src/arch/mod.rs
@@ -2857,10 +3587,10 @@ index 2aae6399..e5791c1e 100644
 +pub use self::mips64::*;
 diff --git a/src/context/arch/mips64.rs b/src/context/arch/mips64.rs
 new file mode 100644
-index 00000000..b8b3d4e8
+index 00000000..2d12d483
 --- /dev/null
 +++ b/src/context/arch/mips64.rs
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,226 @@
 +use crate::{
 +    arch::interrupt::InterruptStack, context::context::Kstack, memory::RmmA, percpu::PercpuBlock,
 +    syscall::FloatRegisters,
@@ -3016,7 +3746,16 @@ index 00000000..b8b3d4e8
 +            .new_addrsp_tmp
 +            .set(next.addr_space.clone());
 +
++        crate::arch::cache::STAT_SWITCHES
++            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++        crate::arch::interrupt::exception::timing_charge();
 +        switch_to_inner(&mut prev.arch, &mut next.arch);
++        // This context runs again: its time is not known by trap code.
++        if crate::arch::cache::TRAP_TIMING {
++            crate::arch::interrupt::exception::timing_charge();
++            crate::arch::interrupt::exception::TIMING_CODE
++                .store(31, core::sync::atomic::Ordering::Relaxed);
++        }
 +    }
 +}
 +
@@ -3078,6 +3817,84 @@ index 00000000..b8b3d4e8
 +        switch_hook = sym crate::context::switch_finish_hook,
 +    );
 +}
+diff --git a/src/context/memory.rs b/src/context/memory.rs
+index 74ef9e74..703646f1 100644
+--- a/src/context/memory.rs
++++ b/src/context/memory.rs
+@@ -389,7 +389,11 @@ impl AddrSpaceWrapper {
+             }
+             _ => {
+                 dst.grants
+-                    .find_free(dst.mmap_min, cmp::max(new_page_count, src_span.count))
++                    .find_free_near(
++                        dst.mmap_min,
++                        cmp::max(new_page_count, src_span.count),
++                        Some(src_span.base),
++                    )
+                     .ok_or(Error::new(ENOMEM))?
+                     .base
+             }
+@@ -1029,6 +1033,30 @@ impl UserGrants {
+                 usable_start + req_size <= hole_end
+             })?;
+         // Create new region
++        #[cfg(target_arch = "mips64")]
++        if let Some(near) = _near {
++            // Virtually indexed caches: put the region on the cache colour of
++            // `near`, the address these pages are known by elsewhere, when a
++            // hole has room for the shift (arch::cache).
++            let colours = crate::arch::cache::colours();
++            let want = crate::arch::cache::colour(near.start_address().data());
++            let slack = (colours - 1) * PAGE_SIZE;
++            let found = self
++                .holes_by_size
++                .range((req_size + slack, VirtualAddress::new(0))..)
++                .find(|&&(hole_size, hole_offset)| {
++                    let usable_start = cmp::max(hole_offset.data(), min);
++                    usable_start + req_size + slack <= hole_offset.data() + hole_size
++                });
++            if let Some(&(_, hole_offset)) = found {
++                let start = cmp::max(hole_offset.data(), min);
++                let shift = (want + colours - crate::arch::cache::colour(start)) % colours;
++                return Some(PageSpan::new(
++                    Page::containing_address(VirtualAddress::new(start + shift * PAGE_SIZE)),
++                    page_count,
++                ));
++            }
++        }
+         Some(PageSpan::new(
+             Page::containing_address(VirtualAddress::new(cmp::max(hole_start.data(), min))),
+             page_count,
+@@ -1810,8 +1838,14 @@ impl Grant {
+                     } else {
+                         // TODO: Omit the unnecessary subsequent add_ref call.
+                         let must_be_zero = true;
++                        #[cfg(target_arch = "mips64")]
++                        crate::arch::cache::set_alloc_colour(Some(
++                            src_page.start_address().data(),
++                        ));
+                         let new_frame =
+                             init_frame(RefCount::One, must_be_zero).expect("TODO: handle OOM");
++                        #[cfg(target_arch = "mips64")]
++                        crate::arch::cache::set_alloc_colour(None);
+                         let src_flush = unsafe {
+                             src_mapper
+                                 .map_phys(src_page.start_address(), new_frame.base(), flags, 0)
+@@ -2527,7 +2561,13 @@ fn map_zeroed(
+     _writable: bool,
+ ) -> Result<Frame, PfError> {
+     let must_be_zero = true;
+-    let new_frame = init_frame(RefCount::One, must_be_zero)?;
++    // Virtually indexed caches: ask for a frame on the page's colour.
++    #[cfg(target_arch = "mips64")]
++    crate::arch::cache::set_alloc_colour(Some(page.start_address().data()));
++    let new_frame = init_frame(RefCount::One, must_be_zero);
++    #[cfg(target_arch = "mips64")]
++    crate::arch::cache::set_alloc_colour(None);
++    let new_frame = new_frame?;
+ 
+     unsafe {
+         mapper
 diff --git a/src/context/mod.rs b/src/context/mod.rs
 index 161eefb3..3e1ec214 100644
 --- a/src/context/mod.rs
@@ -3286,6 +4103,24 @@ index a29621fa..3f05f23d 100644
  #![cfg_attr(dtb, feature(iter_next_chunk))]
  #![feature(sync_unsafe_cell)]
  #![feature(btree_cursors)]
+diff --git a/src/memory/mod.rs b/src/memory/mod.rs
+index eddfa494..3a5ca425 100644
+--- a/src/memory/mod.rs
++++ b/src/memory/mod.rs
+@@ -142,7 +142,12 @@ pub fn allocate_p2frame(order: u32, must_be_zero: bool) -> Option<Frame> {
+     None
+ }
+ pub fn allocate_frame(must_be_zero: bool) -> Option<Frame> {
+-    allocate_p2frame(0, must_be_zero)
++    let frame = allocate_p2frame(0, must_be_zero)?;
++    // Virtually indexed caches: prefer a frame on the colour of the address
++    // it is being allocated for (arch::cache).
++    #[cfg(target_arch = "mips64")]
++    let frame = crate::arch::cache::recolour(frame, must_be_zero);
++    Some(frame)
+ }
+ 
+ // TODO: Flags, strategy
 diff --git a/src/panic.rs b/src/panic.rs
 index ded62e62..45143468 100644
 --- a/src/panic.rs
@@ -3326,7 +4161,7 @@ index 10abe0b8..984843bd 100644
      cpu_set::LogicalCpuId,
      event,
 diff --git a/src/scheme/proc.rs b/src/scheme/proc.rs
-index 4d974bf4..6a52fa3a 100644
+index 4d974bf4..03da6c24 100644
 --- a/src/scheme/proc.rs
 +++ b/src/scheme/proc.rs
 @@ -457,7 +457,8 @@ impl KernelScheme for ProcScheme {
@@ -3339,6 +4174,65 @@ index 4d974bf4..6a52fa3a 100644
                      ))]
                      regs.set_arg1(arg1);
  
+@@ -547,9 +548,12 @@ impl KernelScheme for ProcScheme {
+                     // SAFETY: We've compared  Arc::ptr_eq(addrspace, dst_addr_space) before
+                     let mut dst_addrsp_guard =
+                         unsafe { dst_addr_space.acquire_rewrite(lock_token) };
++                    // With no address asked for, offer the source's as a hint:
++                    // on mips64 the pages then land on the source's cache
++                    // colour (Grants::find_free_near).
+                     dst_addrsp_guard.mmap(
+                         dst_addr_space,
+-                        requested_dst_base,
++                        requested_dst_base.or(Some(src_span.base)),
+                         src_page_count,
+                         map.flags,
+                         Some(&mut notify_files),
+diff --git a/src/scheme/sys/mod.rs b/src/scheme/sys/mod.rs
+index f4c0dba6..8b4e4f19 100644
+--- a/src/scheme/sys/mod.rs
++++ b/src/scheme/sys/mod.rs
+@@ -103,6 +103,23 @@ const FILES: &[(&str, Kind)] = &[
+             match arg.trim_ascii() {
+                 b"shutdown" => crate::stop::kstop(token),
+                 b"reset" => crate::stop::kreset(),
++                // The Indy's boot deadman (arch::time): a remote test image
++                // reboots by itself unless this arrives in time.
++                #[cfg(target_arch = "mips64")]
++                b"profile" => {
++                    crate::arch::time::profile_log();
++                    Ok(0)
++                }
++                #[cfg(target_arch = "mips64")]
++                b"cachestat" => {
++                    crate::arch::cache::log_stats();
++                    Ok(0)
++                }
++                #[cfg(target_arch = "mips64")]
++                b"disarm" => {
++                    crate::arch::time::disarm_deadman();
++                    Ok(0)
++                }
+                 b"emergency_reset" => crate::stop::emergency_reset(),
+                 _ => Err(Error::new(EINVAL)),
+             }
+diff --git a/src/scheme/user.rs b/src/scheme/user.rs
+index d91ae0ab..6ca05079 100644
+--- a/src/scheme/user.rs
++++ b/src/scheme/user.rs
+@@ -597,9 +597,11 @@ impl UserInner {
+         let mut dst_space_guard = dst_space_lock.acquire_write(token.downgrade());
+         let (dst_space, _token_split) = dst_space_guard.token_split();
+ 
++        // The pages are laid out as in the source, so starting on the source's
++        // cache colour keeps every borrowed page on its own colour (mips64).
+         let free_span = dst_space
+             .grants
+-            .find_free(dst_space.mmap_min, page_count)
++            .find_free_near(dst_space.mmap_min, page_count, Some(src_page))
+             .ok_or(Error::new(ENOMEM))?;
+ 
+         let head = if let Some(array) = head_buf_opt {
 diff --git a/src/startup/mod.rs b/src/startup/mod.rs
 index b599f546..e8bfd177 100644
 --- a/src/startup/mod.rs

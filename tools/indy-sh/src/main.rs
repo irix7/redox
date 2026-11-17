@@ -105,6 +105,41 @@ fn run(line: &str, out: &mut dyn Write) -> bool {
         }
         "bench" => bench(out),
         "polltest" => polltest(out),
+        "profile" => {
+            let _ = fs::write("/scheme/sys/kstop", "profile");
+            let log = fs::read("/scheme/sys/log").unwrap_or_default();
+            let text = String::from_utf8_lossy(&log);
+            let lines: Vec<&str> = text.lines().collect();
+            let start = lines.iter().rposition(|l| l.contains("profile: ") && l.contains("samples")).unwrap_or(0);
+            for line in &lines[start..] {
+                if line.contains("Indy: profile") {
+                    let _ = writeln!(out, "{line}\r");
+                }
+            }
+        }
+        "ipcbench" => {
+            use std::os::unix::fs::FileExt;
+            if let Ok(file) = fs::File::open("/scheme/initfs/lib/init.d/00_randd.service") {
+                let mut byte = [0u8; 1];
+                let start = std::time::Instant::now();
+                for _ in 0..4000 {
+                    let _ = file.read_at(&mut byte, 0);
+                }
+                let _ = writeln!(out, "4000 reads through the initfs server: {} ms\r", start.elapsed().as_millis());
+            }
+        }
+        "cachestat" => {
+            let _ = fs::write("/scheme/sys/kstop", "cachestat");
+            let log = fs::read("/scheme/sys/log").unwrap_or_default();
+            let text = String::from_utf8_lossy(&log);
+            let lines: Vec<&str> = text.lines().collect();
+            let start = lines.iter().rposition(|l| l.contains("Indy: cache:")).unwrap_or(0);
+            for line in &lines[start.saturating_sub(9)..=start.min(lines.len().saturating_sub(1))] {
+                if line.contains("Indy: ") {
+                    let _ = writeln!(out, "{line}\r");
+                }
+            }
+        }
         "sigtest" => sigtest(out),
         "reboot" => {
             let _ = writeln!(out, "rebooting to the PROM\r");
@@ -217,6 +252,8 @@ fn tcp_server() {
         }
     };
     println!("REDOX-INDY-SH: listening on tcp port {TCP_PORT}\r");
+    // The kernel reboots a test image that never gets this far.
+    let _ = fs::write("/scheme/sys/kstop", "disarm");
     for stream in listener.incoming().flatten() {
         thread::spawn(move || serve(stream));
     }
@@ -328,6 +365,28 @@ fn bench(out: &mut dyn Write) {
         sum += pages[page * 4096] as u32;
     }
     let faults = start.elapsed().as_millis();
+
+    let start = Instant::now();
+    let mut flags = 0;
+    for _ in 0..20_000 {
+        flags ^= unsafe { fcntl(0, 3, 0) };
+    }
+    let fcntls = start.elapsed().as_millis();
+    let _ = writeln!(out, "bench: 20000 fcntl calls {fcntls} ms ({flags:#x})\r");
+
+    // One read of an open file: a kernel scheme (no context switch), a
+    // scheme served by the bootstrap process, and the network filesystem.
+    for path in ["/scheme/sys/uname", "/scheme/initfs/lib/init.d/00_randd.service", "/usr/lib/init.d/40_sh.service"] {
+        use std::os::unix::fs::FileExt;
+        let Ok(file) = fs::File::open(path) else { continue };
+        let mut byte = [0u8; 1];
+        let start = Instant::now();
+        let mut got = 0;
+        for _ in 0..2000 {
+            got += file.read_at(&mut byte, 0).unwrap_or(0);
+        }
+        let _ = writeln!(out, "bench: 2000 one-byte reads of {path}: {} ms ({got})\r", start.elapsed().as_millis());
+    }
 
     let _ = writeln!(
         out,

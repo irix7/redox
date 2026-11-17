@@ -3,7 +3,7 @@
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpStream};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::dns;
 use crate::tls::TlsStream;
@@ -13,6 +13,8 @@ use crate::trust::TrustStore;
 
 const ATTEMPTS: u32 = 3;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// A kept connection is reused only this soon after its last exchange.
+const IDLE_REUSE: Duration = Duration::from_secs(2);
 /// Longest response header accepted.
 const MAX_HEAD: usize = 16 * 1024;
 
@@ -238,6 +240,8 @@ pub struct Client {
     /// Connect to this address instead of looking the host up.
     address: Option<IpAddr>,
     conn: Option<Conn>,
+    /// When the connection last finished an exchange.
+    last_used: Instant,
     pub stats: Stats,
 }
 
@@ -248,6 +252,7 @@ impl Client {
             trust,
             address,
             conn: None,
+            last_used: Instant::now(),
             stats: Stats::default(),
         }
     }
@@ -275,9 +280,13 @@ impl Client {
     }
 
     fn attempt(&mut self, path: &str, limit: usize) -> io::Result<Response> {
+        // A connection that sat idle is not trusted: a NAT or a server may
+        // have dropped it without telling us, and the request would wait for
+        // the whole I/O timeout before the retry. A new connection costs one
+        // round trip.
         let mut conn = match self.conn.take() {
-            Some(conn) => conn,
-            None => self.connect()?,
+            Some(conn) if self.last_used.elapsed() < IDLE_REUSE => conn,
+            _ => self.connect()?,
         };
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: webfs/0.1\r\nAccept-Encoding: identity\r\n\r\n",
@@ -287,6 +296,7 @@ impl Client {
         let (response, keep) = read_response(&mut conn, limit)?;
         if keep {
             self.conn = Some(conn);
+            self.last_used = Instant::now();
         }
         self.stats.requests += 1;
         self.stats.body_bytes += response.body.len() as u64;
