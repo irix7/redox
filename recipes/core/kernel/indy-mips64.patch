@@ -1,4 +1,4 @@
-From 9b4d733031d45eaf30413190ad4400feceb45f0c Mon Sep 17 00:00:00 2001
+From 991a4b51aa02bb27feda1ed5c22646f37aeb805d Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -38,7 +38,7 @@ Signed-off-by: belikh <io@jupiter.au>
  src/arch/mips64/device/cpu/mod.rs      |  11 +
  src/arch/mips64/device/mod.rs          |  22 ++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 298 +++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 333 +++++++++++++++++++++
  src/arch/mips64/interrupt/handler.rs   | 384 +++++++++++++++++++++++++
  src/arch/mips64/interrupt/irq.rs       |  19 ++
  src/arch/mips64/interrupt/mod.rs       |  47 +++
@@ -64,9 +64,10 @@ Signed-off-by: belikh <io@jupiter.au>
  src/scheme/proc.rs                     |   3 +-
  src/startup/mod.rs                     |  20 +-
  syscall/src/arch/mips64.rs             | 232 +++++++++++++++
+ syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 39 files changed, 2423 insertions(+), 13 deletions(-)
+ 40 files changed, 2464 insertions(+), 13 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/consts.rs
@@ -661,10 +662,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..b2c2f76e
+index 00000000..31390e7f
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,333 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -876,6 +877,25 @@ index 00000000..b2c2f76e
 +            return;
 +        }
 +
++        // `rdhwr rt, $29` reads the user-local register, which the R4400 lacks:
++        // LLVM uses it for every thread-local access, so emulate it with the
++        // thread pointer ($gp). The instruction is SPECIAL3 (0x1f), function
++        // RDHWR (0x3b), rd = 29.
++        if exc_code == cause::EXC_RI
++            && let Some(insn) = read_user_insn(regs.iret.epc as usize)
++            && insn & 0xffe0_ffff == 0x7c00_e83b
++        {
++            let rt = ((insn >> 16) & 0x1f) as usize;
++            let tp = regs.registers.gp;
++            if rt != 0 && rt != 26 && rt != 27 {
++                unsafe {
++                    (&raw mut regs.registers as *mut u64).add(rt - 1).write(tp);
++                }
++            }
++            regs.iret.epc += 4;
++            return;
++        }
++
 +        info!(
 +            "User exception {} at {:#x}, BadVAddr {:#x}",
 +            exc_code,
@@ -889,6 +909,22 @@ index 00000000..b2c2f76e
 +            address: regs.iret.badvaddr as usize,
 +        });
 +    }
++}
++
++/// Fetch the user instruction at `epc` through the user copy path, so a bad
++/// address faults safely instead of taking the kernel down.
++fn read_user_insn(epc: usize) -> Option<u32> {
++    if epc & 3 != 0 || epc >= crate::arch::consts::USER_END_OFFSET {
++        return None;
++    }
++    let mut word = [0u8; 4];
++    let failed = unsafe {
++        crate::arch::arch_copy_from_user(word.as_mut_ptr() as usize, epc, 4)
++    };
++    if failed != 0 {
++        return None;
++    }
++    Some(u32::from_be_bytes(word))
 +}
 +
 +/// Serve a TLB exception from the page table; fall back to the generic page
@@ -1682,7 +1718,7 @@ index 00000000..62d40404
 +}
 diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
 new file mode 100644
-index 00000000..43561f6c
+index 00000000..b7ea7466
 --- /dev/null
 +++ b/src/arch/mips64/start.rs
 @@ -0,0 +1,275 @@
@@ -1725,7 +1761,7 @@ index 00000000..43561f6c
 +}
 +
 +/// The environment handed to userspace through `sys:env`.
-+static ENV: &[u8] = b"BOOTSTRAP_LOG_LEVEL=trace\n";
++static ENV: &[u8] = b"BOOTSTRAP_LOG_LEVEL=info\n";
 +
 +static AREAS: SyncUnsafeCell<[AreaEntry; 2]> = SyncUnsafeCell::new([
 +    AreaEntry {
@@ -1955,7 +1991,7 @@ index 00000000..43561f6c
 +
 +        crate::startup::kmain(
 +            bootstrap,
-+            Kstack::new(None).expect("failed to allocate stack"),
++            Kstack::new().expect("failed to allocate stack"),
 +        );
 +    }
 +}
@@ -2301,7 +2337,7 @@ index 00000000..11c452ed
 +    );
 +}
 diff --git a/src/context/mod.rs b/src/context/mod.rs
-index 13fe2c9c..3fdee977 100644
+index 161eefb3..3e1ec214 100644
 --- a/src/context/mod.rs
 +++ b/src/context/mod.rs
 @@ -47,6 +47,10 @@ mod arch;
@@ -2514,7 +2550,7 @@ index ded62e62..45143468 100644
              kernel_ptr,
              size_of::<FileHeader<NativeEndian>>(),
 diff --git a/src/scheme/irq.rs b/src/scheme/irq.rs
-index daedb374..94fcfbe3 100644
+index 10abe0b8..984843bd 100644
 --- a/src/scheme/irq.rs
 +++ b/src/scheme/irq.rs
 @@ -24,6 +24,8 @@ use super::{CallerCtx, HandleMap, OpenResult, SchemeExt, StrOrBytes};
@@ -2527,7 +2563,7 @@ index daedb374..94fcfbe3 100644
      cpu_set::LogicalCpuId,
      event,
 diff --git a/src/scheme/proc.rs b/src/scheme/proc.rs
-index cba8ebf5..21db148f 100644
+index 4d974bf4..6a52fa3a 100644
 --- a/src/scheme/proc.rs
 +++ b/src/scheme/proc.rs
 @@ -457,7 +457,8 @@ impl KernelScheme for ProcScheme {
@@ -2541,7 +2577,7 @@ index cba8ebf5..21db148f 100644
                      regs.set_arg1(arg1);
  
 diff --git a/src/startup/mod.rs b/src/startup/mod.rs
-index 2cbdd332..8c61c5cf 100644
+index b599f546..e8bfd177 100644
 --- a/src/startup/mod.rs
 +++ b/src/startup/mod.rs
 @@ -19,14 +19,14 @@ pub mod memory;
@@ -2821,6 +2857,24 @@ index 00000000..052b03cb
 +        }
 +    }
 +}
+diff --git a/syscall/src/data.rs b/syscall/src/data.rs
+index 512a5f34..a2ef2a1b 100644
+--- a/syscall/src/data.rs
++++ b/syscall/src/data.rs
+@@ -180,7 +180,13 @@ impl DerefMut for StatVfs {
+ #[derive(Copy, Clone, Debug, Default, PartialEq)]
+ #[repr(C, packed)]
+ pub struct StdFsCallMeta {
++    // The metadata travels as native-endian u64 words and every consumer
++    // takes the kind as the low byte of word 0. Keep that true on big-endian
++    // machines by placing the kind last in the first word there.
++    #[cfg(target_endian = "big")]
++    _rsvd: [u8; 7],
+     pub kind: u8, // enum StdFsCallKind
++    #[cfg(target_endian = "little")]
+     _rsvd: [u8; 7],
+     pub arg1: u64,
+     pub arg2: u64,
 diff --git a/syscall/src/lib.rs b/syscall/src/lib.rs
 index 49628da8..6cf00c1e 100644
 --- a/syscall/src/lib.rs

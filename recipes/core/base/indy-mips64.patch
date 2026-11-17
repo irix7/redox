@@ -1,30 +1,617 @@
-From 959c3bcac3622fb9b06a5163ea38ac3b9b76951c Mon Sep 17 00:00:00 2001
+From fd27cc8bd8519946816adea7c4553998701507b3 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:40 +1000
-Subject: [PATCH] bootstrap: add the mips64 (SGI Indy) entry and point at local
- runtime crates
+Subject: [PATCH] Indy (mips64 n32): bootstrap entry, Seeq 8003 driver,
+ big-endian fixes
 
-bootstrap/src/mips64.rs maps the initial stack with SYS_FMAP ($v0 number,
-$a0..$a2 arguments) and calls start; mips64.ld is the riscv64 layout for
-elf32-ntradbigmips. USERMODE_END is 0x8000_0000.
-
-Cargo.toml takes redox-rt from ../../../relibc/source/redox-rt and patches
-redox_syscall and libc with the fork's vendored copies that carry the
-mips64 architecture files.
+- bootstrap/src/mips64.rs, mips64.ld: the bootstrap's entry and layout for
+  elf32-ntradbigmips; USERMODE_END is 0x8000_0000.
+- bootstrap/src/initnsmgr.rs: decode numbers in native byte order, as
+  redox-rt encodes them (a big-endian machine read dup kind 2 as 0x02000000).
+- drivers/net/seeqd: Seeq 8003 behind the HPC3 DMA engines, fixed physical
+  addresses, MAC from the DS1386 NVRAM, a 16-descriptor receive ring and one
+  transmit descriptor, polled on a 10 ms timer.
+- drivers/common/src/dma.rs: DMA memory is uncached on mips64.
+- netstack: read /etc/net/<key> from the initfs when there is no root
+  filesystem.
+- Cargo.toml: redox_syscall and libc from the fork's vendored copies;
+  bootstrap takes redox-rt from the local relibc checkout.
 
 Signed-off-by: belikh <io@jupiter.au>
 ---
- bootstrap/Cargo.lock    |  5 ----
- bootstrap/Cargo.toml    | 11 +++++---
- bootstrap/src/main.rs   |  5 ++++
- bootstrap/src/mips64.ld | 59 +++++++++++++++++++++++++++++++++++++++++
- bootstrap/src/mips64.rs | 57 +++++++++++++++++++++++++++++++++++++++
- 5 files changed, 128 insertions(+), 9 deletions(-)
+ Cargo.lock                      | 133 +++++++-------
+ Cargo.toml                      |   6 +
+ bootstrap/Cargo.lock            |   7 +-
+ bootstrap/Cargo.toml            |  11 +-
+ bootstrap/src/initnsmgr.rs      |   4 +-
+ bootstrap/src/main.rs           |   5 +
+ bootstrap/src/mips64.ld         |  59 ++++++
+ bootstrap/src/mips64.rs         |  57 ++++++
+ drivers/common/src/dma.rs       |   3 +
+ drivers/net/seeqd/Cargo.toml    |  19 ++
+ drivers/net/seeqd/src/device.rs | 313 ++++++++++++++++++++++++++++++++
+ drivers/net/seeqd/src/main.rs   |  93 ++++++++++
+ netstack/src/scheme/mod.rs      |   5 +-
+ 13 files changed, 641 insertions(+), 74 deletions(-)
  create mode 100644 bootstrap/src/mips64.ld
  create mode 100644 bootstrap/src/mips64.rs
+ create mode 100644 drivers/net/seeqd/Cargo.toml
+ create mode 100644 drivers/net/seeqd/src/device.rs
+ create mode 100644 drivers/net/seeqd/src/main.rs
 
+diff --git a/Cargo.lock b/Cargo.lock
+index 641aaaf..5bf827e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -14,7 +14,7 @@ dependencies = [
+  "pcid",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+  "spin",
+ ]
+@@ -49,7 +49,7 @@ dependencies = [
+  "plain",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "ron",
+  "rustc-hash",
+  "scheme-utils",
+@@ -81,7 +81,7 @@ dependencies = [
+  "log",
+  "pcid",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -225,7 +225,7 @@ dependencies = [
+  "libredox 0.2.0",
+  "redox-rings",
+  "redox-scheme",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+ ]
+ 
+@@ -263,7 +263,7 @@ dependencies = [
+  "fdt",
+  "libredox 0.2.0",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -474,7 +474,7 @@ dependencies = [
+  "libredox 0.2.0",
+  "log",
+  "redox-log",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -581,7 +581,7 @@ dependencies = [
+  "libc",
+  "libredox 0.2.0",
+  "redox-scheme",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -660,7 +660,7 @@ dependencies = [
+  "redox-rings",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+  "zerocopy",
+ ]
+@@ -679,7 +679,7 @@ dependencies = [
+  "piaf",
+  "redox-ioctl",
+  "redox-scheme",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+ ]
+ 
+@@ -690,7 +690,7 @@ dependencies = [
+  "daemon",
+  "libredox 0.2.0",
+  "redox-scheme",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+ ]
+ 
+@@ -747,7 +747,7 @@ dependencies = [
+  "log",
+  "pcid",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -853,7 +853,7 @@ dependencies = [
+  "libredox 0.2.0",
+  "orbclient",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -871,7 +871,7 @@ dependencies = [
+  "psf-rs",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+  "serde",
+  "toml",
+@@ -1121,7 +1121,7 @@ dependencies = [
+  "fdt",
+  "libredox 0.2.0",
+  "log",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "ron",
+ ]
+ 
+@@ -1160,7 +1160,7 @@ dependencies = [
+  "log",
+  "pcid",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -1177,7 +1177,7 @@ dependencies = [
+  "redox-rings",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+  "spin",
+ ]
+@@ -1202,7 +1202,7 @@ dependencies = [
+  "range-alloc",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "void",
+ ]
+ 
+@@ -1233,7 +1233,7 @@ dependencies = [
+  "libc",
+  "libredox 0.2.0",
+  "plain",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "serde",
+  "serde_json",
+  "toml",
+@@ -1250,7 +1250,7 @@ dependencies = [
+  "log",
+  "orbclient",
+  "redox-scheme",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+ ]
+ 
+@@ -1279,7 +1279,7 @@ dependencies = [
+  "libredox 0.2.0",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+ ]
+ 
+@@ -1306,7 +1306,7 @@ dependencies = [
+  "libredox 0.2.0",
+  "pcid",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -1364,9 +1364,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+ 
+ [[package]]
+ name = "libc"
+-version = "0.2.189"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
++version = "0.2.191"
+ 
+ [[package]]
+ name = "libredox"
+@@ -1377,7 +1375,7 @@ dependencies = [
+  "bitflags 2.13.1",
+  "libc",
+  "plain",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -1390,7 +1388,7 @@ dependencies = [
+  "ioslice",
+  "libc",
+  "plain",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -1414,7 +1412,7 @@ dependencies = [
+  "driver-block",
+  "libredox 0.2.0",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -1440,7 +1438,7 @@ dependencies = [
+  "daemon",
+  "libredox 0.2.0",
+  "redox-scheme",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+ ]
+ 
+@@ -1507,7 +1505,7 @@ dependencies = [
+  "driver-block",
+  "libredox 0.2.0",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -1521,7 +1519,7 @@ dependencies = [
+  "redox-log",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+  "smoltcp",
+ ]
+@@ -1590,7 +1588,7 @@ dependencies = [
+  "partitionlib",
+  "pcid",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "smallvec",
+ ]
+ 
+@@ -1700,7 +1698,7 @@ dependencies = [
+  "pico-args",
+  "plain",
+  "redox-scheme",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+  "serde",
+ ]
+@@ -1717,7 +1715,7 @@ dependencies = [
+  "log",
+  "pcid",
+  "pico-args",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "serde",
+  "toml",
+ ]
+@@ -1822,7 +1820,7 @@ dependencies = [
+  "orbclient",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -1845,7 +1843,7 @@ dependencies = [
+  "libredox 0.2.0",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "redox_termios",
+  "scheme-utils",
+ ]
+@@ -1884,7 +1882,7 @@ dependencies = [
+  "redox-rings",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+  "zerocopy",
+ ]
+@@ -1932,7 +1930,7 @@ dependencies = [
+  "rand_core 0.5.1",
+  "raw-cpuid",
+  "redox-scheme",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+  "sha2",
+ ]
+@@ -1978,7 +1976,7 @@ version = "0.1.0"
+ source = "git+https://gitlab.redox-os.org/redox-os/relibc.git#82a552657ca3cb6d1852016e81c89aa25812d186"
+ dependencies = [
+  "drm-sys",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -2005,7 +2003,7 @@ source = "git+https://gitlab.redox-os.org/redox-os/redox-rings.git#d787c28c2dba7
+ dependencies = [
+  "bitflags 2.13.1",
+  "libredox 0.2.0",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "zerocopy",
+ ]
+ 
+@@ -2015,7 +2013,7 @@ version = "0.13.0"
+ source = "git+https://gitlab.redox-os.org/redox-os/redox-scheme.git#3514d5696fb8cbbe7d517d37d3074d7cd5cfdded"
+ dependencies = [
+  "libredox 0.2.0",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -2039,9 +2037,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "redox_syscall"
+-version = "0.9.5"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
++version = "0.9.6"
+ dependencies = [
+  "bitflags 2.13.1",
+ ]
+@@ -2063,7 +2059,7 @@ dependencies = [
+  "libredox 0.2.0",
+  "qemu-exit",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "redox_termios",
+ ]
+ 
+@@ -2139,7 +2135,7 @@ dependencies = [
+  "log",
+  "pcid",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -2154,7 +2150,7 @@ dependencies = [
+  "log",
+  "pcid",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -2204,7 +2200,7 @@ dependencies = [
+  "log",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+  "spin",
+ ]
+@@ -2215,7 +2211,7 @@ version = "0.0.0"
+ dependencies = [
+  "libredox 0.2.0",
+  "redox-scheme",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -2267,6 +2263,19 @@ dependencies = [
+  "version-compare",
+ ]
+ 
++[[package]]
++name = "seeqd"
++version = "0.1.0"
++dependencies = [
++ "common",
++ "daemon",
++ "driver-network",
++ "libredox 0.2.0",
++ "log",
++ "redox_event",
++ "redox_syscall 0.9.6",
++]
++
+ [[package]]
+ name = "serde"
+ version = "1.0.229"
+@@ -2568,7 +2577,7 @@ dependencies = [
+  "libredox 0.2.0",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+ ]
+ 
+@@ -2604,7 +2613,7 @@ dependencies = [
+  "log",
+  "orbclient",
+  "plain",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "rehid",
+  "smallvec",
+  "xhcid",
+@@ -2616,7 +2625,7 @@ version = "0.1.0"
+ dependencies = [
+  "common",
+  "log",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "xhcid",
+ ]
+ 
+@@ -2630,7 +2639,7 @@ dependencies = [
+  "libredox 0.2.0",
+  "plain",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "thiserror",
+  "xhcid",
+ ]
+@@ -2662,7 +2671,7 @@ dependencies = [
+  "orbclient",
+  "pcid",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -2686,7 +2695,7 @@ dependencies = [
+  "driver-graphics",
+  "libredox 0.2.0",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -2702,7 +2711,7 @@ dependencies = [
+  "log",
+  "pcid",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "spin",
+  "static_assertions",
+  "thiserror",
+@@ -2721,7 +2730,7 @@ dependencies = [
+  "log",
+  "pcid",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "static_assertions",
+  "thiserror",
+ ]
+@@ -2743,7 +2752,7 @@ dependencies = [
+  "redox-path",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+  "thiserror",
+  "virtio-core",
+@@ -2757,7 +2766,7 @@ dependencies = [
+  "clap",
+  "libc",
+  "libredox 0.1.25",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+ ]
+ 
+ [[package]]
+@@ -2773,7 +2782,7 @@ dependencies = [
+  "log",
+  "pcid",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "static_assertions",
+  "virtio-core",
+ ]
+@@ -2789,7 +2798,7 @@ dependencies = [
+  "libredox 0.2.0",
+  "log",
+  "pcid",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "static_assertions",
+  "virtio-core",
+ ]
+@@ -3050,7 +3059,7 @@ dependencies = [
+  "plain",
+  "redox-scheme",
+  "redox_event",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "regex",
+  "scheme-utils",
+  "serde",
+@@ -3087,7 +3096,7 @@ dependencies = [
+  "daemon",
+  "libredox 0.2.0",
+  "redox-scheme",
+- "redox_syscall 0.9.5",
++ "redox_syscall 0.9.6",
+  "scheme-utils",
+ ]
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index ded5edf..d2a8917 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -53,6 +53,7 @@ members = [
+     "drivers/net/ixgbed",
+     "drivers/net/rtl8139d",
+     "drivers/net/rtl8168d",
++    "drivers/net/seeqd",
+     "drivers/net/virtio-netd",
+ 
+     "drivers/redoxerd",
+@@ -133,3 +134,8 @@ unused_io_amount = "warn" #TODO: have an abstraction to irq file read/write, the
+ 
+ [patch."https://gitlab.redox-os.org/redox-os/relibc.git"]
+ #redox-ioctl = { path = "../../relibc/source/redox-ioctl" }
++
++# Indy port: crates with the mips64 architecture files (irix7/redox vendor/).
++[patch.crates-io]
++redox_syscall = { path = "../../../../vendor/redox_syscall-0.9.6" }
++libc = { path = "../../../../vendor/libc-0.2.191" }
 diff --git a/bootstrap/Cargo.lock b/bootstrap/Cargo.lock
-index f79cba6..8455fd7 100644
+index f79cba6..39d6077 100644
 --- a/bootstrap/Cargo.lock
 +++ b/bootstrap/Cargo.lock
 @@ -41,7 +41,6 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
@@ -52,11 +639,13 @@ index f79cba6..8455fd7 100644
  dependencies = [
   "bitflags",
   "generic-rt",
-@@ -176,7 +172,6 @@ dependencies = [
+@@ -175,8 +171,7 @@ dependencies = [
+ 
  [[package]]
  name = "redox_syscall"
- version = "0.9.5"
+-version = "0.9.5"
 -source = "git+https://gitlab.redox-os.org/redox-os/kernel/#6cfaba5f8cbf3fb9a373170fc21ab78b972065c2"
++version = "0.9.6"
  dependencies = [
   "bitflags",
  ]
@@ -86,6 +675,21 @@ index ba46940..ab8f91a 100644
 +# mips64 definitions (bootstrap.md, Provenance).
 +redox_syscall = { path = "../../../../../vendor/redox_syscall-0.9.6" }
 +libc = { path = "../../../../../vendor/libc-0.2.190" }
+diff --git a/bootstrap/src/initnsmgr.rs b/bootstrap/src/initnsmgr.rs
+index 707b896..008e3e8 100644
+--- a/bootstrap/src/initnsmgr.rs
++++ b/bootstrap/src/initnsmgr.rs
+@@ -518,7 +518,9 @@ macro_rules! num_from_bytes_impl {
+                     let buffer_slice = buffer.get(..size).and_then(|s| s.try_into().ok());
+ 
+                     if let Some(slice) = buffer_slice {
+-                        Ok(Self::from_le_bytes(slice))
++                        // Senders (redox-rt) encode with to_ne_bytes: decode the
++                        // same way, or a big-endian machine reads 2 as 0x02000000.
++                        Ok(Self::from_ne_bytes(slice))
+                     } else {
+                         error!(
+                             "read_num: buffer is too short to read num of size {} (buffer len: {})",
 diff --git a/bootstrap/src/main.rs b/bootstrap/src/main.rs
 index 58b6b34..6c4628d 100644
 --- a/bootstrap/src/main.rs
@@ -237,6 +841,479 @@ index 0000000..e3fd459
 +    number = const SYS_FMAP,
 +    stack_size = const STACK_SIZE,
 +);
+diff --git a/drivers/common/src/dma.rs b/drivers/common/src/dma.rs
+index 37e7b1a..d6906d3 100644
+--- a/drivers/common/src/dma.rs
++++ b/drivers/common/src/dma.rs
+@@ -24,6 +24,9 @@ const DMA_MEMTY: MemoryType = {
+     } else if cfg!(target_arch = "riscv64") {
+         // FIXME check this out more
+         MemoryType::Uncacheable
++    } else if cfg!(target_arch = "mips64") {
++        // The R4400 has no coherent DMA: map DMA memory uncached
++        MemoryType::Uncacheable
+     } else {
+         panic!("invalid arch")
+     }
+diff --git a/drivers/net/seeqd/Cargo.toml b/drivers/net/seeqd/Cargo.toml
+new file mode 100644
+index 0000000..a06c2f2
+--- /dev/null
++++ b/drivers/net/seeqd/Cargo.toml
+@@ -0,0 +1,19 @@
++[package]
++name = "seeqd"
++description = "Seeq 8003 Ethernet driver for the SGI Indy (HPC3 DMA)"
++version = "0.1.0"
++edition = "2021"
++license = "MIT"
++
++[dependencies]
++libredox.workspace = true
++log.workspace = true
++redox_event.workspace = true
++redox_syscall.workspace = true
++
++common = { path = "../../common" }
++daemon = { path = "../../../daemon" }
++driver-network = { path = "../driver-network" }
++
++[lints]
++workspace = true
+diff --git a/drivers/net/seeqd/src/device.rs b/drivers/net/seeqd/src/device.rs
+new file mode 100644
+index 0000000..d2cbe36
+--- /dev/null
++++ b/drivers/net/seeqd/src/device.rs
+@@ -0,0 +1,313 @@
++//! Seeq 8003 and the HPC3 Ethernet DMA engines.
++//!
++//! Register facts (checked against the iris emulator's `hpc3.rs` and
++//! `seeq8003.rs`; to be confirmed on real hardware):
++//!
++//! - HPC3 Ethernet DMA: receive engine at physical `0x1FB9_4000`, transmit at
++//!   `0x1FB9_6000`. In each: next-descriptor pointer at `+0x0004`, byte count
++//!   at `+0x1000`, control at `+0x1004`; the receive block also has the
++//!   reset register at `+0x1014`.
++//! - Seeq registers: `0x1FBD_4000`, one byte per 32-bit word. Registers 0..5
++//!   are the station address (write, bank 0), 6 is receive command/status,
++//!   7 is transmit command/status.
++//! - A descriptor is three big-endian words in a 16-byte slot: buffer
++//!   address, count and flags, next descriptor.
++//! - A received frame is written as two pad bytes, the frame, then one
++//!   status byte. HPC3 then stores the remaining count in the low half of the
++//!   count word, which clears the ownership bit.
++//! - The MAC address is in the DS1386 NVRAM, bytes 314..320, one byte per
++//!   word at `0x1FBE_0000`.
++
++use std::ptr::{read_volatile, write_volatile};
++
++use common::dma::Dma;
++use common::{MemoryType, Prot};
++use driver_network::NetworkAdapter;
++use syscall::error::{Error, Result, EIO, EMSGSIZE};
++
++pub const HPC3_ENET_PHYS: usize = 0x1FB9_4000;
++pub const SEEQ_PHYS: usize = 0x1FBD_4000;
++const NVRAM_PHYS: usize = 0x1FBE_0000;
++const NVRAM_MAC_OFFSET: usize = 314;
++
++// Offsets inside the mapped Ethernet DMA window (receive engine first).
++const RX_NDPTR: usize = 0x0004;
++const RX_CTRL: usize = 0x1004;
++const RX_RESET: usize = 0x1014;
++const TX_NDPTR: usize = 0x2004;
++const TX_CTRL: usize = 0x3004;
++
++const CTRL_ACTIVE: u32 = 0x200;
++const RESET_CHANNEL: u32 = 0x01;
++const RESET_CLEAR_IRQ: u32 = 0x02;
++
++// Seeq register numbers.
++const SEEQ_RX: usize = 6;
++const SEEQ_TX: usize = 7;
++/// Receive command: station address and broadcast, interrupt on end of frame.
++const RX_CMD: u32 = 0x80 | 0x10;
++/// Transmit command: register bank 0, interrupt on success, 16 tries,
++/// collision and underflow.
++const TX_CMD: u32 = 0x0f;
++/// Receive status byte: frame ended and was good.
++const RX_STATUS_GOOD: u8 = 0x20;
++
++// Descriptor count-word flags.
++const DESC_EOX: u32 = 0x8000_0000;
++const DESC_EOP: u32 = 0x4000_0000;
++const DESC_XIE: u32 = 0x2000_0000;
++/// Receive: the descriptor belongs to HPC3.
++const DESC_OWN: u32 = 0x0000_4000;
++/// Transmit: HPC3 has sent the packet.
++const DESC_TXD: u32 = 0x0000_8000;
++const DESC_COUNT: u32 = 0x0000_3fff;
++
++const RX_RING: usize = 16;
++const BUF_SIZE: usize = 2048;
++const MIN_FRAME: usize = 60;
++const MAX_FRAME: usize = 1514;
++
++#[repr(C, align(16))]
++#[derive(Clone, Copy)]
++struct Desc {
++    pbuf: u32,
++    cntinfo: u32,
++    pnext: u32,
++    _pad: u32,
++}
++
++pub struct Seeq {
++    enet: *mut u8,
++    seeq: *mut u8,
++    rx_ring: Dma<[Desc; RX_RING]>,
++    rx_bufs: Dma<[u8; RX_RING * BUF_SIZE]>,
++    /// Next receive descriptor to read.
++    rx_i: usize,
++    /// Descriptor that currently carries the end-of-ring mark.
++    rx_eox: usize,
++    tx_desc: Dma<[Desc; 1]>,
++    tx_buf: Dma<[u8; BUF_SIZE]>,
++    mac: [u8; 6],
++}
++
++// The device is owned by one scheme thread.
++unsafe impl Send for Seeq {}
++
++unsafe fn map(phys: usize, len: usize) -> Result<*mut u8> {
++    Ok(common::physmap(phys, len, Prot::RW, MemoryType::DeviceMemory)
++        .map_err(|_| Error::new(EIO))? as *mut u8)
++}
++
++impl Seeq {
++    unsafe fn enet_read(&self, offset: usize) -> u32 {
++        read_volatile(self.enet.add(offset) as *const u32)
++    }
++
++    unsafe fn enet_write(&self, offset: usize, value: u32) {
++        write_volatile(self.enet.add(offset) as *mut u32, value)
++    }
++
++    unsafe fn seeq_write(&self, reg: usize, value: u32) {
++        write_volatile(self.seeq.add(reg * 4) as *mut u32, value)
++    }
++
++    /// Read a volatile word of a descriptor HPC3 may be updating.
++    fn rx_cntinfo(&self, index: usize) -> u32 {
++        unsafe { read_volatile(&raw const self.rx_ring[index].cntinfo) }
++    }
++
++    fn set_rx_cntinfo(&mut self, index: usize, value: u32) {
++        unsafe { write_volatile(&raw mut self.rx_ring[index].cntinfo, value) }
++    }
++
++    pub unsafe fn new() -> Result<Self> {
++        let enet = map(HPC3_ENET_PHYS, 0x4000)?;
++        let seeq = map(SEEQ_PHYS, 0x1000)?;
++
++        // Station address from the NVRAM; a blank or erased slot gets a
++        // locally administered address.
++        let nvram = map(NVRAM_PHYS, 0x1000)?;
++        let mut mac = [0u8; 6];
++        for (i, byte) in mac.iter_mut().enumerate() {
++            *byte = read_volatile(nvram.add((NVRAM_MAC_OFFSET + i) * 4) as *const u32) as u8;
++        }
++        if mac == [0; 6] || mac == [0xff; 6] {
++            mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
++        }
++
++        let map_err = |_| Error::new(EIO);
++        let mut device = Seeq {
++            enet,
++            seeq,
++            rx_ring: Dma::zeroed().map_err(map_err)?.assume_init(),
++            rx_bufs: Dma::zeroed().map_err(map_err)?.assume_init(),
++            rx_i: 0,
++            rx_eox: RX_RING - 1,
++            tx_desc: Dma::zeroed().map_err(map_err)?.assume_init(),
++            tx_buf: Dma::zeroed().map_err(map_err)?.assume_init(),
++            mac,
++        };
++        device.init();
++        Ok(device)
++    }
++
++    pub fn mac(&self) -> [u8; 6] {
++        self.mac
++    }
++
++    unsafe fn init(&mut self) {
++        // Reset both DMA channels and the Seeq, then release the reset.
++        self.enet_write(RX_RESET, RESET_CHANNEL | RESET_CLEAR_IRQ);
++        for _ in 0..1000 {
++            std::hint::spin_loop();
++        }
++        self.enet_write(RX_RESET, 0);
++
++        // Bank 0: registers 0..5 take the station address.
++        self.seeq_write(SEEQ_TX, TX_CMD);
++        for (i, byte) in self.mac.into_iter().enumerate() {
++            self.seeq_write(i, byte as u32);
++        }
++
++        // Receive ring: every descriptor owned by HPC3, the last one marked
++        // as the end of the ring, linked in a circle.
++        let ring_phys = self.rx_ring.physical() as u32;
++        let bufs_phys = self.rx_bufs.physical() as u32;
++        for i in 0..RX_RING {
++            let next = (i + 1) % RX_RING;
++            self.rx_ring[i] = Desc {
++                pbuf: bufs_phys + (i * BUF_SIZE) as u32,
++                cntinfo: DESC_OWN
++                    | DESC_XIE
++                    | BUF_SIZE as u32
++                    | if i == RX_RING - 1 { DESC_EOX } else { 0 },
++                pnext: ring_phys + (next * size_of::<Desc>()) as u32,
++                _pad: 0,
++            };
++        }
++        self.rx_i = 0;
++        self.rx_eox = RX_RING - 1;
++
++        self.seeq_write(SEEQ_RX, RX_CMD);
++        self.enet_write(RX_NDPTR, ring_phys);
++        self.enet_write(RX_CTRL, CTRL_ACTIVE);
++    }
++
++    /// Timer tick: restart the receive channel if it stopped at the end of
++    /// the ring while descriptors are free again.
++    pub fn poll(&mut self) {
++        unsafe {
++            if self.enet_read(RX_CTRL) & CTRL_ACTIVE == 0
++                && self.rx_cntinfo(self.rx_i) & DESC_OWN != 0
++            {
++                let phys =
++                    self.rx_ring.physical() as u32 + (self.rx_i * size_of::<Desc>()) as u32;
++                self.enet_write(RX_NDPTR, phys);
++                self.enet_write(RX_CTRL, CTRL_ACTIVE);
++            }
++        }
++    }
++
++    /// Hand descriptor `index` back to HPC3 and move the end-of-ring mark onto it.
++    fn rearm(&mut self, index: usize) {
++        self.set_rx_cntinfo(index, DESC_OWN | DESC_XIE | DESC_EOX | BUF_SIZE as u32);
++        let old = self.rx_eox;
++        if old != index {
++            let value = self.rx_cntinfo(old) & !DESC_EOX;
++            self.set_rx_cntinfo(old, value);
++        }
++        self.rx_eox = index;
++    }
++}
++
++impl NetworkAdapter for Seeq {
++    fn mac_address(&mut self) -> [u8; 6] {
++        self.mac
++    }
++
++    fn available_for_read(&mut self) -> usize {
++        let mut count = 0;
++        for n in 0..RX_RING {
++            if self.rx_cntinfo((self.rx_i + n) % RX_RING) & DESC_OWN != 0 {
++                break;
++            }
++            count += 1;
++        }
++        count
++    }
++
++    fn read_packet(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
++        loop {
++            let index = self.rx_i;
++            let cntinfo = self.rx_cntinfo(index);
++            if cntinfo & DESC_OWN != 0 {
++                return Ok(None);
++            }
++
++            // Bytes HPC3 wrote: two pad bytes, the frame, one status byte.
++            let remaining = (cntinfo & DESC_COUNT) as usize;
++            let written = BUF_SIZE.saturating_sub(remaining);
++            let base = index * BUF_SIZE;
++            let result = if written >= 3 + 14 {
++                let len = written - 3;
++                let status = unsafe { read_volatile(&raw const self.rx_bufs[base + 2 + len]) };
++                if status & RX_STATUS_GOOD == 0 {
++                    None
++                } else if len > buf.len() {
++                    self.rearm(index);
++                    self.rx_i = (index + 1) % RX_RING;
++                    return Err(Error::new(EMSGSIZE));
++                } else {
++                    for (i, out) in buf[..len].iter_mut().enumerate() {
++                        *out = unsafe { read_volatile(&raw const self.rx_bufs[base + 2 + i]) };
++                    }
++                    Some(len)
++                }
++            } else {
++                None
++            };
++
++            self.rearm(index);
++            self.rx_i = (index + 1) % RX_RING;
++            self.poll();
++
++            if let Some(len) = result {
++                return Ok(Some(len));
++            }
++            // A bad or runt frame: look at the next descriptor.
++        }
++    }
++
++    fn write_packet(&mut self, buf: &[u8]) -> Result<usize> {
++        if buf.len() > MAX_FRAME {
++            return Err(Error::new(EMSGSIZE));
++        }
++        unsafe {
++            // One packet at a time: wait for the previous one to leave.
++            let mut spins = 0u32;
++            while self.enet_read(TX_CTRL) & CTRL_ACTIVE != 0 {
++                std::hint::spin_loop();
++                spins += 1;
++                if spins > 5_000_000 {
++                    return Err(Error::new(EIO));
++                }
++            }
++
++            let len = buf.len().max(MIN_FRAME);
++            for i in 0..len {
++                let byte = buf.get(i).copied().unwrap_or(0);
++                write_volatile(&raw mut self.tx_buf[i], byte);
++            }
++            self.tx_desc[0] = Desc {
++                pbuf: self.tx_buf.physical() as u32,
++                cntinfo: len as u32 | DESC_EOP | DESC_EOX | DESC_XIE,
++                pnext: 0,
++                _pad: 0,
++            };
++            let _ = DESC_TXD;
++            self.enet_write(TX_NDPTR, self.tx_desc.physical() as u32);
++            self.enet_write(TX_CTRL, CTRL_ACTIVE);
++        }
++        Ok(buf.len())
++    }
++}
+diff --git a/drivers/net/seeqd/src/main.rs b/drivers/net/seeqd/src/main.rs
+new file mode 100644
+index 0000000..bd48f05
+--- /dev/null
++++ b/drivers/net/seeqd/src/main.rs
+@@ -0,0 +1,93 @@
++//! Seeq 8003 Ethernet on the SGI Indy.
++//!
++//! The controller sits behind the HPC3, which moves frames with two DMA
++//! engines walking descriptor chains in memory. The device is at fixed
++//! physical addresses; there is no bus to enumerate. The driver polls on a
++//! timer: the kernel does not route the HPC3 interrupt to userspace yet.
++
++use std::mem::size_of;
++
++use driver_network::NetworkScheme;
++use event::{user_data, EventQueue};
++use libredox::flag::O_RDWR;
++use libredox::Fd;
++use syscall::data::TimeSpec;
++
++pub mod device;
++
++/// Receive ring poll period.
++const POLL_NS: i32 = 10_000_000;
++
++fn arm_timer(time: &Fd) {
++    let mut now = TimeSpec::default();
++    if time.read(&mut now).map(|n| n >= size_of::<TimeSpec>()).unwrap_or(false) {
++        now.tv_nsec += POLL_NS;
++        if now.tv_nsec >= 1_000_000_000 {
++            now.tv_nsec -= 1_000_000_000;
++            now.tv_sec += 1;
++        }
++        let _ = time.write(&now);
++    }
++}
++
++fn main() {
++    daemon::Daemon::new(daemon);
++}
++
++fn daemon(daemon: daemon::Daemon) -> ! {
++    common::init();
++
++    let device = unsafe { device::Seeq::new().expect("seeqd: failed to set up the device") };
++    let mac = device.mac();
++    println!(
++        "seeqd: Seeq 8003 at {:#x}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
++        device::SEEQ_PHYS,
++        mac[0],
++        mac[1],
++        mac[2],
++        mac[3],
++        mac[4],
++        mac[5]
++    );
++
++    let mut scheme = NetworkScheme::new(move || device, daemon, "network.seeq".to_string());
++
++    user_data! {
++        enum Source {
++            Time,
++            Scheme,
++        }
++    }
++
++    let time_path = format!("/scheme/time/{}", syscall::CLOCK_MONOTONIC);
++    let time = Fd::open(&time_path, O_RDWR, 0).expect("seeqd: failed to open the time scheme");
++
++    let event_queue = EventQueue::<Source>::new().expect("seeqd: could not create event queue");
++    event_queue
++        .subscribe(time.raw(), Source::Time, event::EventFlags::READ)
++        .expect("seeqd: failed to subscribe to the timer");
++    event_queue
++        .subscribe(
++            scheme.event_handle().raw(),
++            Source::Scheme,
++            event::EventFlags::READ,
++        )
++        .expect("seeqd: failed to subscribe to the scheme");
++
++    arm_timer(&time);
++    scheme.tick().unwrap();
++
++    for event in event_queue.map(|e| e.expect("seeqd: failed to get next event")) {
++        match event.user_data {
++            Source::Time => {
++                scheme.adapter_mut().poll();
++                scheme.tick().unwrap();
++                arm_timer(&time);
++            }
++            Source::Scheme => {
++                scheme.tick().unwrap();
++            }
++        }
++    }
++    unreachable!()
++}
+diff --git a/netstack/src/scheme/mod.rs b/netstack/src/scheme/mod.rs
+index ce7e3db..cd2de7f 100644
+--- a/netstack/src/scheme/mod.rs
++++ b/netstack/src/scheme/mod.rs
+@@ -49,7 +49,10 @@ const MIN_DURATION: Duration = Duration::from_micros(0);
+ 
+ fn getcfg(key: &str) -> Result<String> {
+     let mut value = String::new();
+-    let mut file = File::open(format!("/etc/net/{key}"))?;
++    // A netbooted machine has no root filesystem when the stack starts: fall
++    // back to the copy in the initfs.
++    let mut file = File::open(format!("/etc/net/{key}"))
++        .or_else(|_| File::open(format!("/scheme/initfs/etc/net/{key}")))?;
+     file.read_to_string(&mut value)?;
+     Ok(value.trim().to_string())
+ }
 -- 
 2.56.0
 

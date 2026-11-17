@@ -4,7 +4,7 @@ description = "The Redox microkernel"
 [source]
 git = "https://gitlab.redox-os.org/redox-os/kernel.git"
 # The Indy port is a patch on a pinned upstream commit (bootstrap.md, Provenance).
-rev = "8f0e965e99856fc6215294663fa1a9d1018a7eb2"
+rev = "7824a967b630d4a81c0dbe75a3e50a2a3657cacd"
 patches = ["indy-mips64.patch"]
 
 [build]

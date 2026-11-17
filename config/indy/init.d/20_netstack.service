@@ -1,0 +1,7 @@
+[unit]
+description = "Network stack"
+requires_weak = ["10_seeqd.service"]
+
+[service]
+cmd = "netstack"
+type = "notify"

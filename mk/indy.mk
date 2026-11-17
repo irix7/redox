@@ -8,7 +8,7 @@
 INDY_BUILD=build/indy
 INDY_TARGET=targets/mips64-sgi-redox.json
 INDY_TFTP_DIR?=/var/lib/sgi-netboot
-INDY_MARKER?=REDOX-INDY-INIT: hello
+INDY_MARKER?=addr 192.168
 # The toolchain pin of this fork; the kernel checkout carries upstream's own.
 INDY_RUST_TOOLCHAIN?=nightly-2026-10-03
 
@@ -67,15 +67,29 @@ $(SYSROOT)/lib/libc.a: FORCE
 	tools/relibc-indy.sh $(CURDIR)/$(SYSROOT)
 
 $(INIT_ELF): $(SYSROOT)/lib/libc.a $(wildcard tools/indy-init/src/*.rs) tools/indy-init/Cargo.toml tools/indy-init/.cargo/config.toml
+	touch tools/indy-init/src/main.rs
 	cd tools/indy-init && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) __CARGO_TESTS_ONLY_SRC_ROOT=$(RUST_SRC) cargo build --release
 
-# The initfs holds what the bootstrap starts: bin/init and the drivers.
-$(INITFS_IMG): $(BOOTSTRAP_ELF) $(INITFS_AR) $(INIT_ELF)
+# Base programs for the target: the real init, the Seeq driver and the network
+# stack (tools/base-indy.sh).
+BASE_BINS=init randd seeqd netstack dhcpd
+BASE_OUT=$(BASE_SOURCE)/target/mips64-sgi-redox/release
+
+$(BASE_OUT)/init: $(SYSROOT)/lib/libc.a FORCE
+	tools/base-indy.sh $(BASE_BINS)
+
+# The initfs holds what the bootstrap starts: init, its unit files
+# (config/indy/init.d), the driver, the network stack and the console reporter.
+$(INITFS_IMG): $(BOOTSTRAP_ELF) $(INITFS_AR) $(INIT_ELF) $(BASE_OUT)/init $(wildcard config/indy/init.d/*)
 	rm -rf $(INITFS_DIR)
 	mkdir -p $(INITFS_DIR)/bin $(INITFS_DIR)/lib/drivers $(INITFS_DIR)/lib/init.d
-	install -m 0755 $(INIT_ELF) $(INITFS_DIR)/bin/init
+	for bin in $(BASE_BINS); do install -m 0755 $(BASE_OUT)/$$bin $(INITFS_DIR)/bin/$$bin; done
+	install -m 0755 $(INIT_ELF) $(INITFS_DIR)/bin/netinfo
+	install -m 0644 config/indy/init.d/* $(INITFS_DIR)/lib/init.d/
+	mkdir -p $(INITFS_DIR)/etc/net
+	install -m 0644 config/indy/net/* $(INITFS_DIR)/etc/net/
 	$(INITFS_AR) $(INITFS_DIR) $(BOOTSTRAP_ELF) -o $@
-	ls -l $@
+	ls -l $@ $(INITFS_DIR)/bin
 
 $(INDY_BUILD)/redox: $(INDY_ELF) $(ECOFF) $(INITFS_IMG)
 	mkdir -p $(INDY_BUILD)

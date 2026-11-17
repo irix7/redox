@@ -30,6 +30,9 @@ export NM="$SDK/bin/mips64-buildroot-linux-uclibc-nm"
 export OBJCOPY="$SDK/bin/mips64-buildroot-linux-uclibc-objcopy"
 
 BUILD="$SRC/target/$TARGET/release"
+# relibc's Makefile only tracks files inside its own tree; the vendored crates
+# live outside it, so let cargo decide what is stale.
+rm -f "$BUILD/librelibc.a"
 make -C "$SRC" "$BUILD/librelibc.a" "$BUILD/crt0.o" "$BUILD/crti.o" "$BUILD/crtn.o"
 
 mkdir -p "$SYSROOT/lib"
@@ -37,5 +40,8 @@ cp "$BUILD/librelibc.a" "$SYSROOT/lib/libc.a"
 cp "$BUILD/crt0.o" "$BUILD/crti.o" "$BUILD/crtn.o" "$SYSROOT/lib/"
 ln -sf crt0.o "$SYSROOT/lib/crt1.o"
 rm -f "$SYSROOT"/lib/lib{m,dl,pthread,rt,gcc_s}.a
-for lib in m dl pthread rt gcc_s; do "$AR" -rcs "$SYSROOT/lib/lib$lib.a"; done
+for lib in m dl pthread rt; do "$AR" -rcs "$SYSROOT/lib/lib$lib.a"; done
+# libgcc_s: the two unwinder entry points std's backtrace printer references.
+"$CC_mips64_sgi_redox" $CFLAGS_mips64_sgi_redox -O2 -c "$ROOT/tools/unwind-stub.c" -o "$SYSROOT/lib/unwind-stub.o"
+"$AR" -rcs "$SYSROOT/lib/libgcc_s.a" "$SYSROOT/lib/unwind-stub.o"
 ls -l "$SYSROOT/lib"

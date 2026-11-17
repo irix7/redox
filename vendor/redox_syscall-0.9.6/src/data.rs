@@ -180,7 +180,13 @@ impl DerefMut for StatVfs {
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 #[repr(C, packed)]
 pub struct StdFsCallMeta {
+    // The metadata travels as native-endian u64 words and every consumer
+    // takes the kind as the low byte of word 0. Keep that true on big-endian
+    // machines by placing the kind last in the first word there.
+    #[cfg(target_endian = "big")]
+    _rsvd: [u8; 7],
     pub kind: u8, // enum StdFsCallKind
+    #[cfg(target_endian = "little")]
     _rsvd: [u8; 7],
     pub arg1: u64,
     pub arg2: u64,

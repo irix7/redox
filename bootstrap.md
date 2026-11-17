@@ -1,10 +1,10 @@
 # Bootstrapping Redox on the SGI Indy — 32 MB
 
 **Audience:** agents and engineers working in `irix7/redox`.
-**Status:** T1, T3, T4, T5 and the first half of T6 pass on iris (2026-11-17): `make indy-gate`
-netboots the Redox kernel with an appended initfs on a 32 MiB `indy_ip24`; the userspace
-bootstrap forks the initfs, process-manager and namespace daemons and stops at "failed to
-open init" because there is no relibc for the target yet. T2 (the x86_64 floor) is not done. This file says
+**Status:** T1 and T3 to T7 pass on iris (2026-11-17): `make indy-gate` netboots kernel plus
+initfs on a 32 MiB `indy_ip24`, base's `init` starts `randd`, the Seeq driver, `netstack` and
+`dhcpd`, and the gate waits for the DHCP lease. Nothing has run on real hardware yet. T2 (the
+x86_64 floor) is not done. This file says
 where the pieces are, what has been proved on this machine, and what the 32 MB budget allows.
 **Fork base:** `redox-os/redox` mirror at `f71658dfca2b978bee55a4c19d95ab926a948c21`
 (2026-11-16). See [Provenance](#provenance-and-rebasing).
@@ -47,6 +47,11 @@ versions, commands and byte counts, not principles.
 | Reference hosts | iris emulator (IP24 with an embedded PROM fallback), CI on `x86_64-linux` |
 
 **The one constraint is 32 MiB.** Every other decision in this plan is downstream of it.
+
+A second limit comes from the PROM (measured 2026-11-17 on iris's embedded IP24 PROM): a
+netboot image loaded at `0x8804_0000` must fit its free-memory area. A 6,865,104-byte image
+loads; a 7,684,304-byte one fails with `Text start 0x8040000, size 0x754000 doesn't fit in a
+FreeMemory area`. Keep the TFTP file under 6.8 MB.
 Redox's QEMU defaults are 1–2 GiB: `mk/qemu.mk` sets `QEMU_MEM` to 1024 on one architecture
 and 2048 on the others. The default desktop configuration ships COSMIC, fonts and a browser.
 The kernel's release profile carries `debug = "full"`, and LTO is commented out
@@ -676,20 +681,22 @@ and none of them is on the critical path to "the machine runs our code".
 
 ### Next, in order
 
-- **T6 — initfs and the bootstrap program.** Half done 2026-11-17: `ecoff convert --append`
-  places the initfs after the kernel (header page `REDOXIFS`, length, payload), the kernel
-  hands it to `usermode_bootstrap`, and the `bootstrap` program (base, `no_std`, with
-  `redox-rt`) runs: it forks the initfs scheme, the process manager and the namespace
-  manager, then stops at `failed to open init` because the initfs holds no `bin/init`. The
-  gate marker is `bootstrap: namespace scheme start`. What remains is relibc for n32 and a
-  `std` build for the target, so that `init` and the daemons can be built.
-- **T7 — Seeq 8003 Ethernet.** The first device driver, and the one that matters most: a
-  netbooted machine with no disk has nothing else. In Redox it is a userspace scheme, so it
-  follows T6. The HPC3 interrupt demultiplexer (INT3, CP0 IP2/IP3) in the kernel's
-  `arch::interrupt::irq` is its prerequisite; today that module claims no IRQs. Read
-  `irix7/os/docs/research/indy-hardware.md` §4 (HPC3), §4.2 (the interrupt-status bug) and
-  §6 (Seeq register set, DMA, the frame format quirk) first; iris's `src/dev/seeq*` is the
-  model to test against.
+- **T6 — initfs, relibc and std.** Done 2026-11-17. `ecoff convert --append` places the initfs
+  after the kernel; the `bootstrap` program forks the initfs scheme, the process manager and
+  the namespace manager; relibc builds as a static `libc.a` (`tools/relibc-indy.sh`); Rust
+  `std` builds with `-Zbuild-std` from a copy of rust-src whose libc is the fork's patched
+  one; base's real `init` runs unit files from `config/indy/init.d`. The kernel is pinned to
+  `7824a967`, the commit whose syscall crate relibc locks.
+- **T7 — Seeq 8003 Ethernet.** Done in the emulator 2026-11-17: `seeqd`
+  (`base/drivers/net/seeqd`, in the base patch) drives the Seeq through the HPC3 DMA
+  engines, `netstack` and `dhcpd` run on it, and the gate marker is the DHCP lease:
+  `REDOX-INDY-NET: mac 08-00-69-12-34-56 addr 192.168.0.2/24`. It polls on a 10 ms timer.
+  Not done: the HPC3/INT3 interrupt path in the kernel (`arch::interrupt::irq` claims no
+  IRQs), the IOC2 twisted-pair select, collision and error counters, and any run on real
+  hardware.
+- **T8 — next.** Interrupts for the driver; a shell on the serial console; shrink the
+  initfs (4.2 MiB against a 2 MiB budget: every program statically links std and relibc, at
+  about 450 KiB each); an entropy source for `randd` (it seeds with zero today).
 - **T2** stays worth doing: it tells which userspace cut matters most before T6 pulls in
   packages.
 
@@ -710,6 +717,7 @@ the same shape.
 | D6 | Graphics: serial only in v1, or REX3 from the start | 3.75 MiB vs 300 KiB, and weeks of work |
 | D7 | **Decided**: off; the kernel builds with `--no-default-features` and `ipi` is a no-op | the Indy is single-CPU; SMP is pure cost |
 | D8 | Package format and index for the first image | the sibling's index format exists but is not a Redox format |
+| D4a | **Decided** ([ADR 0004](docs/adr/0004-byte-order.md)): native byte order across syscall and scheme boundaries; fix producers | every syscall with packed metadata depends on it |
 | D9 | **Decided** ([ADR 0003](docs/adr/0003-paging-and-tlb.md)): two-level 4-byte tables, EntryLo-shaped leaves, one ASID, software refill | every mapping and the TLB handler depend on it |
 
 ---

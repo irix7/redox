@@ -1,4 +1,4 @@
-From a242c77a2645f6ac589ade031a7694ff826bd885 Mon Sep 17 00:00:00 2001
+From 543a6b223280d957b1fd832f0cf0ead9f0fe9768 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:49 +1000
 Subject: [PATCH] redox-rt, generic-rt: add mips64 n32 (SGI Indy)
@@ -27,6 +27,7 @@ Signed-off-by: belikh <io@jupiter.au>
  src/crt0/src/lib.rs                        |  17 ++
  src/header/arch_mips64_user/cbindgen.toml  |  16 ++
  src/header/arch_mips64_user/mod.rs         |  23 ++
+ src/header/dirent/mod.rs                   |  15 +-
  src/header/mod.rs                          |   1 +
  src/header/netdb/mod.rs                    |   2 +-
  src/header/setjmp/impl/mipsn32/longjmp.S   |  10 -
@@ -46,7 +47,7 @@ Signed-off-by: belikh <io@jupiter.au>
  src/lib.rs                                 |   1 +
  src/platform/redox/ptrace.rs               |  12 +
  stripcore.sh                               |   5 +-
- 32 files changed, 547 insertions(+), 52 deletions(-)
+ 33 files changed, 561 insertions(+), 53 deletions(-)
  create mode 100644 redox-rt/src/arch/mips64.rs
  create mode 100644 src/header/arch_mips64_user/cbindgen.toml
  create mode 100644 src/header/arch_mips64_user/mod.rs
@@ -710,6 +711,53 @@ index 0000000..1075f12
 +pub type elf_greg_t = c_ulonglong;
 +pub type elf_gregset_t = user_regs_struct;
 +pub type elf_fpregset_t = user_fpregs_struct;
+diff --git a/src/header/dirent/mod.rs b/src/header/dirent/mod.rs
+index ca94be2..ee9a894 100644
+--- a/src/header/dirent/mod.rs
++++ b/src/header/dirent/mod.rs
+@@ -61,6 +61,12 @@ pub struct DIR {
+ 
+     // The last value of d_off, used by telldir
+     opaque_offset: u64,
++
++    // The entry returned by readdir, copied out of `buf`. Records in `buf`
++    // are packed, so a pointer into it is not aligned for `dirent`, whose
++    // first member is 64 bits; a CPU that traps on unaligned loads (MIPS)
++    // needs the copy.
++    current: Vec<u64>,
+ }
+ impl DIR {
+     pub fn new(path: CStr) -> Result<Box<Self>, Errno> {
+@@ -72,6 +78,7 @@ impl DIR {
+             buf: Vec::with_capacity(INITIAL_BUFSIZE),
+             buf_offset: 0,
+             opaque_offset: 0,
++            current: alloc::vec![0_u64; size_of::<dirent>().div_ceil(8)],
+         }))
+     }
+     pub fn from_fd(fd: c_int) -> Result<Box<Self>, Errno> {
+@@ -89,6 +96,7 @@ impl DIR {
+             buf: Vec::with_capacity(INITIAL_BUFSIZE),
+             buf_offset: 0,
+             opaque_offset: 0,
++            current: alloc::vec![0_u64; size_of::<dirent>().div_ceil(8)],
+         }
+         .into())
+     }
+@@ -133,7 +141,12 @@ impl DIR {
+             // Don't want memory corruption if a scheme is adversarial.
+             return Err(Errno(EIO));
+         }
+-        let dent_ptr = this_dent.as_ptr() as *mut dirent;
++        let copy_len = usize::from(this_reclen).min(size_of::<dirent>());
++        let dent_ptr = self.current.as_mut_ptr().cast::<dirent>();
++        unsafe {
++            core::ptr::write_bytes(dent_ptr.cast::<u8>(), 0, size_of::<dirent>());
++            core::ptr::copy_nonoverlapping(this_dent.as_ptr(), dent_ptr.cast::<u8>(), copy_len);
++        }
+ 
+         self.opaque_offset = this_next_opaque;
+         self.buf_offset = next_off;
 diff --git a/src/header/mod.rs b/src/header/mod.rs
 index dffef13..e13fad7 100644
 --- a/src/header/mod.rs

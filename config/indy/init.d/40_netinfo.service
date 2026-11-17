@@ -1,0 +1,7 @@
+[unit]
+description = "Report the network address on the console"
+requires_weak = ["20_netstack.service"]
+
+[service]
+cmd = "netinfo"
+type = "oneshot_async"
