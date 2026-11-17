@@ -1,0 +1,295 @@
+//! The Redox scheme: a read-only file tree backed by a `Store`.
+//!
+//! The main thread reads requests from the scheme socket and hands each call
+//! to a worker thread, so a read that waits for the network does not hold up
+//! other callers. Workers share the store, its cache and the handle table.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use redox_scheme::scheme::{SchemeState, SchemeSync};
+use redox_scheme::{CallRequest, CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
+use scheme_utils::FpathWriter;
+use syscall::data::{Stat, StatVfs};
+use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
+use syscall::error::{EBADF, EIO, EOPNOTSUPP, EISDIR, ELOOP, ENOENT, ENOTDIR, EROFS, Error, Result};
+use syscall::flag::{
+    MODE_DIR, MODE_FILE, MODE_SYMLINK, O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_STAT,
+    O_SYMLINK, O_TRUNC,
+};
+use syscall::schemev2::NewFdFlags;
+
+use crate::format::{CHUNK, Entry, Kind};
+use crate::store::{self, Store};
+
+const ROOT_ID: usize = 1;
+
+struct Handle {
+    /// Path from the root of the tree, without a leading slash.
+    path: String,
+    entry: Entry,
+}
+
+/// Worker stack: the TLS handshake and RSA-4096 checks keep their buffers
+/// on the stack.
+const WORKER_STACK: usize = 512 * 1024;
+
+struct Shared {
+    name: String,
+    store: Store,
+    handles: Mutex<BTreeMap<usize, Handle>>,
+    next_id: AtomicUsize,
+}
+
+/// One per thread; all of them point at the same `Shared`.
+#[derive(Clone)]
+pub struct WebScheme {
+    shared: Arc<Shared>,
+}
+
+fn errno(err: store::Error) -> Error {
+    Error::new(match err {
+        store::Error::NotFound => ENOENT,
+        store::Error::NotDir => ENOTDIR,
+        store::Error::IsDir => EISDIR,
+        store::Error::Loop => ELOOP,
+        store::Error::Io(text) => {
+            eprintln!("webfs: {text}");
+            EIO
+        }
+    })
+}
+
+impl WebScheme {
+    pub fn new(name: String, store: Store) -> Self {
+        WebScheme {
+            shared: Arc::new(Shared {
+                name,
+                store,
+                handles: Mutex::new(BTreeMap::new()),
+                next_id: AtomicUsize::new(ROOT_ID + 1),
+            }),
+        }
+    }
+
+    fn handles(&self) -> std::sync::MutexGuard<'_, BTreeMap<usize, Handle>> {
+        self.shared.handles.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn path(&self, id: usize) -> Result<String> {
+        if id == ROOT_ID {
+            return Ok(String::new());
+        }
+        Ok(self.handles().get(&id).ok_or(Error::new(EBADF))?.path.clone())
+    }
+
+    /// The entry behind an id. The root id is resolved on each use: it
+    /// exists before the store has been reached.
+    fn entry(&self, id: usize) -> Result<Entry> {
+        if id == ROOT_ID {
+            return self.shared.store.resolve("", true).map_err(errno);
+        }
+        Ok(self.handles().get(&id).ok_or(Error::new(EBADF))?.entry.clone())
+    }
+
+    /// Serve the scheme on `socket` with `threads` workers. Does not return.
+    pub fn run(self, socket: Socket, threads: usize) -> ! {
+        let socket = Arc::new(socket);
+        let (sender, receiver) = mpsc::channel::<CallRequest>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..threads.max(1) {
+            let (mut scheme, socket, receiver) = (self.clone(), socket.clone(), receiver.clone());
+            thread::Builder::new()
+                .name(format!("webfs-{index}"))
+                .stack_size(WORKER_STACK)
+                .spawn(move || worker(&mut scheme, &socket, &receiver))
+                .expect("webfs: failed to start a worker thread");
+        }
+        let mut scheme = self;
+        loop {
+            let request = match socket.next_request(SignalBehavior::Restart) {
+                Ok(Some(request)) => request,
+                Ok(None) => std::process::exit(0),
+                Err(err) => panic!("webfs: failed to read a scheme request: {err}"),
+            };
+            let response = match request.kind() {
+                RequestKind::Call(call) => {
+                    sender.send(call).expect("webfs: the workers are gone");
+                    continue;
+                }
+                RequestKind::OnClose { id } => {
+                    scheme.on_close(id);
+                    continue;
+                }
+                RequestKind::SendFd(request) => Response::new(Err(Error::new(EOPNOTSUPP)), request),
+                RequestKind::RecvFd(request) => {
+                    Response::open_dup_like(Err(Error::new(EOPNOTSUPP)), request)
+                }
+                _ => continue,
+            };
+            let _ = socket.write_response(response, SignalBehavior::Restart);
+        }
+    }
+}
+
+fn worker(scheme: &mut WebScheme, socket: &Socket, receiver: &Mutex<Receiver<CallRequest>>) {
+    // File locks are not offered, so each worker can keep its own state.
+    let mut state = SchemeState::new();
+    loop {
+        let call = receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).recv();
+        let Ok(call) = call else { return };
+        let response = call.handle_sync(scheme, &mut state);
+        if let Err(err) = socket.write_response(response, SignalBehavior::Restart) {
+            eprintln!("webfs: failed to write a scheme response: {err}");
+        }
+    }
+}
+
+impl SchemeSync for WebScheme {
+    fn scheme_root(&mut self) -> Result<usize> {
+        Ok(ROOT_ID)
+    }
+
+    fn openat(
+        &mut self,
+        dirfd: usize,
+        path: &str,
+        flags: usize,
+        _fcntl_flags: u32,
+        _ctx: &CallerCtx,
+    ) -> Result<OpenResult> {
+        let base = self.path(dirfd)?;
+        let stat = flags & O_STAT != 0;
+        if !stat && (flags & O_ACCMODE != O_RDONLY || flags & (O_CREAT | O_TRUNC) != 0) {
+            return Err(Error::new(EROFS));
+        }
+        let full = format!("{base}/{path}");
+        let follow = flags & (O_SYMLINK | O_NOFOLLOW) == 0;
+        let entry = self.shared.store.resolve(&full, follow).map_err(errno)?;
+        if flags & O_DIRECTORY != 0 && entry.kind != Kind::Dir {
+            return Err(Error::new(ENOTDIR));
+        }
+        let path: Vec<&str> = full.split('/').filter(|part| !part.is_empty() && *part != ".").collect();
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        self.handles().insert(
+            id,
+            Handle {
+                path: path.join("/"),
+                entry,
+            },
+        );
+        Ok(OpenResult::ThisScheme {
+            number: id,
+            flags: NewFdFlags::POSITIONED,
+        })
+    }
+
+    fn read(
+        &mut self,
+        id: usize,
+        buf: &mut [u8],
+        offset: u64,
+        _fcntl_flags: u32,
+        _ctx: &CallerCtx,
+    ) -> Result<usize> {
+        let entry = self.entry(id)?;
+        self.shared.store.read(&entry, offset, buf).map_err(errno)
+    }
+
+    fn write(
+        &mut self,
+        _id: usize,
+        _buf: &[u8],
+        _offset: u64,
+        _fcntl_flags: u32,
+        _ctx: &CallerCtx,
+    ) -> Result<usize> {
+        Err(Error::new(EROFS))
+    }
+
+    fn fsize(&mut self, id: usize, _ctx: &CallerCtx) -> Result<u64> {
+        Ok(self.entry(id)?.size)
+    }
+
+    fn fcntl(&mut self, _id: usize, _cmd: usize, _arg: usize, _ctx: &CallerCtx) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
+        let path = self.path(id)?;
+        FpathWriter::with(buf, &self.shared.name, |writer| {
+            writer.push_str(&path);
+            Ok(())
+        })
+    }
+
+    fn fstat(&mut self, id: usize, stat: &mut Stat, _ctx: &CallerCtx) -> Result<()> {
+        let entry = self.entry(id)?;
+        let time = self.shared.store.root().map_err(errno)?.time;
+        let kind = match entry.kind {
+            Kind::Dir => MODE_DIR,
+            Kind::File => MODE_FILE,
+            Kind::Link => MODE_SYMLINK,
+        };
+        *stat = Stat {
+            st_ino: u64::from_be_bytes(entry.hash[..8].try_into().expect("a hash has 32 bytes")),
+            st_mode: kind | entry.mode,
+            st_nlink: 1,
+            st_size: entry.size,
+            st_blksize: CHUNK as u32,
+            st_blocks: entry.size.div_ceil(512),
+            st_mtime: time,
+            st_atime: time,
+            st_ctime: time,
+            ..Default::default()
+        };
+        Ok(())
+    }
+
+    fn fstatvfs(&mut self, _id: usize, stat: &mut StatVfs, _ctx: &CallerCtx) -> Result<()> {
+        *stat = StatVfs {
+            f_bsize: CHUNK as u32,
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+        };
+        Ok(())
+    }
+
+    fn getdents<'buf>(
+        &mut self,
+        id: usize,
+        mut buf: DirentBuf<&'buf mut [u8]>,
+        opaque_offset: u64,
+    ) -> Result<DirentBuf<&'buf mut [u8]>> {
+        let dir = self.entry(id)?;
+        let entries = self.shared.store.list(&dir).map_err(errno)?;
+        let start = usize::try_from(opaque_offset).unwrap_or(usize::MAX);
+        for (index, entry) in entries.iter().enumerate().skip(start) {
+            let full = buf.entry(DirEntry {
+                inode: u64::from_be_bytes(entry.hash[..8].try_into().expect("a hash has 32 bytes")),
+                name: &entry.name,
+                kind: match entry.kind {
+                    Kind::Dir => DirentKind::Directory,
+                    Kind::File => DirentKind::Regular,
+                    Kind::Link => DirentKind::Symlink,
+                },
+                next_opaque_id: index as u64 + 1,
+            });
+            match full {
+                Ok(()) => {}
+                // The buffer is full: the caller comes back for the rest.
+                Err(_) if index > start => break,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(buf)
+    }
+
+    fn on_close(&mut self, id: usize) {
+        self.handles().remove(&id);
+    }
+}

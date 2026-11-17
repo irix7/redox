@@ -18,6 +18,9 @@
 #   IRIS_ARGS       extra emulator options, e.g. "--cache full --cpu r5000"
 #   SHELL_CHECK     1 to also drive the TCP shell: run a command, then `reboot`
 #                   and wait for the PROM to come back
+#   SHELL_EXPECT_CMD, SHELL_EXPECT, SHELL_WAIT
+#                   with SHELL_CHECK: a shell command, a string its output must
+#                   contain, and the seconds to wait for it (default 30)
 set -euo pipefail
 
 IMAGE="${1:?usage: indy-gate.sh IMAGE [MARKER] [TIMEOUT_SECONDS]}"
@@ -99,6 +102,12 @@ if [ "${SHELL_CHECK:-0}" = 1 ]; then
   reply="$( (printf 'echo tcp-shell-ok\r\nuname\r\n'; sleep 4) | socat - "TCP:127.0.0.1:$SHELL_PORT" | tr -d '\r' )"
   echo "$reply" | sed 's/^/indy-gate: tcp> /'
   echo "$reply" | grep -q 'tcp-shell-ok'
+  if [ -n "${SHELL_EXPECT_CMD:-}" ]; then
+    reply="$( (printf '%s\r\n' "$SHELL_EXPECT_CMD"; sleep "${SHELL_WAIT:-30}") | socat - "TCP:127.0.0.1:$SHELL_PORT" | tr -d '\r' )"
+    echo "$reply" | tail -5 | sed 's/^/indy-gate: tcp> /'
+    echo "$reply" | grep -qF "$SHELL_EXPECT"
+    echo "indy-gate: \"$SHELL_EXPECT_CMD\" printed \"$SHELL_EXPECT\""
+  fi
   (printf 'reboot\r\n'; sleep 2) | socat - "TCP:127.0.0.1:$SHELL_PORT" >/dev/null || true
   ic serial-wait 'System Maintenance Menu' --timeout 120
   echo "indy-gate: reboot returned to the PROM"

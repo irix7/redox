@@ -714,6 +714,11 @@ and none of them is on the critical path to "the machine runs our code".
   leaves 768 KiB to the PROM. iris hid a cache fault: gate with `IRIS_ARGS="--cache full"`
   as well. VCED/VCEI are handled in the exception entry. Cache aliasing on R4600/R5000,
   which do not trap, is open.
+- **webfs.** 2026-11-17, in the emulator: `tools/webfs` mounts a read-only tree served
+  over HTTP or HTTPS at `/scheme/web` and packs and serves it on the host
+  ([docs/webfs.md](docs/webfs.md)). `make indy-webfs-gate` reads a 200 KiB file over TLS on
+  a 32 MiB guest. The daemon is 1,067,900 bytes and enters the image only with
+  `INDY_WEBFS_URL` set.
 - **T9 — next.** First real-hardware boot and whatever it shows; shrink the initfs (4.4 MiB
   against a 2 MiB budget); an entropy source for `randd`; the serial interrupt (INT3
   mappable lines) instead of polling; `ion` in place of the bring-up shell.

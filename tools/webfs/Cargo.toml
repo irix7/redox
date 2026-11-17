@@ -1,0 +1,36 @@
+[package]
+name = "webfs"
+version = "0.1.0"
+edition = "2024"
+description = "Read-only filesystem served as content-addressed blobs over HTTP or HTTPS"
+license = "MIT"
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false }
+embedded-tls = { version = "0.19", default-features = false, features = ["std", "alloc"] }
+embedded-io = { version = "0.7", features = ["std"] }
+rand_core = { version = "0.6", default-features = false }
+x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+
+[target.'cfg(target_os = "redox")'.dependencies]
+daemon = { path = "../../recipes/core/base/source/daemon" }
+scheme-utils = { path = "../../recipes/core/base/source/scheme-utils" }
+redox-scheme = { git = "https://gitlab.redox-os.org/redox-os/redox-scheme.git", default-features = false }
+redox_syscall = { version = "0.9.5", features = ["std"] }
+libredox = "0.2.0"
+
+# The crates with the mips64 architecture files (vendor/, tools/vendor.sh).
+[patch.crates-io]
+redox_syscall = { path = "../../vendor/redox_syscall-0.9.6" }
+libc = { path = "../../vendor/libc-0.2.191" }
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+lto = true
+codegen-units = 1
+debug = false
+strip = "symbols"

@@ -81,9 +81,29 @@ BASE_OUT=$(BASE_SOURCE)/target/mips64-sgi-redox/release
 $(BASE_OUT)/init: $(SYSROOT)/lib/libc.a FORCE
 	tools/base-indy.sh $(BASE_BINS)
 
+# webfs: the read-only filesystem served over HTTP or HTTPS (tools/webfs).
+# The same crate builds for the host (pack, serve) and for the target (mount).
+#   INDY_WEBFS_URL    store to mount at /scheme/web; empty leaves webfs out of the image
+#   INDY_WEBFS_ARGS   extra `webfs mount` options, e.g. --connect 10.1.1.3
+#   INDY_WEBFS_CA     certificate file to trust besides the built-in roots
+WEBFS_ELF=tools/webfs/target/mips64-sgi-redox/release/webfs
+WEBFS_HOST=tools/webfs/target/release/webfs
+WEBFS_SRC=$(wildcard tools/webfs/src/*.rs) tools/webfs/Cargo.toml tools/webfs/Cargo.lock
+INDY_WEBFS_URL?=
+INDY_WEBFS_ARGS?=
+INDY_WEBFS_CA?=
+
+$(WEBFS_ELF): $(SYSROOT)/lib/libc.a $(WEBFS_SRC)
+	tools/webfs-indy.sh
+
+$(WEBFS_HOST): $(WEBFS_SRC)
+	cd tools/webfs && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) cargo build --release
+
+webfs: $(WEBFS_HOST)
+
 # The initfs holds what the bootstrap starts: init, its unit files
 # (config/indy/init.d), the driver, the network stack and the bring-up shell.
-$(INITFS_IMG): $(BOOTSTRAP_ELF) $(INITFS_AR) $(INIT_ELF) $(BASE_OUT)/init $(wildcard config/indy/init.d/*)
+$(INITFS_IMG): $(BOOTSTRAP_ELF) $(INITFS_AR) $(INIT_ELF) $(if $(INDY_WEBFS_URL),$(WEBFS_ELF) FORCE) $(BASE_OUT)/init $(wildcard config/indy/init.d/*)
 	rm -rf $(INITFS_DIR)
 	mkdir -p $(INITFS_DIR)/bin $(INITFS_DIR)/lib/drivers $(INITFS_DIR)/lib/init.d
 	for bin in $(BASE_BINS); do install -m 0755 $(BASE_OUT)/$$bin $(INITFS_DIR)/bin/$$bin; done
@@ -91,6 +111,8 @@ $(INITFS_IMG): $(BOOTSTRAP_ELF) $(INITFS_AR) $(INIT_ELF) $(BASE_OUT)/init $(wild
 	install -m 0644 config/indy/init.d/* $(INITFS_DIR)/lib/init.d/
 	mkdir -p $(INITFS_DIR)/etc/net
 	install -m 0644 config/indy/net/* $(INITFS_DIR)/etc/net/
+	if [ -n "$(INDY_WEBFS_URL)" ]; then WEBFS_CA="$(INDY_WEBFS_CA)" tools/webfs-unit.sh $(INITFS_DIR) $(WEBFS_ELF) \
+		"$(INDY_WEBFS_URL)" $(INDY_WEBFS_ARGS); fi
 	$(INITFS_AR) $(INITFS_DIR) $(BOOTSTRAP_ELF) -o $@
 	ls -l $@ $(INITFS_DIR)/bin
 
@@ -107,4 +129,9 @@ indy-gate: $(INDY_BUILD)/redox
 indy-netboot: $(INDY_BUILD)/redox
 	for name in $(INDY_TFTP_NAMES); do install -m 0644 $< $(INDY_TFTP_DIR)/$$name; done
 
-.PHONY: indy indy-gate indy-netboot indy-probe indy-probe-gate
+# Pack a test tree, serve it over HTTPS on this host and read it from the
+# emulated Indy through /scheme/web.
+indy-webfs-gate: $(WEBFS_HOST) $(WEBFS_ELF) $(INDY_BUILD)/redox
+	tools/webfs-gate.sh
+
+.PHONY: webfs indy-webfs-gate indy indy-gate indy-netboot indy-probe indy-probe-gate
