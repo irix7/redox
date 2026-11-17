@@ -1,4 +1,4 @@
-From 2e30d39fcb4746c2d849920488dc0c8c5cce585b Mon Sep 17 00:00:00 2001
+From 962dd0d136b820a7ec1fd4260c25d5d5d9ca57be Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -41,8 +41,8 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/device/cpu/mod.rs      |  11 +
  src/arch/mips64/device/mod.rs          |  24 ++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 461 +++++++++++++++++++++++++
- src/arch/mips64/interrupt/handler.rs   | 394 +++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 469 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/handler.rs   | 396 +++++++++++++++++++++
  src/arch/mips64/interrupt/irq.rs       |  90 +++++
  src/arch/mips64/interrupt/mod.rs       |  47 +++
  src/arch/mips64/interrupt/syscall.rs   |   4 +
@@ -51,7 +51,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/misc.rs                |  60 ++++
  src/arch/mips64/mod.rs                 |  92 +++++
  src/arch/mips64/paging.rs              |  26 ++
- src/arch/mips64/start.rs               | 347 +++++++++++++++++++
+ src/arch/mips64/start.rs               | 347 ++++++++++++++++++
  src/arch/mips64/stop.rs                |  47 +++
  src/arch/mips64/time.rs                |  89 +++++
  src/arch/mod.rs                        |   6 +
@@ -65,11 +65,11 @@ Signed-off-by: belikh <io@belic.net>
  src/scheme/irq.rs                      |   2 +
  src/scheme/proc.rs                     |   3 +-
  src/startup/mod.rs                     |  20 +-
- syscall/src/arch/mips64.rs             | 232 +++++++++++++
+ syscall/src/arch/mips64.rs             | 232 ++++++++++++
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 41 files changed, 3213 insertions(+), 12 deletions(-)
+ 41 files changed, 3223 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -1055,10 +1055,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..ac8d7259
+index 00000000..d8c805ef
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,461 @@
+@@ -0,0 +1,469 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -1146,6 +1146,12 @@ index 00000000..ac8d7259
 +        "
 +        .set noreorder
 +        .set noat
++        // $27 (k1) is preserved for user code: relibc's signal trampoline
++        // needs one register no compiled code uses, to hold its last jump
++        // target. Stash it in ErrorEPC, which only reset, NMI and cache
++        // errors write; push_registers moves it into the frame before EXL
++        // is cleared. $26 (k0) stays kernel scratch.
++        dmtc0   $27, $30
 +        // Virtual coherency exceptions (R4000/R4400 with a secondary cache):
 +        // the page was last cached under another virtual colour. Drop the
 +        // primary line at this index, write the secondary line back and
@@ -1206,12 +1212,14 @@ index 00000000..ac8d7259
 +        nop
 +        cache   9, 0($26)               // Index_Store_Tag_D
 +        cache   0x17, 0($26)            // Hit_Writeback_Inv_SD
++        dmfc0   $27, $30
 +        eret
 +        nop
 +    9:
 +        mfc0    $26, $8
 +        nop
 +        cache   0x17, 0($26)            // Hit_Writeback_Inv_SD
++        dmfc0   $27, $30
 +        eret
 +        nop
 +        .set at
@@ -1522,10 +1530,10 @@ index 00000000..ac8d7259
 +}
 diff --git a/src/arch/mips64/interrupt/handler.rs b/src/arch/mips64/interrupt/handler.rs
 new file mode 100644
-index 00000000..e038a227
+index 00000000..fced8a75
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/handler.rs
-@@ -0,0 +1,394 @@
+@@ -0,0 +1,396 @@
 +//! The trap frame. Every general register is saved as 64 bits, because n32
 +//! code keeps 64-bit values in registers even though pointers are 32 bits.
 +//!
@@ -1562,8 +1570,8 @@ index 00000000..e038a227
 +    pub s7: u64, // $23
 +    pub t8: u64, // $24
 +    pub t9: u64, // $25
-+    pub k0: u64, // $26 (scratch, not restored)
-+    pub k1: u64, // $27 (scratch, not restored)
++    pub k0: u64, // $26 (kernel scratch, not restored)
++    pub k1: u64, // $27, preserved: the entry stashes it in ErrorEPC
 +    pub gp: u64, // $28, the thread pointer
 +    pub sp: u64, // $29
 +    pub fp: u64, // $30
@@ -1813,7 +1821,8 @@ index 00000000..e038a227
 +    sd      $24, 184($sp)
 +    sd      $25, 192($sp)
 +    sd      $zero, 200($sp)
-+    sd      $zero, 208($sp)
++    dmfc0   $8, $30
++    sd      $8, 208($sp)
 +    sd      $28, 216($sp)
 +    sd      $27, 224($sp)
 +    sd      $30, 232($sp)
@@ -1875,6 +1884,7 @@ index 00000000..e038a227
 +    ld      $23, 176($sp)
 +    ld      $24, 184($sp)
 +    ld      $25, 192($sp)
++    ld      $27, 208($sp)
 +    ld      $28, 216($sp)
 +    ld      $30, 232($sp)
 +    ld      $31, 240($sp)

@@ -1,4 +1,4 @@
-From 2f47f64ae8f0a53a666a0cd35b01e049e0fe31bb Mon Sep 17 00:00:00 2001
+From 4bfe1259e80ccee6abe9dbf9adf82d32872c73ce Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:49 +1000
 Subject: [PATCH] redox-rt, generic-rt: add mips64 n32 (SGI Indy)
@@ -18,22 +18,22 @@ Signed-off-by: belikh <io@belic.net>
  Cargo.lock                                 |   3 -
  Cargo.toml                                 |   6 +-
  Makefile                                   |   7 +-
- generic-rt/src/lib.rs                      |  19 ++
- redox-rt/src/arch/mips64.rs                | 292 +++++++++++++++++++++
+ generic-rt/src/lib.rs                      |  19 +
+ redox-rt/src/arch/mips64.rs                | 638 +++++++++++++++++++++
  redox-rt/src/arch/mod.rs                   |   5 +
- redox-rt/src/lib.rs                        |  32 ++-
+ redox-rt/src/lib.rs                        |  32 +-
  redox-rt/src/proc.rs                       |   6 +-
- redox-rt/src/signal.rs                     |   2 +-
+ redox-rt/src/signal.rs                     |   8 +-
  src/casting.rs                             |  14 +-
- src/crt0/src/lib.rs                        |  17 ++
- src/header/arch_mips64_user/cbindgen.toml  |  16 ++
- src/header/arch_mips64_user/mod.rs         |  23 ++
+ src/crt0/src/lib.rs                        |  17 +
+ src/header/arch_mips64_user/cbindgen.toml  |  16 +
+ src/header/arch_mips64_user/mod.rs         |  23 +
  src/header/dirent/mod.rs                   |  15 +-
  src/header/mod.rs                          |   1 +
  src/header/netdb/mod.rs                    |   2 +-
  src/header/setjmp/impl/mipsn32/longjmp.S   |  10 -
  src/header/setjmp/impl/mipsn32/setjmp.S    |  10 -
- src/header/setjmp/impl/mipsn32/sigsetjmp.S |  23 ++
+ src/header/setjmp/impl/mipsn32/sigsetjmp.S |  23 +
  src/header/setjmp/mod.rs                   |   1 +
  src/header/signal/redox.rs                 |  12 +-
  src/header/stdio/printf.rs                 |   5 +
@@ -42,13 +42,13 @@ Signed-off-by: belikh <io@belic.net>
  src/header/sys_procfs/mod.rs               |   2 +
  src/header/time/mod.rs                     |   4 +-
  src/header/unistd/mod.rs                   |   4 +-
- src/ld_so/dso.rs                           |  37 ++-
+ src/ld_so/dso.rs                           |  37 +-
  src/ld_so/linker.rs                        |   6 +-
  src/ld_so/mod.rs                           |   7 +
  src/lib.rs                                 |   1 +
  src/platform/redox/ptrace.rs               |  12 +
  stripcore.sh                               |   5 +-
- 33 files changed, 564 insertions(+), 53 deletions(-)
+ 33 files changed, 915 insertions(+), 54 deletions(-)
  create mode 100644 redox-rt/src/arch/mips64.rs
  create mode 100644 src/header/arch_mips64_user/cbindgen.toml
  create mode 100644 src/header/arch_mips64_user/mod.rs
@@ -152,10 +152,10 @@ index 226c366..738cd2b 100644
          let tcb_len = unsafe { Self::arch_read(offset_of!(Self, tcb_len)) };
 diff --git a/redox-rt/src/arch/mips64.rs b/redox-rt/src/arch/mips64.rs
 new file mode 100644
-index 0000000..c442ac2
+index 0000000..f82aa25
 --- /dev/null
 +++ b/redox-rt/src/arch/mips64.rs
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,638 @@
 +//! MIPS n32 (SGI Indy). Registers are 64 bits wide, pointers 32.
 +//!
 +//! Thread pointer: `$gp` (`$28`) is the MIPS thread pointer
@@ -164,17 +164,20 @@ index 0000000..c442ac2
 +//! static with no GOT, so `$gp` is otherwise unused. The kernel emulates
 +//! `rdhwr $rt, $29` with this register for compiled thread-local accesses.
 +//!
-+//! The signal trampoline is not implemented yet: `__relibc_internal_sigentry`
-+//! traps. Fork and thread start are complete.
++//! The signal trampoline keeps the TCB pointer in `$27` (k1) and makes its
++//! last jump through it. No compiled code uses k1, and the Indy kernel
++//! preserves it across exceptions for this purpose (k0 stays kernel scratch).
++//! The kernel's saved "archdep" register is not used: it is a `usize`, half
++//! the width of an n32 register.
 +
 +use core::cell::SyncUnsafeCell;
 +
 +use crate::{
 +    Tcb,
 +    proc::{FdGuard, FdGuardUpper, ForkArgs, fork_inner},
-+    signal::{PosixStackt, SigStack, get_sigaltstack},
++    signal::{PosixStackt, RtSigarea, SigStack, get_sigaltstack, inner_c},
 +};
-+use core::{ptr::NonNull, sync::atomic::Ordering};
++use core::{mem::offset_of, ptr::NonNull, sync::atomic::Ordering};
 +use redox_protocols::protocol::{ProcCall, RtSigInfo};
 +use syscall::{data::*, error::*};
 +
@@ -199,6 +202,10 @@ index 0000000..c442ac2
 +    pub tmp_a3: u64,
 +    pub tmp_a4: u64,
 +    pub tmp_a7: u64,
++    pub tmp_t5: u64,
++    pub tmp_t6: u64,
++    /// `$13` for the spurious-signal exit; only that path writes it.
++    pub spur_t1: u64,
 +
 +    pub pctl: usize, // TODO: remove
 +    pub tmp_ip: u64,
@@ -323,24 +330,344 @@ index 0000000..c442ac2
 +    .set reorder
 +"] <= [child_hook = sym child_hook]);
 +
-+// TODO: the signal trampoline. Until it exists a delivered signal traps here,
-+// which the kernel reports as a user exception.
++// The frame: 336 bytes, 16-byte aligned. The SigStack starts 8 bytes above
++// `$sp`; `regs` is 56 bytes into it, so register `$n` is at 64 + 8 * (n - 1),
++// then PC, HI and LO.
++const _: () = {
++    assert!(offset_of!(SigStack, regs) == 56);
++    assert!(offset_of!(SigStack, sig_num) == 48);
++    assert!(8 + size_of::<SigStack>() <= 336);
++    assert!(offset_of!(ArchIntRegs, pc) == 248);
++};
++
 +asmfunction!(__relibc_internal_sigentry: ["
 +    .set noreorder
++    .set noat
++    lw      $27, -28676($28)            // TCB
++    sd      $sp, {sa_tmp_sp}($27)
++    sd      $13, {sa_tmp_t1}($27)
++    sd      $14, {sa_tmp_t2}($27)
++    sd      $15, {sa_tmp_t3}($27)
++    sd      $24, {sa_tmp_t4}($27)
++    sd      $25, {sa_tmp_t5}($27)
++    sd      $11, {sa_tmp_t6}($27)
++    lw      $24, {sa_pctl}($27)
++
++    // Select a signal: the lowest pending and allowed one.
++99:
++    ld      $13, {sc_word0}($27)
++    dsrl32  $14, $13, 0                 // allowed, low word
++    and     $13, $13, $14
++    beqz    $13, 3f
++    nop
++    move    $15, $zero                  // thread signal in the first word
++2:  andi    $25, $13, 1
++    bnez    $25, 10f
++    nop
++    addiu   $15, $15, 1
++    b       2b
++    dsrl    $13, $13, 1
++
++    // No thread signal there: the process-wide word. This is a race with
++    // the other threads; whoever clears the pending bit has the signal.
++3:  ld      $13, {pctl_pending}($24)
++    dsll32  $13, $13, 0
++    dsrl32  $13, $13, 0
++    and     $13, $13, $14
++    beqz    $13, 4f
++    nop
++    li      $15, -1
++2:  andi    $25, $13, 1
++    addiu   $15, $15, 1
++    beqz    $25, 2b
++    dsrl    $13, $13, 1
++    sll     $13, $15, 3                 // * size_of SenderInfo
++    addu    $13, $13, $24
++    ld      $13, {pctl_sender_infos}($13)
++    sd      $13, {sa_tmp_id_inf}($27)
++    li      $13, 1
++    dsllv   $13, $13, $15
++5:  lld     $14, {pctl_pending}($24)
++    and     $25, $14, $13
++    beqz    $25, 4f                     // another thread took it
++    nop
++    xor     $25, $14, $13
++    scd     $25, {pctl_pending}($24)
++    beqz    $25, 5b
++    nop
++    b       9f
++    nop
++
++    // The second word, thread and process together: POSIX wants the lowest
++    // realtime signal first.
++4:  ld      $13, {sc_word1}($27)
++    ld      $14, {pctl_pending}($24)
++    dsrl32  $14, $14, 0
++    or      $25, $13, $14
++    dsrl32  $14, $13, 0
++    and     $25, $25, $14
++    beqz    $25, 7f
++    nop
++    li      $15, -1
++2:  andi    $14, $25, 1
++    addiu   $15, $15, 1
++    beqz    $14, 2b
++    dsrl    $25, $25, 1
++    li      $14, 1
++    dsllv   $14, $14, $15
++    and     $13, $13, $14
++    addiu   $15, $15, 32
++    bnez    $13, 10f                    // sent to this thread
++    nop
++
++    // A realtime signal for the process: dequeue it from the process
++    // manager. SYS_CALL(fd, payload, payload_len, metadata_len, metadata).
++    sd      $2, {sa_tmp_a7}($27)
++    sd      $4, {sa_tmp_a0}($27)
++    sd      $5, {sa_tmp_a1}($27)
++    sd      $6, {sa_tmp_a2}($27)
++    sd      $7, {sa_tmp_a3}($27)
++    sd      $8, {sa_tmp_a4}($27)
++    li      $2, {SYS_CALL}
++    la      $4, {proc_fd}
++    lw      $4, 0($4)
++    addiu   $5, $27, {sa_tmp_rt_inf}
++    addiu   $6, $15, -32
++    sw      $6, 0($5)
++    li      $6, {RTINF_SIZE}
++    li      $7, 1
++    la      $8, {proc_call}
++    syscall
++    move    $13, $2
++    ld      $2, {sa_tmp_a7}($27)
++    ld      $4, {sa_tmp_a0}($27)
++    ld      $5, {sa_tmp_a1}($27)
++    ld      $6, {sa_tmp_a2}($27)
++    ld      $7, {sa_tmp_a3}($27)
++    ld      $8, {sa_tmp_a4}($27)
++    bnez    $13, 99b                    // the only error is EAGAIN
++    nop
++    b       9f
++    nop
++
++    // A thread signal, number in $15: note the sender and clear the bit.
++10: srl     $13, $15, 5
++    bnez    $13, 2f
++    nop
++    sll     $14, $15, 3
++    addu    $14, $14, $27
++    ld      $14, {sc_sender_infos}($14)
++    sd      $14, {sa_tmp_id_inf}($27)
++2:  andi    $25, $15, 31
++    li      $14, 1
++    dsllv   $14, $14, $25
++    nor     $14, $14, $zero
++    sll     $13, $13, 3
++    addu    $13, $13, $27
++5:  lld     $25, {sc_word0}($13)
++    and     $25, $25, $14
++    scd     $25, {sc_word0}($13)
++    beqz    $25, 5b
++    nop
++    addiu   $15, $15, 64                // 64 and up: sent to the thread
++
++    // The signal is chosen. Move to the alternate stack if its action asks
++    // for it and this stack is not already inside it.
++9:  lw      $24, {sa_pctl}($27)
++    andi    $13, $15, 63
++    sll     $13, $13, 4                 // * size_of RawAction
++    addu    $13, $13, $24
++    ld      $13, {pctl_actions}($13)
++    dsll    $13, $13, 5                 // SA_ONSTACK (bit 58) to the sign bit
++    bgez    $13, 3f
++    nop
++    lw      $13, {sa_altstack_top}($27)
++    sltu    $14, $13, $sp
++    bnez    $14, 2f                     // above the alternate stack
++    nop
++    lw      $14, {sa_altstack_bottom}($27)
++    sltu    $14, $14, $sp
++    bnez    $14, 3f                     // inside it already
++    nop
++2:  move    $sp, $13
++3:
++    addiu   $sp, $sp, -336
++    li      $13, -16
++    and     $sp, $sp, $13
++
++    sd      $1, 64($sp)
++    sd      $2, 72($sp)
++    sd      $3, 80($sp)
++    sd      $4, 88($sp)
++    sd      $5, 96($sp)
++    sd      $6, 104($sp)
++    sd      $7, 112($sp)
++    sd      $8, 120($sp)
++    sd      $9, 128($sp)
++    sd      $10, 136($sp)
++    sd      $11, 144($sp)
++    sd      $12, 152($sp)
++    sd      $16, 184($sp)
++    sd      $17, 192($sp)
++    sd      $18, 200($sp)
++    sd      $19, 208($sp)
++    sd      $20, 216($sp)
++    sd      $21, 224($sp)
++    sd      $22, 232($sp)
++    sd      $23, 240($sp)
++    sd      $28, 280($sp)
++    sd      $30, 296($sp)
++    sd      $31, 304($sp)
++    ld      $13, {sa_tmp_t1}($27)
++    sd      $13, 160($sp)
++    ld      $13, {sa_tmp_t2}($27)
++    sd      $13, 168($sp)
++    ld      $13, {sa_tmp_t3}($27)
++    sd      $13, 176($sp)
++    ld      $13, {sa_tmp_t4}($27)
++    sd      $13, 248($sp)
++    ld      $13, {sa_tmp_t5}($27)
++    sd      $13, 256($sp)
++    ld      $13, {sa_tmp_t6}($27)
++    sd      $13, 144($sp)
++    sd      $zero, 264($sp)
++    sd      $zero, 272($sp)
++    ld      $13, {sa_tmp_sp}($27)
++    sd      $13, 288($sp)
++    lw      $13, {sc_saved_ip}($27)
++    sd      $13, 312($sp)
++    mfhi    $13
++    sd      $13, 320($sp)
++    mflo    $13
++    sd      $13, 328($sp)
++    sw      $15, 56($sp)                // SigStack::sig_num
++
++    addiu   $4, $sp, 8
++    la      $25, {inner}
++    jalr    $25
++    nop
++
++    ld      $13, 320($sp)
++    mthi    $13
++    ld      $13, 328($sp)
++    mtlo    $13
++    ld      $1, 64($sp)
++    ld      $2, 72($sp)
++    ld      $3, 80($sp)
++    ld      $4, 88($sp)
++    ld      $5, 96($sp)
++    ld      $6, 104($sp)
++    ld      $7, 112($sp)
++    ld      $8, 120($sp)
++    ld      $9, 128($sp)
++    ld      $10, 136($sp)
++    ld      $11, 144($sp)
++    ld      $12, 152($sp)
++    ld      $13, 160($sp)
++    ld      $14, 168($sp)
++    ld      $15, 176($sp)
++    ld      $16, 184($sp)
++    ld      $17, 192($sp)
++    ld      $18, 200($sp)
++    ld      $19, 208($sp)
++    ld      $20, 216($sp)
++    ld      $21, 224($sp)
++    ld      $22, 232($sp)
++    ld      $23, 240($sp)
++    ld      $24, 248($sp)
++    ld      $25, 256($sp)
++    ld      $30, 296($sp)
++    ld      $31, 304($sp)
++    ld      $27, 312($sp)           // the new PC; the TCB pointer is done with
 +    .global __relibc_internal_sigentry_crit_first
 +__relibc_internal_sigentry_crit_first:
++    ld      $sp, 288($sp)
 +    .global __relibc_internal_sigentry_crit_second
 +__relibc_internal_sigentry_crit_second:
++    jr      $27
++    nop
++
++    // A spurious signal: nothing was pending. Signals are still disabled.
++    // If this entry interrupted the exit below, its slots already hold the
++    // values that exit needs, so they are left alone.
++7:  ld      $sp, {sa_tmp_sp}($27)
++    lw      $13, {sc_saved_ip}($27)
++    la      $14, __relibc_internal_sigentry_crit_third
++    sltu    $15, $13, $14
++    bnez    $15, 8f
++    nop
++    la      $14, __relibc_internal_sigentry_crit_end
++    sltu    $15, $13, $14
++    bnez    $15, 6f
++    nop
++8:  sd      $13, {sa_tmp_ip}($27)
++    ld      $14, {sa_tmp_t1}($27)
++    sd      $14, {sa_spur_t1}($27)
++6:  ld      $14, {sa_tmp_t2}($27)
++    ld      $15, {sa_tmp_t3}($27)
++    ld      $24, {sa_tmp_t4}($27)
++    ld      $25, {sa_tmp_t5}($27)
++    ld      $11, {sa_tmp_t6}($27)
++    // Allow delivery again: clear INHIBIT_DELIVERY (bit 0).
++    lw      $13, {sc_control}($27)
++    ori     $13, $13, 1
++    xori    $13, $13, 1
++    sw      $13, {sc_control}($27)
 +    .global __relibc_internal_sigentry_crit_third
 +__relibc_internal_sigentry_crit_third:
++    ld      $13, {sa_spur_t1}($27)
 +    .global __relibc_internal_sigentry_crit_fourth
 +__relibc_internal_sigentry_crit_fourth:
++    ld      $27, {sa_tmp_ip}($27)
 +    .global __relibc_internal_sigentry_crit_fifth
 +__relibc_internal_sigentry_crit_fifth:
-+    break   1
++    jr      $27
 +    nop
++    .global __relibc_internal_sigentry_crit_end
++__relibc_internal_sigentry_crit_end:
++    .set at
 +    .set reorder
-+"] <= []);
++"] <= [
++    sc_word0 = const (TCB_SC + offset_of!(Sigcontrol, word)),
++    sc_word1 = const (TCB_SC + offset_of!(Sigcontrol, word) + 8),
++    sc_saved_ip = const (TCB_SC + offset_of!(Sigcontrol, saved_ip)),
++    sc_sender_infos = const (TCB_SC + offset_of!(Sigcontrol, sender_infos)),
++    sc_control = const (TCB_SC + offset_of!(Sigcontrol, control_flags)),
++
++    sa_pctl = const (TCB_SA + offset_of!(SigArea, pctl)),
++    sa_tmp_sp = const (TCB_SA + offset_of!(SigArea, tmp_sp)),
++    sa_tmp_t1 = const (TCB_SA + offset_of!(SigArea, tmp_t1)),
++    sa_tmp_t2 = const (TCB_SA + offset_of!(SigArea, tmp_t2)),
++    sa_tmp_t3 = const (TCB_SA + offset_of!(SigArea, tmp_t3)),
++    sa_tmp_t4 = const (TCB_SA + offset_of!(SigArea, tmp_t4)),
++    sa_tmp_t5 = const (TCB_SA + offset_of!(SigArea, tmp_t5)),
++    sa_tmp_t6 = const (TCB_SA + offset_of!(SigArea, tmp_t6)),
++    sa_spur_t1 = const (TCB_SA + offset_of!(SigArea, spur_t1)),
++    sa_tmp_a0 = const (TCB_SA + offset_of!(SigArea, tmp_a0)),
++    sa_tmp_a1 = const (TCB_SA + offset_of!(SigArea, tmp_a1)),
++    sa_tmp_a2 = const (TCB_SA + offset_of!(SigArea, tmp_a2)),
++    sa_tmp_a3 = const (TCB_SA + offset_of!(SigArea, tmp_a3)),
++    sa_tmp_a4 = const (TCB_SA + offset_of!(SigArea, tmp_a4)),
++    sa_tmp_a7 = const (TCB_SA + offset_of!(SigArea, tmp_a7)),
++    sa_tmp_ip = const (TCB_SA + offset_of!(SigArea, tmp_ip)),
++    sa_tmp_id_inf = const (TCB_SA + offset_of!(SigArea, tmp_id_inf)),
++    sa_tmp_rt_inf = const (TCB_SA + offset_of!(SigArea, tmp_rt_inf)),
++    sa_altstack_top = const (TCB_SA + offset_of!(SigArea, altstack_top)),
++    sa_altstack_bottom = const (TCB_SA + offset_of!(SigArea, altstack_bottom)),
++
++    pctl_actions = const offset_of!(SigProcControl, actions),
++    pctl_pending = const offset_of!(SigProcControl, pending),
++    pctl_sender_infos = const offset_of!(SigProcControl, sender_infos),
++    inner = sym inner_c,
++    SYS_CALL = const syscall::SYS_CALL,
++    RTINF_SIZE = const size_of::<RtSigInfo>(),
++    proc_fd = sym PROC_FD,
++    proc_call = sym PROC_CALL,
++]);
++
++/// Offsets from the TCB to the signal control block and to the SigArea.
++const TCB_SC: usize = offset_of!(crate::Tcb, os_specific) + offset_of!(RtSigarea, control);
++const TCB_SA: usize = offset_of!(crate::Tcb, os_specific) + offset_of!(RtSigarea, arch);
 +
 +// The new thread's stack holds [function, a0, a1, a2, a3, a4, a5] as 32-bit words.
 +asmfunction!(__relibc_internal_rlct_clone_ret: ["
@@ -418,16 +745,34 @@ index 0000000..c442ac2
 +}
 +
 +pub unsafe fn arch_pre(stack: &mut SigStack, area: &mut SigArea) -> PosixStackt {
-+    // No trampoline yet, so no critical section to repair.
-+    let _ = (
-+        __relibc_internal_sigentry_crit_first as usize,
-+        __relibc_internal_sigentry_crit_second as usize,
-+        __relibc_internal_sigentry_crit_third as usize,
-+        __relibc_internal_sigentry_crit_fourth as usize,
-+        __relibc_internal_sigentry_crit_fifth as usize,
-+    );
++    // SP and PC cannot be restored in one instruction. A signal that lands
++    // inside one of the trampoline's two exits finds them half done; finish
++    // the exit here, on the interrupted context, so that returning from this
++    // signal goes straight to where that exit was heading. `int_regs[n - 1]`
++    // is `$n`: 12 is `$13`, 26 is `$27`, 28 is `$sp`.
++    let pc = stack.regs.pc as usize;
++    if pc == __relibc_internal_sigentry_crit_first as usize {
++        // Redo `ld $sp, 288($sp)`, then the jump.
++        let frame = stack.regs.int_regs[28] as usize as *const u64;
++        stack.regs.int_regs[28] = unsafe { frame.byte_add(SP_SLOT).read() };
++        stack.regs.pc = stack.regs.int_regs[26];
++    } else if pc == __relibc_internal_sigentry_crit_second as usize
++        || pc == __relibc_internal_sigentry_crit_fifth as usize
++    {
++        stack.regs.pc = stack.regs.int_regs[26];
++    } else if pc == __relibc_internal_sigentry_crit_third as usize {
++        stack.regs.int_regs[12] = area.spur_t1;
++        stack.regs.int_regs[26] = area.tmp_ip;
++        stack.regs.pc = area.tmp_ip;
++    } else if pc == __relibc_internal_sigentry_crit_fourth as usize {
++        stack.regs.int_regs[26] = area.tmp_ip;
++        stack.regs.pc = area.tmp_ip;
++    }
 +    get_sigaltstack(area, stack.regs.int_regs[28] as usize).into()
 +}
++
++/// Offset of the saved `$sp` from the trampoline's frame pointer.
++const SP_SLOT: usize = 288;
 +
 +/// map to `si_signo` and `si_code`.
 +pub(crate) fn map_err_code(_excp: &syscall::Exception) -> (i32, i32) {
@@ -447,7 +792,8 @@ index 0000000..c442ac2
 +}
 +
 +pub(crate) static PROC_FD: SyncUnsafeCell<usize> = SyncUnsafeCell::new(usize::MAX);
-+static PROC_CALL: [usize; 1] = [ProcCall::Sigdeq as usize];
++/// Metadata words are 64 bits on every target.
++static PROC_CALL: [u64; 1] = [ProcCall::Sigdeq as u64];
 diff --git a/redox-rt/src/arch/mod.rs b/redox-rt/src/arch/mod.rs
 index e763dc9..d1be614 100644
 --- a/redox-rt/src/arch/mod.rs
@@ -550,7 +896,7 @@ index 3fb375f..5d94e3b 100644
              let buf = create_set_addr_space_buf_for_fork(
                  new_addr_space_fd.as_raw_fd(),
 diff --git a/redox-rt/src/signal.rs b/redox-rt/src/signal.rs
-index 19e7edb..afa63fc 100644
+index 19e7edb..56b6312 100644
 --- a/redox-rt/src/signal.rs
 +++ b/redox-rt/src/signal.rs
 @@ -46,7 +46,7 @@ pub struct SigStack {
@@ -562,6 +908,19 @@ index 19e7edb..afa63fc 100644
      _pad: [usize; 3], // pad from 9*4 to 12*4
  
      pub link: *mut SigStack,
+@@ -789,7 +789,11 @@ pub fn setup_sighandler(tcb: &RtTcb, first_thread: bool) {
+         // equivalent to not using any altstack at all (the default).
+         arch.altstack_top = usize::MAX;
+         arch.altstack_bottom = 0;
+-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
++        #[cfg(any(
++            target_arch = "aarch64",
++            target_arch = "riscv64",
++            target_arch = "mips64"
++        ))]
+         {
+             arch.pctl = core::ptr::addr_of!(PROC_CONTROL_STRUCT) as usize;
+         }
 diff --git a/src/casting.rs b/src/casting.rs
 index 154dede..eb587df 100644
 --- a/src/casting.rs

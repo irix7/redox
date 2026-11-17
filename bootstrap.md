@@ -726,9 +726,11 @@ and none of them is on the critical path to "the machine runs our code".
   `/scheme/sys/env`). The root filesystem is a webfs store over HTTP mounted as scheme
   `file` (docs/webfs.md): the netboot image is 5.39 MB and holds only init, randd, seeqd,
   netstack and webfs; the shell, dhcpd and zerod load from the store. Programs spawn from
-  `/usr/bin`. Open: `poll()` on two pipes fails with EOPNOTSUPP (std `Command::output`
-  panics), the signal trampoline is still a stub, cache flushing on every trap is slow
-  (reads at about 45 KiB/s), the machine does not answer ping.
+  `/usr/bin`. `poll()` works (upstream's event kcall is applied on the kernel pin) and
+  signals are delivered through a real trampoline (the kernel preserves `$k1` for it);
+  `sigtest` and `polltest` in the shell check both. Open: cache flushing on every trap is
+  slow (reads at about 45 KiB/s), the machine does not answer ping, the store server is
+  started by hand.
 - **T9 — next.** First real-hardware boot and whatever it shows; shrink the initfs (4.4 MiB
   against a 2 MiB budget); an entropy source for `randd`; the serial interrupt (INT3
   mappable lines) instead of polling; `ion` in place of the bring-up shell.

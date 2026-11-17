@@ -28,7 +28,7 @@ fn net_line() -> String {
 fn help(out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "commands:\r\n  help               this list\r\n  echo TEXT          print TEXT\r\n  ls [DIR]           list a directory (default {BIN_DIR})\r\n  cat FILE           print a file\r\n  ps                 contexts (/scheme/sys/context)\r\n  mem                memory (/scheme/sys/memory... if present)\r\n  net                interface address\r\n  uname              kernel identification\r\n  dmesg              kernel log\r\n  sum FILE           size and CRC-32 of a file\r\n  peek ADDR [LEN]    hex dump of physical memory\r\n  sleep SECONDS      wait; checks the timer against a wall clock\r\n  bench              time a compute loop, syscalls and page faults\r\n  reboot             reset to the PROM\r\n  PROGRAM [ARGS]     run {BIN_DIR}/PROGRAM\r"
+        "commands:\r\n  help               this list\r\n  echo TEXT          print TEXT\r\n  ls [DIR]           list a directory (default {BIN_DIR})\r\n  cat FILE           print a file\r\n  ps                 contexts (/scheme/sys/context)\r\n  mem                memory (/scheme/sys/memory... if present)\r\n  net                interface address\r\n  uname              kernel identification\r\n  dmesg              kernel log\r\n  sum FILE           size and CRC-32 of a file\r\n  peek ADDR [LEN]    hex dump of physical memory\r\n  sleep SECONDS      wait; checks the timer against a wall clock\r\n  bench              time a compute loop, syscalls and page faults\r\n  polltest           pipe, fcntl and poll, one call at a time\r\n  sigtest            deliver SIGUSR1 to a handler 1000 times around a checksum\r\n  reboot             reset to the PROM\r\n  PROGRAM [ARGS]     run {BIN_DIR}/PROGRAM\r"
     );
 }
 
@@ -105,6 +105,7 @@ fn run(line: &str, out: &mut dyn Write) -> bool {
         }
         "bench" => bench(out),
         "polltest" => polltest(out),
+        "sigtest" => sigtest(out),
         "reboot" => {
             let _ = writeln!(out, "rebooting to the PROM\r");
             let _ = out.flush();
@@ -410,4 +411,54 @@ fn polltest(out: &mut dyn Write) {
         let r = poll(set.as_mut_ptr(), 1, 100);
         let _ = writeln!(out, "poll ready -> {r} revents {:#x} {}\r", set[0].revents, if r < 0 { err().to_string() } else { String::new() });
     }
+}
+
+static SIGNAL_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+extern "C" fn on_signal(_signal: i32) {
+    SIGNAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+unsafe extern "C" {
+    fn signal(signal: i32, handler: usize) -> usize;
+    fn raise(signal: i32) -> i32;
+}
+
+/// Signal delivery through the trampoline: 1000 signals to a handler, each
+/// in the middle of a running checksum. The checksum must match the same
+/// loop without signals, or the trampoline lost a register.
+fn sigtest(out: &mut dyn Write) {
+    use std::sync::atomic::Ordering;
+    const SIGUSR1: i32 = 10;
+    fn step(x: u64, i: u64) -> u64 {
+        x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i).rotate_left(17)
+    }
+    let mut plain: u64 = 1;
+    for i in 0..1000u64 {
+        for j in 0..100 {
+            plain = step(plain, i ^ j);
+        }
+    }
+    SIGNAL_HITS.store(0, Ordering::Relaxed);
+    let previous = unsafe { signal(SIGUSR1, on_signal as usize) };
+    let mut with: u64 = 1;
+    let mut failed = 0;
+    for i in 0..1000u64 {
+        for j in 0..50 {
+            with = step(with, i ^ j);
+        }
+        if unsafe { raise(SIGUSR1) } != 0 {
+            failed += 1;
+        }
+        for j in 50..100 {
+            with = step(with, i ^ j);
+        }
+    }
+    unsafe { signal(SIGUSR1, previous) };
+    let hits = SIGNAL_HITS.load(Ordering::Relaxed);
+    let verdict = if hits == 1000 && failed == 0 && with == plain { "ok" } else { "FAILED" };
+    let _ = writeln!(
+        out,
+        "sigtest {verdict}: {hits} handler calls, {failed} raise errors, checksum {with:#x} (expect {plain:#x})\r"
+    );
 }
