@@ -1,4 +1,4 @@
-From 1b7710256a2c6d47a2ef70d0893a43dcda28d5ca Mon Sep 17 00:00:00 2001
+From ee26081bde853fa17bd377b5e36af4d4c90a5bd9 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -52,7 +52,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/mod.rs                 |  92 +++++
  src/arch/mips64/paging.rs              |  26 ++
  src/arch/mips64/start.rs               | 321 ++++++++++++++++++
- src/arch/mips64/stop.rs                |  30 ++
+ src/arch/mips64/stop.rs                |  43 +++
  src/arch/mips64/time.rs                |  61 ++++
  src/arch/mod.rs                        |   6 +
  src/context/arch/mips64.rs             | 217 ++++++++++++
@@ -69,7 +69,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 41 files changed, 3059 insertions(+), 12 deletions(-)
+ 41 files changed, 3072 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -2576,22 +2576,35 @@ index 00000000..dd570a1d
 +const PHYS_OFFSET: usize = <crate::arch::CurrentRmmArch as rmm::Arch>::PHYS_OFFSET;
 diff --git a/src/arch/mips64/stop.rs b/src/arch/mips64/stop.rs
 new file mode 100644
-index 00000000..7614c259
+index 00000000..586521b6
 --- /dev/null
 +++ b/src/arch/mips64/stop.rs
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,43 @@
 +use crate::sync::CleanLockToken;
 +
-+/// Jump to the PROM's reset entry. The PROM re-sizes memory and shows its
-+/// menu again, so this is a warm reboot.
++/// Reset the machine through the memory controller: CPUCTRL0 bit 4 (SYSINIT)
++/// pulses the system reset line, so the PROM starts from a real reset with
++/// every device in its power-on state. Jumping to the PROM's entry instead
++/// left the real machine with a blank screen.
 +pub unsafe fn kreset() -> ! {
 +    println!("kreset");
 +    unsafe { emergency_reset() }
 +}
 +
 +pub unsafe fn emergency_reset() -> ! {
++    const MC_CPUCTRL0: *mut u32 = 0xBFA0_0004 as *mut u32;
++    const SYSINIT: u32 = 0x10;
 +    unsafe {
++        super::interrupt::disable();
++        MC_CPUCTRL0.write_volatile(MC_CPUCTRL0.read_volatile() | SYSINIT);
++        // The reset takes effect within a few bus cycles. If it does not,
++        // fall back to the PROM's entry with its own vectors selected.
++        for _ in 0..1_000_000 {
++            core::hint::spin_loop();
++        }
 +        core::arch::asm!(
++            "li $8, 0x00400000", // Status: BEV only
++            "mtc0 $8, $12",
 +            "li $8, 0xBFC00000",
 +            "jr $8",
 +            "nop",
