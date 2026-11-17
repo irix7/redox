@@ -1,6 +1,6 @@
 diff -ruN libc-0.2.190/src/unix/redox/mod.rs libc-0.2.190/src/unix/redox/mod.rs
 --- libc-0.2.190/src/unix/redox/mod.rs	2006-07-24 11:21:28.000000000 +1000
-+++ libc-0.2.190/src/unix/redox/mod.rs	2026-11-17 09:53:11.870191309 +1000
++++ libc-0.2.190/src/unix/redox/mod.rs	2026-11-17 13:32:52.077381208 +1000
 @@ -38,7 +38,8 @@
      target_arch = "x86",
      target_arch = "x86_64",
@@ -28,7 +28,7 @@ diff -ruN libc-0.2.190/src/unix/redox/mod.rs libc-0.2.190/src/unix/redox/mod.rs
 +    // MIPS n32 (SGI Indy): 31 general registers, pc, hi, lo as u64, 16 bytes spare.
 +    #[cfg(target_arch = "mips64")]
 +    pub struct mcontext {
-+        _opaque: [c_uchar; 288],
++        _opaque: [c_ulonglong; 36],
 +    }
  }
  

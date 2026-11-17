@@ -1,4 +1,4 @@
-From 20202d7baf0bb5811a5e8a6da7f27b6df70e6440 Mon Sep 17 00:00:00 2001
+From a242c77a2645f6ac589ade031a7694ff826bd885 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:49 +1000
 Subject: [PATCH] redox-rt, generic-rt: add mips64 n32 (SGI Indy)
@@ -16,7 +16,7 @@ Signed-off-by: belikh <io@jupiter.au>
 ---
  Cargo.lock                                 |   3 -
  Cargo.toml                                 |   6 +-
- Makefile                                   |   5 +
+ Makefile                                   |   7 +-
  generic-rt/src/lib.rs                      |  19 ++
  redox-rt/src/arch/mips64.rs                | 289 +++++++++++++++++++++
  redox-rt/src/arch/mod.rs                   |   5 +
@@ -29,11 +29,14 @@ Signed-off-by: belikh <io@jupiter.au>
  src/header/arch_mips64_user/mod.rs         |  23 ++
  src/header/mod.rs                          |   1 +
  src/header/netdb/mod.rs                    |   2 +-
+ src/header/setjmp/impl/mipsn32/longjmp.S   |  10 -
+ src/header/setjmp/impl/mipsn32/setjmp.S    |  10 -
  src/header/setjmp/impl/mipsn32/sigsetjmp.S |  23 ++
  src/header/setjmp/mod.rs                   |   1 +
- src/header/signal/redox.rs                 |  16 +-
+ src/header/signal/redox.rs                 |  12 +-
  src/header/stdio/printf.rs                 |   5 +
  src/header/stdlib/mod.rs                   |   4 +-
+ src/header/sys_epoll/mod.rs                |  14 +-
  src/header/sys_procfs/mod.rs               |   2 +
  src/header/time/mod.rs                     |   4 +-
  src/header/unistd/mod.rs                   |   4 +-
@@ -42,7 +45,8 @@ Signed-off-by: belikh <io@jupiter.au>
  src/ld_so/mod.rs                           |   7 +
  src/lib.rs                                 |   1 +
  src/platform/redox/ptrace.rs               |  12 +
- 28 files changed, 533 insertions(+), 29 deletions(-)
+ stripcore.sh                               |   5 +-
+ 32 files changed, 547 insertions(+), 52 deletions(-)
  create mode 100644 redox-rt/src/arch/mips64.rs
  create mode 100644 src/header/arch_mips64_user/cbindgen.toml
  create mode 100644 src/header/arch_mips64_user/mod.rs
@@ -84,7 +88,7 @@ index 400489e..de725f5 100644
 +libc = { path = "../../../../vendor/libc-0.2.191" }
 +#redox_syscall = {git = "https://gitlab.redox-os.org/redox-os/kernel/"}
 diff --git a/Makefile b/Makefile
-index 4534cf8..ba4c6e1 100644
+index 4534cf8..35ebb9c 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -13,7 +13,12 @@ export OBJCOPY?=objcopy
@@ -100,6 +104,15 @@ index 4534cf8..ba4c6e1 100644
  EXCEPT_MATH=-not -name "math"
  FEATURE_MATH=
  ifneq ($(USE_RUST_LIBM),)
+@@ -190,7 +195,7 @@ $(BUILD)/release/librelibc.a: $(SRC)
+ 	$(CARGO) rustc --release $(CARGOFLAGS) $(FEATURE_MATH) -- --emit link=$@ $(RUSTCFLAGS)
+ 	@# TODO: Better to only allow a certain whitelisted set of symbols? Perhaps
+ 	@# use some cbindgen hook, specify them manually, or grep for #[unsafe(no_mangle)].
+-	./renamesyms.sh "$@" "$(BUILD)/release/deps/"
++	./renamesyms.sh "$@" "$(BUILD)/release/"
+ 	./stripcore.sh "$@"
+ 	touch $@
+ 
 diff --git a/generic-rt/src/lib.rs b/generic-rt/src/lib.rs
 index 226c366..738cd2b 100644
 --- a/generic-rt/src/lib.rs
@@ -722,6 +735,47 @@ index 1a44bf2..14a5b31 100644
              let cp_s_addr = unsafe { mem::transmute::<[c_char; 4], u32>(cp_slice) };
              #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
              let cp_s_addr = u32::from_ne_bytes(cp_slice);
+diff --git a/src/header/setjmp/impl/mipsn32/longjmp.S b/src/header/setjmp/impl/mipsn32/longjmp.S
+index 30c3ee0..eddd6fa 100644
+--- a/src/header/setjmp/impl/mipsn32/longjmp.S
++++ b/src/header/setjmp/impl/mipsn32/longjmp.S
+@@ -10,16 +10,6 @@ longjmp:
+ 	nop
+ 	addu	$2, $2, 1
+ 1:
+-#ifndef __mips_soft_float
+-	ldc1	$24, 96($4)
+-	ldc1	$25, 104($4)
+-	ldc1	$26, 112($4)
+-	ldc1	$27, 120($4)
+-	ldc1	$28, 128($4)
+-	ldc1	$29, 136($4)
+-	ldc1	$30, 144($4)
+-	ldc1	$31, 152($4)
+-#endif
+ 	ld	$ra, 0($4)
+ 	ld	$sp, 8($4)
+ 	ld	$gp, 16($4)
+diff --git a/src/header/setjmp/impl/mipsn32/setjmp.S b/src/header/setjmp/impl/mipsn32/setjmp.S
+index b9646c2..4235d27 100644
+--- a/src/header/setjmp/impl/mipsn32/setjmp.S
++++ b/src/header/setjmp/impl/mipsn32/setjmp.S
+@@ -20,15 +20,5 @@ setjmp:
+ 	sd	$22, 72($4)
+ 	sd	$23, 80($4)
+ 	sd	$30, 88($4)
+-#ifndef __mips_soft_float
+-	sdc1	$24, 96($4)
+-	sdc1	$25, 104($4)
+-	sdc1	$26, 112($4)
+-	sdc1	$27, 120($4)
+-	sdc1	$28, 128($4)
+-	sdc1	$29, 136($4)
+-	sdc1	$30, 144($4)
+-	sdc1	$31, 152($4)
+-#endif
+ 	jr	$ra
+ 	li	$2, 0
 diff --git a/src/header/setjmp/impl/mipsn32/sigsetjmp.S b/src/header/setjmp/impl/mipsn32/sigsetjmp.S
 new file mode 100644
 index 0000000..3e56b9b
@@ -764,23 +818,19 @@ index e915bf2..f56afec 100644
  
  //Each platform has different sizes for sigjmp_buf, currently only x86_64 is supported
 diff --git a/src/header/signal/redox.rs b/src/header/signal/redox.rs
-index 66d0c00..9995388 100644
+index 66d0c00..c0e0dc0 100644
 --- a/src/header/signal/redox.rs
 +++ b/src/header/signal/redox.rs
-@@ -1,6 +1,11 @@
- use redox_rt::signal::SiginfoAbi;
+@@ -2,7 +2,7 @@ use redox_rt::signal::SiginfoAbi;
  
--#[cfg(any(target_arch = "x86", target_arch = "aarch64", target_arch = "riscv64"))]
-+#[cfg(any(
-+    target_arch = "x86",
-+    target_arch = "aarch64",
-+    target_arch = "riscv64",
-+    target_arch = "mips64"
-+))]
+ #[cfg(any(target_arch = "x86", target_arch = "aarch64", target_arch = "riscv64"))]
  use crate::platform::types::c_uchar;
- use crate::platform::types::{c_uint, c_ulong};
+-use crate::platform::types::{c_uint, c_ulong};
++use crate::platform::types::{c_uint, c_ulong, c_ulonglong};
  
-@@ -53,7 +58,7 @@ pub struct ucontext {
+ use super::{siginfo_t, sigset_t, stack_t};
+ 
+@@ -53,7 +53,7 @@ pub struct ucontext {
      ))]
      _pad: [c_ulong; 1], // pad from 7*8 to 64
  
@@ -789,15 +839,16 @@ index 66d0c00..9995388 100644
      _pad: [c_ulong; 3], // pad from 9*4 to 12*4
  
      /// Pointer to the context that is resumed when this context returns.
-@@ -114,6 +119,13 @@ pub struct mcontext {
+@@ -114,6 +114,14 @@ pub struct mcontext {
      _opaque: [c_uchar; 520],
  }
  
 +/// MIPS n32: $1..$31, pc, hi, lo as 64-bit values, 16 bytes spare.
++/// 8-byte elements keep `uc_mcontext` at the offset of `SigStack::regs`.
 +#[cfg(target_arch = "mips64")]
 +#[repr(C)]
 +pub struct mcontext {
-+    _opaque: [c_uchar; 288],
++    _opaque: [c_ulonglong; 36],
 +}
 +
  impl From<SiginfoAbi> for siginfo_t {
@@ -835,6 +886,31 @@ index 08bbc00..c1c2bd4 100644
      c_long::try_from(k).unwrap()
  }
  
+diff --git a/src/header/sys_epoll/mod.rs b/src/header/sys_epoll/mod.rs
+index b4180e2..16553b1 100644
+--- a/src/header/sys_epoll/mod.rs
++++ b/src/header/sys_epoll/mod.rs
+@@ -129,7 +129,19 @@ pub struct epoll_event {
+ ///
+ /// Specifies data that the kernel should save and return when the
+ /// corresponding file descriptor becomes ready.
+-#[cfg(not(all(target_os = "redox", target_pointer_width = "64")))]
++/// On 32-bit Redox this is 12 bytes, the size of `syscall::Event`
++/// (three `usize`), so the union is packed to 4-byte alignment.
++#[cfg(all(target_os = "redox", target_pointer_width = "32"))]
++#[repr(C, packed(4))]
++#[derive(Clone, Copy, Default)]
++pub struct epoll_event {
++    /// Epoll events.
++    pub events: c_uint,
++    /// User data variable.
++    pub data: epoll_data,
++}
++
++#[cfg(not(target_os = "redox"))]
+ #[repr(C)]
+ #[derive(Clone, Copy, Default)]
+ pub struct epoll_event {
 diff --git a/src/header/sys_procfs/mod.rs b/src/header/sys_procfs/mod.rs
 index 0bc4a88..63708a3 100644
 --- a/src/header/sys_procfs/mod.rs
@@ -1029,6 +1105,27 @@ index f70c00f..7a3003a 100644
  #[cfg(target_arch = "riscv64")]
  #[expect(unused_variables, reason = "function not yet implemented")]
  fn inner_ptrace(
+diff --git a/stripcore.sh b/stripcore.sh
+index e711ea6..909b973 100755
+--- a/stripcore.sh
++++ b/stripcore.sh
+@@ -1,6 +1,8 @@
+ #!/usr/bin/env bash
+ 
+ # This script exists as a workaround for https://github.com/rust-lang/rust/issues/142119
++# On MIPS (soft float) the symbols are named in relocations, so objcopy cannot
++# strip them; they are weakened instead and libm's definitions win.
+ 
+ set -e
+ 
+@@ -13,5 +15,6 @@ fi
+ 
+ for sym in cbrtf ceilf copysignf fabsf fdimf floorf fmaf fmaxf fminf fmodf rintf roundf sqrtf truncf \
+             cbrt ceil copysign fabs fdim floor fmax fmin fmod rint round sqrt trunc; do \
+-    "$OBJCOPY" --globalize-symbol=$sym --strip-symbol=$sym "$target"; \
++    "$OBJCOPY" --globalize-symbol=$sym --strip-symbol=$sym "$target" 2>/dev/null || \
++    "$OBJCOPY" --globalize-symbol=$sym --weaken-symbol=$sym "$target"; \
+ done
 -- 
 2.56.0
 
