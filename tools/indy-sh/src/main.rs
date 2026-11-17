@@ -104,6 +104,7 @@ fn run(line: &str, out: &mut dyn Write) -> bool {
             let _ = writeln!(out, "slept {seconds} s\r");
         }
         "bench" => bench(out),
+        "polltest" => polltest(out),
         "reboot" => {
             let _ = writeln!(out, "rebooting to the PROM\r");
             let _ = out.flush();
@@ -371,4 +372,42 @@ fn sum(out: &mut dyn Write, path: &str) {
         !crc,
         start.elapsed().as_millis()
     );
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+unsafe extern "C" {
+    fn pipe(fds: *mut i32) -> i32;
+    fn fcntl(fd: i32, cmd: i32, arg: usize) -> i32;
+    fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+    fn write(fd: i32, buf: *const u8, len: usize) -> isize;
+}
+
+/// The calls std makes to read a child's two pipes, one at a time, with the
+/// error of each. Finds which one this port gets wrong.
+fn polltest(out: &mut dyn Write) {
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    const O_NONBLOCK: usize = 0x0004_0000;
+    let err = || std::io::Error::last_os_error();
+    let mut fds = [0i32; 2];
+    unsafe {
+        let r = pipe(fds.as_mut_ptr());
+        let _ = writeln!(out, "pipe -> {r} ({:?}) {}\r", fds, if r < 0 { err().to_string() } else { String::new() });
+        let flags = fcntl(fds[0], F_GETFL, 0);
+        let _ = writeln!(out, "F_GETFL -> {flags:#x} {}\r", if flags < 0 { err().to_string() } else { String::new() });
+        let r = fcntl(fds[0], F_SETFL, flags as usize | O_NONBLOCK);
+        let _ = writeln!(out, "F_SETFL -> {r} {}\r", if r < 0 { err().to_string() } else { String::new() });
+        let mut set = [PollFd { fd: fds[0], events: 1, revents: 0 }];
+        let r = poll(set.as_mut_ptr(), 1, 100);
+        let _ = writeln!(out, "poll empty -> {r} revents {:#x} {}\r", set[0].revents, if r < 0 { err().to_string() } else { String::new() });
+        let _ = write(fds[1], b"x".as_ptr(), 1);
+        let r = poll(set.as_mut_ptr(), 1, 100);
+        let _ = writeln!(out, "poll ready -> {r} revents {:#x} {}\r", set[0].revents, if r < 0 { err().to_string() } else { String::new() });
+    }
 }

@@ -1,4 +1,4 @@
-From 2eeb14dd0a48b7994850833589aecad5df02d4d7 Mon Sep 17 00:00:00 2001
+From 2e30d39fcb4746c2d849920488dc0c8c5cce585b Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
