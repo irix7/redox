@@ -1,4 +1,4 @@
-From 4efa1ce9f5aebd470ee147a2aefba66bd3fb70e9 Mon Sep 17 00:00:00 2001
+From 781a41dd8c530bbd7022fa30bff677e4ef270aab Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -58,7 +58,7 @@ Signed-off-by: belikh <io@belic.net>
  src/context/mod.rs                     |   4 +
  src/devices/mod.rs                     |   2 +
  src/devices/serial.rs                  |  13 +
- src/devices/uart_z85c30.rs             |  86 ++++++
+ src/devices/uart_z85c30.rs             | 120 ++++++++
  src/main.rs                            |   1 +
  src/panic.rs                           |  15 +
  src/scheme/irq.rs                      |   2 +
@@ -68,7 +68,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 40 files changed, 2797 insertions(+), 12 deletions(-)
+ 40 files changed, 2831 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/consts.rs
@@ -2750,10 +2750,10 @@ index 1b3435dc..8e0ad399 100644
  }
 diff --git a/src/devices/uart_z85c30.rs b/src/devices/uart_z85c30.rs
 new file mode 100644
-index 00000000..75bc3dc0
+index 00000000..d5ef56bc
 --- /dev/null
 +++ b/src/devices/uart_z85c30.rs
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,120 @@
 +//! Zilog Z85C30 ESCC inside the SGI Indy's IOC2, polled.
 +//!
 +//! Registers are indirect: write the register number to the control port,
@@ -2771,9 +2771,27 @@ index 00000000..75bc3dc0
 +/// baud = PCLK / (2 * 16 * (tc + 2)); tc = 10 gives 9562.
 +const BAUD_9600_TIME_CONSTANT: u8 = 10;
 +
++/// Polls of RR0 before the transmitter is declared stuck: about 40 ms, where
++/// a character takes 1 ms.
++const TX_POLL_LIMIT: u32 = 20_000;
++
 +pub struct SerialPort {
 +    control: *mut u8,
 +    data: *mut u8,
++    /// The transmitter never became ready once; output is dropped from then
++    /// on so a dead port cannot hang the console.
++    tx_stuck: bool,
++}
++
++/// Recovery time between accesses to the chip. The Z85C30 needs a few PCLK
++/// cycles after each access; back-to-back accesses can corrupt a register
++/// write on real hardware. Eight uncached bus reads take over a microsecond.
++#[inline(never)]
++fn recover() {
++    const MC_SYSID: *const u32 = 0xBFA0_001C as *const u32;
++    for _ in 0..8 {
++        let _ = unsafe { read_volatile(MC_SYSID) };
++    }
 +}
 +
 +// The port is only ever reached through the COM1 mutex.
@@ -2786,18 +2804,23 @@ index 00000000..75bc3dc0
 +        Self {
 +            control: control as *mut u8,
 +            data: (control + 4) as *mut u8,
++            tx_stuck: false,
 +        }
 +    }
 +
 +    fn write_reg(&mut self, reg: u8, value: u8) {
 +        unsafe {
 +            write_volatile(self.control, reg);
++            recover();
 +            write_volatile(self.control, value);
++            recover();
 +        }
 +    }
 +
 +    fn rr0(&self) -> u8 {
-+        unsafe { read_volatile(self.control) }
++        let value = unsafe { read_volatile(self.control) };
++        recover();
++        value
 +    }
 +
 +    /// 9600 8N1, no interrupts, DTR and RTS asserted.
@@ -2818,17 +2841,28 @@ index 00000000..75bc3dc0
 +
 +    pub fn receive(&mut self) -> Option<u8> {
 +        if self.rr0() & RR0_RX_AVAILABLE != 0 {
-+            Some(unsafe { read_volatile(self.data) })
++            let byte = unsafe { read_volatile(self.data) };
++            recover();
++            Some(byte)
 +        } else {
 +            None
 +        }
 +    }
 +
 +    pub fn send(&mut self, byte: u8) {
++        if self.tx_stuck {
++            return;
++        }
++        let mut polls = 0;
 +        while self.rr0() & RR0_TX_EMPTY == 0 {
-+            core::hint::spin_loop();
++            polls += 1;
++            if polls > TX_POLL_LIMIT {
++                self.tx_stuck = true;
++                return;
++            }
 +        }
 +        unsafe { write_volatile(self.data, byte) }
++        recover();
 +    }
 +
 +    pub fn write(&mut self, buf: &[u8]) {
