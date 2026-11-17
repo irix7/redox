@@ -1,4 +1,4 @@
-From 7105ca37cd9e70bd651ae15481554fc820444345 Mon Sep 17 00:00:00 2001
+From 1b7710256a2c6d47a2ef70d0893a43dcda28d5ca Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -30,46 +30,46 @@ Signed-off-by: belikh <io@belic.net>
 ---
  Makefile                               |   7 +
  linkers/mips64.ld                      |  60 ++++
- rmm/src/arch/mips.rs                   | 230 +++++++++++++++
+ rmm/src/arch/mips.rs                   | 236 +++++++++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
  src/arch/mips64/cache.rs               |  93 ++++++
  src/arch/mips64/consts.rs              |  24 ++
  src/arch/mips64/cp0.rs                 | 112 +++++++
  src/arch/mips64/debug.rs               |  24 ++
- src/arch/mips64/device/arcs.rs         | 174 +++++++++++
+ src/arch/mips64/device/arcs.rs         | 174 ++++++++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
  src/arch/mips64/device/mod.rs          |  24 ++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 386 ++++++++++++++++++++++++
- src/arch/mips64/interrupt/handler.rs   | 394 +++++++++++++++++++++++++
- src/arch/mips64/interrupt/irq.rs       |  90 ++++++
+ src/arch/mips64/interrupt/exception.rs | 442 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/handler.rs   | 394 ++++++++++++++++++++++
+ src/arch/mips64/interrupt/irq.rs       |  90 +++++
  src/arch/mips64/interrupt/mod.rs       |  47 +++
  src/arch/mips64/interrupt/syscall.rs   |   4 +
  src/arch/mips64/interrupt/trace.rs     |  19 ++
  src/arch/mips64/ipi.rs                 |  24 ++
  src/arch/mips64/misc.rs                |  60 ++++
- src/arch/mips64/mod.rs                 |  92 ++++++
+ src/arch/mips64/mod.rs                 |  92 +++++
  src/arch/mips64/paging.rs              |  26 ++
- src/arch/mips64/start.rs               | 307 +++++++++++++++++++
+ src/arch/mips64/start.rs               | 321 ++++++++++++++++++
  src/arch/mips64/stop.rs                |  30 ++
  src/arch/mips64/time.rs                |  61 ++++
  src/arch/mod.rs                        |   6 +
- src/context/arch/mips64.rs             | 217 ++++++++++++++
+ src/context/arch/mips64.rs             | 217 ++++++++++++
  src/context/mod.rs                     |   4 +
  src/devices/mod.rs                     |   2 +
  src/devices/serial.rs                  |  13 +
- src/devices/uart_z85c30.rs             | 120 ++++++++
+ src/devices/uart_z85c30.rs             | 120 +++++++
  src/main.rs                            |   1 +
  src/panic.rs                           |  15 +
  src/scheme/irq.rs                      |   2 +
  src/scheme/proc.rs                     |   3 +-
  src/startup/mod.rs                     |  20 +-
- syscall/src/arch/mips64.rs             | 232 +++++++++++++++
+ syscall/src/arch/mips64.rs             | 232 +++++++++++++
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 41 files changed, 2983 insertions(+), 12 deletions(-)
+ 41 files changed, 3059 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -198,10 +198,10 @@ index 00000000..b6bf3827
 +}
 diff --git a/rmm/src/arch/mips.rs b/rmm/src/arch/mips.rs
 new file mode 100644
-index 00000000..45279bcf
+index 00000000..825109da
 --- /dev/null
 +++ b/rmm/src/arch/mips.rs
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,236 @@
 +//! MIPS R4000-class paging for the SGI Indy (R4400, n32 kernel, 32-bit addresses).
 +//!
 +//! The TLB is refilled by software. `rmm` keeps a two-level table of 4-byte
@@ -242,10 +242,16 @@ index 00000000..45279bcf
 +/// EntryLo coherency field: uncached.
 +pub const ENTRYLO_UNCACHED: usize = 2 << 3;
 +
++/// Bring-up experiment: map every page uncached. Together with an uncached
++/// kseg0 (Config.K0, set by the kernel) this takes the primary caches out of
++/// the picture, to tell a cache fault from a translation fault on real
++/// hardware. Slow.
++pub const FORCE_UNCACHED: bool = false;
++
 +/// Convert a leaf entry to the EntryLo value the refill handler writes.
 +#[inline(always)]
 +pub fn entry_lo(pte: usize) -> usize {
-+    let cache = if pte & PTE_UNCACHED != 0 {
++    let cache = if FORCE_UNCACHED || pte & PTE_UNCACHED != 0 {
 +        ENTRYLO_UNCACHED
 +    } else {
 +        ENTRYLO_CACHEABLE
@@ -985,10 +991,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..3eb5694a
+index 00000000..56a68846
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,386 @@
+@@ -0,0 +1,442 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -1185,6 +1191,53 @@ index 00000000..3eb5694a
 +    }
 +}
 +
++/// Read one word of the current address space through the page table and
++/// kseg0, without touching the TLB. RAM is current: the data cache was
++/// written back on the way in.
++fn user_peek(addr: usize) -> Option<u32> {
++    unsafe {
++        let root = RmmA::table(rmm::TableKind::User);
++        let directory = RmmA::phys_to_virt(root).data() as *const usize;
++        let pde = directory.add(addr >> 22).read_volatile();
++        if pde & RmmA::ENTRY_FLAG_PRESENT == 0 {
++            return None;
++        }
++        let table_phys =
++            ((pde >> RmmA::ENTRY_ADDRESS_SHIFT) & RmmA::ENTRY_ADDRESS_MASK) << RmmA::PAGE_SHIFT;
++        let table =
++            RmmA::phys_to_virt(rmm::PhysicalAddress::new(table_phys)).data() as *const usize;
++        let pte = table.add((addr >> 12) & 0x3ff).read_volatile();
++        if pte & RmmA::ENTRY_FLAG_PRESENT == 0 {
++            return None;
++        }
++        let frame =
++            ((pte >> RmmA::ENTRY_ADDRESS_SHIFT) & RmmA::ENTRY_ADDRESS_MASK) << RmmA::PAGE_SHIFT;
++        let virt = RmmA::phys_to_virt(rmm::PhysicalAddress::new(frame + (addr & 0xffc))).data();
++        Some((virt as *const u32).read_volatile())
++    }
++}
++
++/// Print `count` words of user memory, eight to a line, for a fault report.
++fn dump_user_words(what: &str, start: usize, count: usize) {
++    if start >= crate::USER_END_OFFSET {
++        return;
++    }
++    println!("{} ({:#x}):", what, start);
++    for row in 0..count.div_ceil(8) {
++        for col in 0..8 {
++            let index = row * 8 + col;
++            if index >= count {
++                break;
++            }
++            match user_peek(start + index * 4) {
++                Some(word) => print!(" {:08X}", word),
++                None => print!(" --------"),
++            }
++        }
++        println!();
++    }
++}
++
 +enum TlbOutcome {
 +    /// The pair was in the page table; only the TLB was written.
 +    Refilled,
@@ -1276,6 +1329,9 @@ index 00000000..3eb5694a
 +            { regs.iret.badvaddr }
 +        );
 +        regs.dump();
++        dump_user_words("code at EPC-16", (regs.iret.epc as usize).wrapping_sub(16) & !3, 12);
++        dump_user_words("code at RA-16", (regs.registers.ra as usize).wrapping_sub(16) & !3, 8);
++        dump_user_words("stack at SP", regs.registers.sp as usize & !3, 32);
 +
 +        excp_handler(Exception {
 +            code: exc_code as usize,
@@ -1353,6 +1409,12 @@ index 00000000..3eb5694a
 +        crate::arch::cache::flush_data();
 +        let ok =
 +            crate::memory::page_fault_handler(regs, flags, VirtualAddress::new(badvaddr)).is_ok();
++        // The handler filled the frame through kseg0. If this fault came from
++        // the kernel copying to user memory, the copy continues through the
++        // user address, which can be another colour: two dirty lines for one
++        // piece of RAM, and the write-back order would pick the winner. Put
++        // the kseg0 lines in RAM now.
++        crate::arch::cache::flush_data();
 +        if ok {
 +            // The handler changed the table; drop any stale TLB entry so the
 +            // retried access refills from the table.
@@ -2187,10 +2249,10 @@ index 00000000..599f5488
 +}
 diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
 new file mode 100644
-index 00000000..33e9dbd5
+index 00000000..dd570a1d
 --- /dev/null
 +++ b/src/arch/mips64/start.rs
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,321 @@
 +//! Kernel entry from the SGI PROM.
 +//!
 +//! `boot -f bootp()redox` loads the ECOFF image at kseg0 0x8804_0000 and
@@ -2335,12 +2397,26 @@ index 00000000..33e9dbd5
 +/// The entry to Rust, all things must be initialized
 +unsafe extern "C" fn start() -> ! {
 +    unsafe {
++        if rmm::mips::FORCE_UNCACHED {
++            // Write the data cache back (32 KiB covers every supported CPU),
++            // then make kseg0 uncached: Config.K0 = 2.
++            let mut addr = 0x8000_0000usize;
++            while addr < 0x8000_8000 {
++                core::arch::asm!("cache 1, 0({0})", in(reg) addr, options(nostack));
++                addr += 16;
++            }
++            cp0::write_config((cp0::read_config() & !7) | 2);
++        }
++
 +        // The PROM console (the screen, or the serial port) and our own
 +        // driver for Serial Port 1.
 +        device::arcs::init();
 +        device::serial::init();
 +
 +        info!("Redox OS starting...");
++        if rmm::mips::FORCE_UNCACHED {
++            info!("Indy: EXPERIMENT: kseg0 and all mappings uncached; this boot is slow");
++        }
 +
 +        // TLB cleared, exception vectors in kseg0, BEV off: from here a kernel
 +        // fault prints its registers instead of vanishing into the PROM.
