@@ -8,7 +8,7 @@
 INDY_BUILD=build/indy
 INDY_TARGET=targets/mips64-sgi-redox.json
 INDY_TFTP_DIR?=/var/lib/sgi-netboot
-INDY_MARKER?=Indy: no initfs
+INDY_MARKER?=bootstrap: namespace scheme start
 # The toolchain pin of this fork; the kernel checkout carries upstream's own.
 INDY_RUST_TOOLCHAIN?=nightly-2026-10-03
 
@@ -21,11 +21,13 @@ INDY_KERNEL_ALL=$(KERNEL_BUILD)/kernel.all
 PROBE_ELF=tools/indy-probe/target/mips64-sgi-redox/release/indy-probe
 ECOFF=tools/ecoff/target/release/ecoff
 
+# mk/config.mk points RUSTUP_TOOLCHAIN at the cookbook prefix; every cargo
+# call here uses the fork's pin instead.
 $(ECOFF): $(wildcard tools/ecoff/src/*.rs) tools/ecoff/Cargo.toml
-	cd tools/ecoff && cargo build --release
+	cd tools/ecoff && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) cargo build --release
 
 $(PROBE_ELF): $(wildcard tools/indy-probe/src/*.rs) tools/indy-probe/Cargo.toml tools/indy-probe/linker.ld $(INDY_TARGET)
-	cd tools/indy-probe && cargo build --release
+	cd tools/indy-probe && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) cargo build --release
 
 $(INDY_BUILD)/probe: $(PROBE_ELF) $(ECOFF)
 	mkdir -p $(INDY_BUILD)
@@ -40,9 +42,32 @@ indy-probe-gate: $(INDY_BUILD)/probe
 $(INDY_ELF): FORCE
 	RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) $(MAKE) -C $(KERNEL_SOURCE) ARCH=mips64 BUILD=$(KERNEL_BUILD)
 
-$(INDY_BUILD)/redox: $(INDY_ELF) $(ECOFF)
+# Userspace: the bootstrap program and the initfs it is archived into.
+BASE_SOURCE=recipes/core/base/source
+BOOTSTRAP_ELF=$(BASE_SOURCE)/bootstrap/target/mips64-sgi-redox/release/bootstrap
+INITFS_AR=$(BASE_SOURCE)/target/release/redox-initfs-ar
+INITFS_DIR=$(INDY_BUILD)/initfs
+INITFS_IMG=$(INDY_BUILD)/initfs.img
+
+$(BOOTSTRAP_ELF): FORCE
+	cd $(BASE_SOURCE)/bootstrap && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) cargo rustc --release \
+		--target $(CURDIR)/$(INDY_TARGET) \
+		-Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec
+
+$(INITFS_AR): FORCE
+	cd $(BASE_SOURCE)/initfs/tools && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) cargo build --release
+
+# The initfs holds what the bootstrap starts: bin/init and the drivers. There
+# is no relibc for the target yet, so the directory carries only the layout.
+$(INITFS_IMG): $(BOOTSTRAP_ELF) $(INITFS_AR)
+	rm -rf $(INITFS_DIR)
+	mkdir -p $(INITFS_DIR)/bin $(INITFS_DIR)/lib/drivers $(INITFS_DIR)/lib/init.d
+	$(INITFS_AR) $(INITFS_DIR) $(BOOTSTRAP_ELF) -o $@
+	ls -l $@
+
+$(INDY_BUILD)/redox: $(INDY_ELF) $(ECOFF) $(INITFS_IMG)
 	mkdir -p $(INDY_BUILD)
-	$(ECOFF) convert $(INDY_ELF) $@
+	$(ECOFF) convert $(INDY_ELF) $@ --append $(INITFS_IMG)
 	llvm-size $(INDY_KERNEL_ALL)
 
 indy: $(INDY_BUILD)/redox

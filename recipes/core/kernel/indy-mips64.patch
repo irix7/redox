@@ -1,4 +1,4 @@
-From 4bb050909022f0385d08c207c0e62cca63013342 Mon Sep 17 00:00:00 2001
+From 9b4d733031d45eaf30413190ad4400feceb45f0c Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -38,17 +38,17 @@ Signed-off-by: belikh <io@jupiter.au>
  src/arch/mips64/device/cpu/mod.rs      |  11 +
  src/arch/mips64/device/mod.rs          |  22 ++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 298 ++++++++++++++++++++
- src/arch/mips64/interrupt/handler.rs   | 376 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 298 +++++++++++++++++++
+ src/arch/mips64/interrupt/handler.rs   | 384 +++++++++++++++++++++++++
  src/arch/mips64/interrupt/irq.rs       |  19 ++
- src/arch/mips64/interrupt/mod.rs       |  47 ++++
+ src/arch/mips64/interrupt/mod.rs       |  47 +++
  src/arch/mips64/interrupt/syscall.rs   |   4 +
  src/arch/mips64/interrupt/trace.rs     |  19 ++
  src/arch/mips64/ipi.rs                 |  24 ++
  src/arch/mips64/misc.rs                |  60 ++++
  src/arch/mips64/mod.rs                 |  91 ++++++
  src/arch/mips64/paging.rs              |  15 +
- src/arch/mips64/start.rs               | 253 +++++++++++++++++
+ src/arch/mips64/start.rs               | 275 ++++++++++++++++++
  src/arch/mips64/stop.rs                |  30 ++
  src/arch/mips64/time.rs                |  61 ++++
  src/arch/mod.rs                        |   6 +
@@ -66,7 +66,7 @@ Signed-off-by: belikh <io@jupiter.au>
  syscall/src/arch/mips64.rs             | 232 +++++++++++++++
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 39 files changed, 2393 insertions(+), 13 deletions(-)
+ 39 files changed, 2423 insertions(+), 13 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/consts.rs
@@ -661,7 +661,7 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..5bdf7acb
+index 00000000..b2c2f76e
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
 @@ -0,0 +1,298 @@
@@ -866,7 +866,7 @@ index 00000000..5bdf7acb
 +                r.a5 as usize,
 +                &mut token,
 +            );
-+            r.v0 = ret as u64;
++            r.v0 = super::handler::sign_extend(ret);
 +            return;
 +        }
 +
@@ -965,10 +965,10 @@ index 00000000..5bdf7acb
 +}
 diff --git a/src/arch/mips64/interrupt/handler.rs b/src/arch/mips64/interrupt/handler.rs
 new file mode 100644
-index 00000000..4f860d02
+index 00000000..dba445c2
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/handler.rs
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,384 @@
 +//! The trap frame. Every general register is saved as 64 bits, because n32
 +//! code keeps 64-bit values in registers even though pointers are 32 bits.
 +//!
@@ -1064,6 +1064,14 @@ index 00000000..4f860d02
 +/// Byte size of the trap frame, as the assembly reserves it.
 +pub const FRAME_SIZE: usize = 38 * 8;
 +
++/// n32 keeps every 32-bit value sign-extended in its 64-bit register. A
++/// value written into a register slot must follow that rule, or compiled
++/// code comparing it against a sign-extended constant goes wrong.
++#[inline(always)]
++pub const fn sign_extend(value: usize) -> u64 {
++    value as u32 as i32 as i64 as u64
++}
++
 +impl InterruptStack {
 +    pub fn init(&mut self) {
 +        const {
@@ -1083,10 +1091,10 @@ index 00000000..4f860d02
 +        self.registers.sp as usize
 +    }
 +    pub fn set_stack_pointer(&mut self, sp: usize) {
-+        self.registers.sp = sp as u64;
++        self.registers.sp = sign_extend(sp);
 +    }
 +    pub fn set_instr_pointer(&mut self, ip: usize) {
-+        self.iret.epc = ip as u64;
++        self.iret.epc = sign_extend(ip);
 +    }
 +    pub fn instr_pointer(&self) -> usize {
 +        self.iret.epc as usize
@@ -1096,12 +1104,12 @@ index 00000000..4f860d02
 +    }
 +
 +    pub fn set_syscall_ret_reg(&mut self, ret: usize) {
-+        self.registers.v0 = ret as u64;
++        self.registers.v0 = sign_extend(ret);
 +    }
 +
 +    pub fn set_arg1(&mut self, arg_opt: Option<usize>) {
 +        if let Some(arg) = arg_opt {
-+            self.registers.a1 = arg as u64;
++            self.registers.a1 = sign_extend(arg);
 +        }
 +    }
 +
@@ -1159,37 +1167,37 @@ index 00000000..4f860d02
 +    /// scheme to read/write registers.
 +    pub fn load(&mut self, all: &IntRegisters) {
 +        let r = &mut self.registers;
-+        self.iret.epc = all.pc as u64;
-+        r.at = all.at as u64;
-+        r.v0 = all.v0 as u64;
-+        r.v1 = all.v1 as u64;
-+        r.a0 = all.a0 as u64;
-+        r.a1 = all.a1 as u64;
-+        r.a2 = all.a2 as u64;
-+        r.a3 = all.a3 as u64;
-+        r.a4 = all.a4 as u64;
-+        r.a5 = all.a5 as u64;
-+        r.a6 = all.a6 as u64;
-+        r.a7 = all.a7 as u64;
-+        r.t0 = all.t0 as u64;
-+        r.t1 = all.t1 as u64;
-+        r.t2 = all.t2 as u64;
-+        r.t3 = all.t3 as u64;
-+        r.s0 = all.s0 as u64;
-+        r.s1 = all.s1 as u64;
-+        r.s2 = all.s2 as u64;
-+        r.s3 = all.s3 as u64;
-+        r.s4 = all.s4 as u64;
-+        r.s5 = all.s5 as u64;
-+        r.s6 = all.s6 as u64;
-+        r.s7 = all.s7 as u64;
-+        r.t8 = all.t8 as u64;
-+        r.t9 = all.t9 as u64;
-+        r.sp = all.sp as u64;
-+        r.fp = all.fp as u64;
-+        r.ra = all.ra as u64;
-+        self.iret.hi = all.hi as u64;
-+        self.iret.lo = all.lo as u64;
++        self.iret.epc = sign_extend(all.pc);
++        r.at = sign_extend(all.at);
++        r.v0 = sign_extend(all.v0);
++        r.v1 = sign_extend(all.v1);
++        r.a0 = sign_extend(all.a0);
++        r.a1 = sign_extend(all.a1);
++        r.a2 = sign_extend(all.a2);
++        r.a3 = sign_extend(all.a3);
++        r.a4 = sign_extend(all.a4);
++        r.a5 = sign_extend(all.a5);
++        r.a6 = sign_extend(all.a6);
++        r.a7 = sign_extend(all.a7);
++        r.t0 = sign_extend(all.t0);
++        r.t1 = sign_extend(all.t1);
++        r.t2 = sign_extend(all.t2);
++        r.t3 = sign_extend(all.t3);
++        r.s0 = sign_extend(all.s0);
++        r.s1 = sign_extend(all.s1);
++        r.s2 = sign_extend(all.s2);
++        r.s3 = sign_extend(all.s3);
++        r.s4 = sign_extend(all.s4);
++        r.s5 = sign_extend(all.s5);
++        r.s6 = sign_extend(all.s6);
++        r.s7 = sign_extend(all.s7);
++        r.t8 = sign_extend(all.t8);
++        r.t9 = sign_extend(all.t9);
++        r.sp = sign_extend(all.sp);
++        r.fp = sign_extend(all.fp);
++        r.ra = sign_extend(all.ra);
++        self.iret.hi = sign_extend(all.hi);
++        self.iret.lo = sign_extend(all.lo);
 +    }
 +
 +    //TODO: single step through the Watch registers or a breakpoint at EPC + 4
@@ -1674,10 +1682,10 @@ index 00000000..62d40404
 +}
 diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
 new file mode 100644
-index 00000000..f53c0cd7
+index 00000000..43561f6c
 --- /dev/null
 +++ b/src/arch/mips64/start.rs
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,275 @@
 +//! Kernel entry from the SGI PROM.
 +//!
 +//! `boot -f bootp()redox` loads the ECOFF image at kseg0 0x8804_0000 and
@@ -1715,6 +1723,9 @@ index 00000000..f53c0cd7
 +    size: u64,
 +    kind: BootloaderMemoryKind,
 +}
++
++/// The environment handed to userspace through `sys:env`.
++static ENV: &[u8] = b"BOOTSTRAP_LOG_LEVEL=trace\n";
 +
 +static AREAS: SyncUnsafeCell<[AreaEntry; 2]> = SyncUnsafeCell::new([
 +    AreaEntry {
@@ -1844,6 +1855,26 @@ index 00000000..f53c0cd7
 +            &raw const __bss_end as usize,
 +        );
 +
++        // An initfs appended by `ecoff convert --append` sits on the first page
++        // boundary after the image: a header page then the payload.
++        let (bootstrap_base, bootstrap_size) = {
++            let header = ((kernel_end_virt + 4095) & !4095) as *const u8;
++            let magic = core::slice::from_raw_parts(header, 8);
++            if magic == b"REDOXIFS" {
++                let len = u32::from_be_bytes([
++                    header.add(8).read(),
++                    header.add(9).read(),
++                    header.add(10).read(),
++                    header.add(11).read(),
++                ]) as usize;
++                let base = header as usize + 4096 - PHYS_OFFSET;
++                (base, (len + 4095) & !4095)
++            } else {
++                (0, 0)
++            }
++        };
++        info!("Indy: initfs {:#x}+{:#x}", bootstrap_base, bootstrap_size);
++
 +        let areas = &mut *AREAS.get();
 +        areas[0] = AreaEntry {
 +            base: consts::RAM_PHYS_BASE as u64,
@@ -1862,16 +1893,15 @@ index 00000000..f53c0cd7
 +            kernel_size: kernel_size as u64,
 +            stack_base: stack_base as u64,
 +            stack_size: STACK_SIZE as u64,
-+            env_base: 0,
-+            env_size: 0,
++            env_base: (ENV.as_ptr() as usize - PHYS_OFFSET) as u64,
++            env_size: ENV.len() as u64,
 +            hwdesc_base: 0,
 +            hwdesc_size: 0,
 +            // Read directly, not through phys_to_virt: give the kseg0 address.
 +            areas_base: AREAS.get() as usize as u64,
 +            areas_size: size_of::<[AreaEntry; 2]>() as u64,
-+            // No initfs yet: the kernel stops when it looks for one.
-+            bootstrap_base: 0,
-+            bootstrap_size: 0,
++            bootstrap_base: bootstrap_base as u64,
++            bootstrap_size: bootstrap_size as u64,
 +        };
 +        let args = &args;
 +

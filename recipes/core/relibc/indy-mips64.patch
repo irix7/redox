@@ -1,0 +1,428 @@
+From 370aa1c929465a9c50d82614e3bbedf7764f11a8 Mon Sep 17 00:00:00 2001
+From: belikh <io@jupiter.au>
+Date: Tue, 17 Nov 2026 10:00:49 +1000
+Subject: [PATCH] redox-rt, generic-rt: add mips64 n32 (SGI Indy)
+
+redox-rt/src/arch/mips64.rs: SigArea and ArchIntRegs ($1..$31, pc, hi, lo
+as u64), the fork wrapper and fork return (callee-saved s0..s7, gp, fp, ra;
+soft float, no FPU state), thread start, current_sp, deactivate_tcb,
+arch_pre/arch_ret_to_sig. The signal trampoline is a trap until it is
+written. STACK_TOP is 0x8000_0000 minus the kernel metadata pages.
+
+Thread pointer convention: $gp ($28) holds &tcb_ptr + 8, so the TCB pointer
+is read at -8($28). Static code with no GOT leaves $gp free.
+
+Signed-off-by: belikh <io@jupiter.au>
+---
+ generic-rt/src/lib.rs       |  18 +++
+ redox-rt/src/arch/mips64.rs | 287 ++++++++++++++++++++++++++++++++++++
+ redox-rt/src/arch/mod.rs    |   5 +
+ redox-rt/src/lib.rs         |  12 +-
+ redox-rt/src/proc.rs        |   6 +-
+ 5 files changed, 325 insertions(+), 3 deletions(-)
+ create mode 100644 redox-rt/src/arch/mips64.rs
+
+diff --git a/generic-rt/src/lib.rs b/generic-rt/src/lib.rs
+index 226c366..e706951 100644
+--- a/generic-rt/src/lib.rs
++++ b/generic-rt/src/lib.rs
+@@ -1,4 +1,5 @@
+ #![no_std]
++#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
+ #![allow(internal_features)]
+ #![deny(unsafe_op_in_unsafe_fn)]
+ 
+@@ -84,6 +85,23 @@ impl<Os> GenericTcb<Os> {
+         value
+     }
+ 
++    /// Architecture specific code to read a usize from the TCB - mips64 n32.
++    /// `$gp` holds `&tcb_ptr + 8`; pointers are 32 bits.
++    #[expect(unsafe_op_in_unsafe_fn)]
++    #[inline(always)]
++    #[cfg(target_arch = "mips64")]
++    unsafe fn arch_read(offset: usize) -> usize {
++        let value;
++        asm!(
++            "lw {value}, -8($28)", // TCB
++            "addu {value}, {value}, {offset}",
++            "lw {value}, 0({value})",
++            value = out(reg) value,
++            offset = in(reg) offset,
++        );
++        value
++    }
++
+     pub unsafe fn current_ptr() -> Option<*mut Self> {
+         let tcb_ptr = unsafe { Self::arch_read(offset_of!(Self, tcb_ptr)) as *mut Self };
+         let tcb_len = unsafe { Self::arch_read(offset_of!(Self, tcb_len)) };
+diff --git a/redox-rt/src/arch/mips64.rs b/redox-rt/src/arch/mips64.rs
+new file mode 100644
+index 0000000..71b4b44
+--- /dev/null
++++ b/redox-rt/src/arch/mips64.rs
+@@ -0,0 +1,287 @@
++//! MIPS n32 (SGI Indy). Registers are 64 bits wide, pointers 32.
++//!
++//! Thread pointer: `$gp` (`$28`) holds `&tcb_ptr + 8`, so the TCB pointer is
++//! at `-8($28)` (see `generic_rt::GenericTcb::arch_read`). Compiled code is
++//! static with no GOT, so `$gp` is otherwise unused.
++//!
++//! The signal trampoline is not implemented yet: `__relibc_internal_sigentry`
++//! traps. Fork and thread start are complete.
++
++use core::cell::SyncUnsafeCell;
++
++use crate::{
++    Tcb,
++    proc::{FdGuard, FdGuardUpper, ForkArgs, fork_inner},
++    signal::{PosixStackt, SigStack, get_sigaltstack},
++};
++use core::{ptr::NonNull, sync::atomic::Ordering};
++use redox_protocols::protocol::{ProcCall, RtSigInfo};
++use syscall::{data::*, error::*};
++
++use super::ForkScratchpad;
++
++/// User addresses end at 0x8000_0000; the kernel's metadata pages sit just
++/// below that, and the initial stack grows down from below them.
++pub const STACK_TOP: usize = 0x8000_0000 - syscall::KERNEL_METADATA_SIZE;
++pub const STACK_SIZE: usize = 1024 * 1024;
++
++#[derive(Debug, Default)]
++#[repr(C)]
++pub struct SigArea {
++    pub tmp_sp: u64,
++    pub tmp_t1: u64,
++    pub tmp_t2: u64,
++    pub tmp_t3: u64,
++    pub tmp_t4: u64,
++    pub tmp_a0: u64,
++    pub tmp_a1: u64,
++    pub tmp_a2: u64,
++    pub tmp_a3: u64,
++    pub tmp_a4: u64,
++    pub tmp_a7: u64,
++
++    pub pctl: usize, // TODO: remove
++    pub tmp_ip: u64,
++    pub tmp_rt_inf: RtSigInfo,
++    pub tmp_id_inf: u64,
++    pub altstack_top: usize,
++    pub altstack_bottom: usize,
++    pub disable_signals_depth: u64,
++    pub last_sig_was_restart: bool,
++    pub last_sigstack: Option<NonNull<SigStack>>,
++}
++
++/// `$1`..`$31` then PC, HI and LO.
++#[repr(C)]
++#[derive(Debug, Default)]
++pub struct ArchIntRegs {
++    pub int_regs: [u64; 31],
++    pub pc: u64,
++    pub hi: u64,
++    pub lo: u64,
++}
++
++/// Deactive TLS, used before exec() on Redox to not trick target executable into thinking TLS
++/// is already initialized as if it was a thread.
++pub unsafe fn deactivate_tcb(open_via_dup: &FdGuardUpper) -> Result<()> {
++    let mut env = syscall::EnvRegisters::default();
++
++    let file = open_via_dup.dup_into_upper(b"regs/env")?;
++
++    env.tp = 0;
++
++    file.write(&env)?;
++    crate::TLS_ACTIVATED.store(false, core::sync::atomic::Ordering::Relaxed);
++    Ok(())
++}
++
++unsafe extern "C" fn fork_impl(args: &ForkArgs, initial_rsp: *mut usize) -> usize {
++    Error::mux(fork_inner(initial_rsp, args))
++}
++
++unsafe extern "C" fn child_hook(scratchpad: &ForkScratchpad) {
++    let _ = crate::sys::close(scratchpad.cur_filetable_fd);
++    unsafe {
++        crate::child_hook_common(crate::ChildHookCommonArgs {
++            new_thr_fd: FdGuard::new(scratchpad.new_thr_fd),
++            new_proc_fd: if scratchpad.new_proc_fd == usize::MAX {
++                None
++            } else {
++                Some(FdGuard::new(scratchpad.new_proc_fd))
++            },
++            new_filetable_fd: FdGuard::new(scratchpad.new_filetable_fd)
++                .to_upper()
++                .unwrap(),
++        })
++    };
++}
++
++// Callee-saved registers: s0..s7 ($16..$23), gp ($28), fp ($30), ra ($31).
++// The FPU is disabled (soft float), so no float state is saved.
++asmfunction!(__relibc_internal_fork_wrapper (usize) -> usize: ["
++    .set noreorder
++    addiu   $sp, $sp, -96
++    sd      $16, 0($sp)
++    sd      $17, 8($sp)
++    sd      $18, 16($sp)
++    sd      $19, 24($sp)
++    sd      $20, 32($sp)
++    sd      $21, 40($sp)
++    sd      $22, 48($sp)
++    sd      $23, 56($sp)
++    sd      $28, 64($sp)
++    sd      $30, 72($sp)
++    sd      $31, 80($sp)
++
++    // $a0 is forwarded from this function; $a1 is the saved-register block.
++    move    $5, $sp
++    la      $25, {fork_impl}
++    jalr    $25
++    nop
++
++    ld      $16, 0($sp)
++    ld      $17, 8($sp)
++    ld      $18, 16($sp)
++    ld      $19, 24($sp)
++    ld      $20, 32($sp)
++    ld      $21, 40($sp)
++    ld      $22, 48($sp)
++    ld      $23, 56($sp)
++    ld      $28, 64($sp)
++    ld      $30, 72($sp)
++    ld      $31, 80($sp)
++
++    jr      $31
++    addiu   $sp, $sp, 96
++    .set reorder
++"] <= [fork_impl = sym fork_impl]);
++
++asmfunction!(__relibc_internal_fork_ret: ["
++    .set noreorder
++    // The scratchpad arrives in $a1 (the kernel's arg1); child_hook takes it in $a0.
++    move    $4, $5
++    la      $25, {child_hook}
++    jalr    $25
++    nop
++
++    move    $2, $zero
++
++    ld      $16, 0($sp)
++    ld      $17, 8($sp)
++    ld      $18, 16($sp)
++    ld      $19, 24($sp)
++    ld      $20, 32($sp)
++    ld      $21, 40($sp)
++    ld      $22, 48($sp)
++    ld      $23, 56($sp)
++    ld      $28, 64($sp)
++    ld      $30, 72($sp)
++    ld      $31, 80($sp)
++
++    jr      $31
++    addiu   $sp, $sp, 96
++    .set reorder
++"] <= [child_hook = sym child_hook]);
++
++// TODO: the signal trampoline. Until it exists a delivered signal traps here,
++// which the kernel reports as a user exception.
++asmfunction!(__relibc_internal_sigentry: ["
++    .set noreorder
++    .global __relibc_internal_sigentry_crit_first
++__relibc_internal_sigentry_crit_first:
++    .global __relibc_internal_sigentry_crit_second
++__relibc_internal_sigentry_crit_second:
++    .global __relibc_internal_sigentry_crit_third
++__relibc_internal_sigentry_crit_third:
++    .global __relibc_internal_sigentry_crit_fourth
++__relibc_internal_sigentry_crit_fourth:
++    .global __relibc_internal_sigentry_crit_fifth
++__relibc_internal_sigentry_crit_fifth:
++    break   1
++    nop
++    .set reorder
++"] <= []);
++
++// The new thread's stack holds [function, a0, a1, a2, a3, a4, a5] as 32-bit words.
++asmfunction!(__relibc_internal_rlct_clone_ret: ["
++    .set noreorder
++    lw      $25, 0($sp)
++    lw      $4, 4($sp)
++    lw      $5, 8($sp)
++    lw      $6, 12($sp)
++    lw      $7, 16($sp)
++    lw      $8, 20($sp)
++    lw      $9, 24($sp)
++    addiu   $sp, $sp, 32
++
++    jalr    $25
++    nop
++    jr      $31
++    nop
++    .set reorder
++"] <= []);
++
++pub fn current_sp() -> usize {
++    let sp: usize;
++    unsafe {
++        core::arch::asm!(
++        "move {}, $sp",
++        out(reg) sp,
++        options(nomem));
++    }
++    sp
++}
++
++pub unsafe fn manually_enter_trampoline() {
++    let ctl = unsafe { &Tcb::current().unwrap().os_specific.control };
++
++    ctl.control_flags.store(
++        ctl.control_flags.load(Ordering::Relaxed) | syscall::flag::INHIBIT_DELIVERY.bits(),
++        Ordering::Release,
++    );
++    ctl.saved_archdep_reg.set(0);
++    let ip_location = &raw const ctl.saved_ip as usize;
++
++    unsafe {
++        // $ra cannot be named as an operand: keep it on the stack around the call.
++        core::arch::asm!("
++                .set noreorder
++                addiu   $sp, $sp, -16
++                sw      $31, 0($sp)
++                bal     2f
++                nop
++                b       3f
++                nop
++            2:
++                sw      $31, 0({ip})
++                la      $25, __relibc_internal_sigentry
++                jr      $25
++                nop
++            3:
++                lw      $31, 0($sp)
++                addiu   $sp, $sp, 16
++                .set reorder
++            ",
++            ip = in(reg) ip_location, out("$25") _);
++    }
++}
++
++unsafe extern "C" {
++    fn __relibc_internal_sigentry_crit_first();
++    fn __relibc_internal_sigentry_crit_second();
++    fn __relibc_internal_sigentry_crit_third();
++    fn __relibc_internal_sigentry_crit_fourth();
++    fn __relibc_internal_sigentry_crit_fifth();
++}
++
++pub unsafe fn arch_pre(stack: &mut SigStack, area: &mut SigArea) -> PosixStackt {
++    // No trampoline yet, so no critical section to repair.
++    let _ = (
++        __relibc_internal_sigentry_crit_first as usize,
++        __relibc_internal_sigentry_crit_second as usize,
++        __relibc_internal_sigentry_crit_third as usize,
++        __relibc_internal_sigentry_crit_fourth as usize,
++        __relibc_internal_sigentry_crit_fifth as usize,
++    );
++    get_sigaltstack(area, stack.regs.int_regs[28] as usize).into()
++}
++
++/// map to `si_signo` and `si_code`.
++pub(crate) fn map_err_code(_excp: &syscall::Exception) -> (i32, i32) {
++    use redox_protocols::flag::*;
++    (SIGABRT, 0 /* todo */)
++}
++
++pub fn arch_ret_to_sig(stack: &mut SigStack, control: &Sigcontrol) {
++    let orig_pc = core::mem::replace(
++        &mut stack.regs.pc,
++        __relibc_internal_sigentry as *const () as u64,
++    );
++    control.saved_ip.set(orig_pc as usize);
++    control
++        .saved_archdep_reg
++        .set(stack.regs.int_regs[11] as usize); // $t0 ($12)
++}
++
++pub(crate) static PROC_FD: SyncUnsafeCell<usize> = SyncUnsafeCell::new(usize::MAX);
++static PROC_CALL: [usize; 1] = [ProcCall::Sigdeq as usize];
+diff --git a/redox-rt/src/arch/mod.rs b/redox-rt/src/arch/mod.rs
+index e763dc9..d1be614 100644
+--- a/redox-rt/src/arch/mod.rs
++++ b/redox-rt/src/arch/mod.rs
+@@ -18,6 +18,11 @@ pub use self::riscv64::*;
+ #[cfg(target_arch = "riscv64")]
+ pub mod riscv64;
+ 
++#[cfg(target_arch = "mips64")]
++pub use self::mips64::*;
++#[cfg(target_arch = "mips64")]
++pub mod mips64;
++
+ #[derive(Debug)]
+ #[repr(C)]
+ pub struct ForkScratchpad {
+diff --git a/redox-rt/src/lib.rs b/redox-rt/src/lib.rs
+index b6935b6..7c793d5 100644
+--- a/redox-rt/src/lib.rs
++++ b/redox-rt/src/lib.rs
+@@ -2,6 +2,7 @@
+ #![allow(internal_features)]
+ #![deny(unsafe_op_in_unsafe_fn)]
+ #![feature(core_intrinsics, int_roundings, slice_ptr_get, sync_unsafe_cell)]
++#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
+ #![forbid(unreachable_patterns)]
+ 
+ use core::cell::UnsafeCell;
+@@ -182,11 +183,20 @@ pub unsafe fn initialize_freestanding(this_thr_fd: FdGuardUpper) -> &'static FdG
+     // Make sure to use ptr::write to prevent dropping the existing FdGuard
+     page.os_specific.thr_fd.get().write(Some(this_thr_fd));
+ 
+-    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
++    #[cfg(not(any(
++        target_arch = "aarch64",
++        target_arch = "riscv64",
++        target_arch = "mips64"
++    )))]
+     unsafe {
+         let tcb_addr = page as *mut Tcb as usize;
+         tcb_activate(&page.os_specific, tcb_addr, 0)
+     }
++    #[cfg(target_arch = "mips64")]
++    unsafe {
++        let abi_ptr = core::ptr::addr_of_mut!(page.tcb_ptr) as usize;
++        core::arch::asm!("move $28, {}", in(reg) (abi_ptr + 8));
++    }
+     #[cfg(target_arch = "aarch64")]
+     unsafe {
+         let abi_ptr = core::ptr::addr_of_mut!(page.tcb_ptr);
+diff --git a/redox-rt/src/proc.rs b/redox-rt/src/proc.rs
+index 3fb375f..5d94e3b 100644
+--- a/redox-rt/src/proc.rs
++++ b/redox-rt/src/proc.rs
+@@ -1016,7 +1016,8 @@ pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
+         #[cfg(any(
+             target_arch = "x86_64",
+             target_arch = "aarch64",
+-            target_arch = "riscv64"
++            target_arch = "riscv64",
++            target_arch = "mips64"
+         ))]
+         let arg1 = {
+             let scratchpad_ptr: *const ForkScratchpad = &raw const scratchpad;
+@@ -1097,7 +1098,8 @@ pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
+             #[cfg(any(
+                 target_arch = "x86_64",
+                 target_arch = "aarch64",
+-                target_arch = "riscv64"
++                target_arch = "riscv64",
++                target_arch = "mips64"
+             ))]
+             let buf = create_set_addr_space_buf_for_fork(
+                 new_addr_space_fd.as_raw_fd(),
+-- 
+2.56.0
+

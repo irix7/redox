@@ -1,9 +1,10 @@
 # Bootstrapping Redox on the SGI Indy — 32 MB
 
 **Audience:** agents and engineers working in `irix7/redox`.
-**Status:** T1, T3, T4 and T5 pass on iris (2026-11-17): `make indy-gate` netboots the
-Redox kernel on a 32 MiB `indy_ip24`, the kernel maps its heap through the TLB and stops at
-"no initfs". T2 (the x86_64 floor) is not done. There is no userspace yet. This file says
+**Status:** T1, T3, T4, T5 and the first half of T6 pass on iris (2026-11-17): `make indy-gate`
+netboots the Redox kernel with an appended initfs on a 32 MiB `indy_ip24`; the userspace
+bootstrap forks the initfs, process-manager and namespace daemons and stops at "failed to
+open init" because there is no relibc for the target yet. T2 (the x86_64 floor) is not done. This file says
 where the pieces are, what has been proved on this machine, and what the 32 MB budget allows.
 **Fork base:** `redox-os/redox` mirror at `f71658dfca2b978bee55a4c19d95ab926a948c21`
 (2026-11-16). See [Provenance](#provenance-and-rebasing).
@@ -675,10 +676,13 @@ and none of them is on the critical path to "the machine runs our code".
 
 ### Next, in order
 
-- **T6 — initfs and the bootstrap program.** The kernel stops at "no initfs". Redox's
-  `bootstrap` is a static relibc program; this needs relibc for n32 (D2, option 1: a new
-  PAL against [ADR 0002](docs/adr/0002-syscall-abi.md)) and an initfs appended to the ECOFF
-  image or loaded as a second TFTP file.
+- **T6 — initfs and the bootstrap program.** Half done 2026-11-17: `ecoff convert --append`
+  places the initfs after the kernel (header page `REDOXIFS`, length, payload), the kernel
+  hands it to `usermode_bootstrap`, and the `bootstrap` program (base, `no_std`, with
+  `redox-rt`) runs: it forks the initfs scheme, the process manager and the namespace
+  manager, then stops at `failed to open init` because the initfs holds no `bin/init`. The
+  gate marker is `bootstrap: namespace scheme start`. What remains is relibc for n32 and a
+  `std` build for the target, so that `init` and the daemons can be built.
 - **T7 — Seeq 8003 Ethernet.** The first device driver, and the one that matters most: a
   netbooted machine with no disk has nothing else. In Redox it is a userspace scheme, so it
   follows T6. The HPC3 interrupt demultiplexer (INT3, CP0 IP2/IP3) in the kernel's

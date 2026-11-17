@@ -7,8 +7,14 @@
 //! file-backed bytes becomes `.bss`.
 //!
 //! Usage:
-//!   ecoff convert KERNEL.elf OUT
+//!   ecoff convert KERNEL.elf OUT [--append PAYLOAD]
 //!   ecoff inspect OUT
+//!
+//! `--append` places a payload (the initfs) after the kernel: `.bss` is
+//! written out as zeros so the file bytes stay contiguous, then a 4 KiB header
+//! page (`REDOXIFS`, payload length as big-endian u32) and the payload, padded
+//! to 4 KiB. The kernel finds the header at the first page boundary after its
+//! `__end` symbol.
 //!
 //! Field widths and the header order follow the ECOFF `filehdr`, `aouthdr`
 //! and `scnhdr` definitions. All fields are big-endian.
@@ -260,9 +266,39 @@ pub fn write_ecoff(image: &Image) -> Vec<u8> {
     w.0
 }
 
-fn convert(input: &str, output: &str) -> Result<(), Error> {
+/// Magic at the start of the payload header page.
+pub const PAYLOAD_MAGIC: &[u8; 8] = b"REDOXIFS";
+const PAGE: usize = 4096;
+
+/// Append `payload` after the image: zero-fill `.bss`, add the header page and
+/// the payload padded to a page.
+pub fn append_payload(image: &mut Image, payload: &[u8]) -> Result<(), Error> {
+    let total = image.bytes.len() + image.bss_len as usize;
+    let header_at = (total + PAGE - 1) & !(PAGE - 1);
+    image.bytes.resize(header_at, 0);
+    let mut header = [0u8; PAGE];
+    header[..8].copy_from_slice(PAYLOAD_MAGIC);
+    let len = u32::try_from(payload.len()).map_err(|_| Error("payload is larger than 4 GiB".into()))?;
+    header[8..12].copy_from_slice(&len.to_be_bytes());
+    image.bytes.extend_from_slice(&header);
+    image.bytes.extend_from_slice(payload);
+    let padded = (image.bytes.len() + PAGE - 1) & !(PAGE - 1);
+    image.bytes.resize(padded, 0);
+    image.bss_len = 0;
+    if image.bytes.len() as u64 + image.base as u64 > u32::MAX as u64 + 1 {
+        return err("image with payload runs past the 32-bit address space");
+    }
+    Ok(())
+}
+
+fn convert(input: &str, output: &str, payload: Option<&str>) -> Result<(), Error> {
     let elf = fs::read(input).map_err(|e| Error(format!("{input}: {e}")))?;
-    let image = parse_elf(&elf)?;
+    let mut image = parse_elf(&elf)?;
+    if let Some(path) = payload {
+        let data = fs::read(path).map_err(|e| Error(format!("{path}: {e}")))?;
+        append_payload(&mut image, &data)?;
+        println!("{output}: payload {path} ({} bytes) appended", data.len());
+    }
     let ecoff = write_ecoff(&image);
     fs::write(output, &ecoff).map_err(|e| Error(format!("{output}: {e}")))?;
     println!(
@@ -311,9 +347,10 @@ fn inspect(path: &str) -> Result<(), Error> {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [_, "convert", input, output] => convert(input, output),
+        [_, "convert", input, output] => convert(input, output, None),
+        [_, "convert", input, output, "--append", payload] => convert(input, output, Some(payload)),
         [_, "inspect", path] => inspect(path),
-        _ => err("usage: ecoff convert KERNEL.elf OUT | ecoff inspect FILE"),
+        _ => err("usage: ecoff convert KERNEL.elf OUT [--append PAYLOAD] | ecoff inspect FILE"),
     };
     if let Err(e) = result {
         eprintln!("ecoff: {e}");
@@ -385,6 +422,19 @@ mod tests {
         assert_eq!(&out[data_hdr..data_hdr + 5], b".data");
         assert_eq!(r.u32(data_hdr + 20).unwrap(), 208 + 48); // s_scnptr
         assert_eq!(&out[208..], &image.bytes[..]);
+    }
+
+    #[test]
+    fn payload_follows_bss_on_a_page_boundary() {
+        let mut image = parse_elf(&sample_elf()).unwrap();
+        append_payload(&mut image, b"initfs").unwrap();
+        // 64 file bytes + 32 bss -> header page at 4096, payload at 8192, padded to 12288.
+        assert_eq!(image.bss_len, 0);
+        assert_eq!(image.bytes.len(), 12288);
+        assert_eq!(&image.bytes[4096..4104], PAYLOAD_MAGIC);
+        assert_eq!(&image.bytes[4104..4108], &6u32.to_be_bytes());
+        assert_eq!(&image.bytes[8192..8198], b"initfs");
+        assert_eq!(image.bytes[64], 0);
     }
 
     #[test]

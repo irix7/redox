@@ -3,6 +3,9 @@ description = "Redox POSIX/C Standard Library"
 
 [source]
 git = "https://gitlab.redox-os.org/redox-os/relibc.git"
+# The Indy port is a patch on a pinned upstream commit (bootstrap.md, Provenance).
+rev = "08c786e109aeb1d8eb9e8901957cf64942cd9f59"
+patches = ["indy-mips64.patch"]
 
 [build]
 template = "custom"

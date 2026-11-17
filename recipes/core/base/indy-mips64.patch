@@ -1,0 +1,242 @@
+From 1e537a72a69922b2b7e9e771c5eac56973f1019e Mon Sep 17 00:00:00 2001
+From: belikh <io@jupiter.au>
+Date: Tue, 17 Nov 2026 10:00:40 +1000
+Subject: [PATCH] bootstrap: add the mips64 (SGI Indy) entry and point at local
+ runtime crates
+
+bootstrap/src/mips64.rs maps the initial stack with SYS_FMAP ($v0 number,
+$a0..$a2 arguments) and calls start; mips64.ld is the riscv64 layout for
+elf32-ntradbigmips. USERMODE_END is 0x8000_0000.
+
+Cargo.toml takes redox-rt from ../../../relibc/source/redox-rt and patches
+redox_syscall and libc with the fork's vendored copies that carry the
+mips64 architecture files.
+
+Signed-off-by: belikh <io@jupiter.au>
+---
+ bootstrap/Cargo.lock    |  5 ----
+ bootstrap/Cargo.toml    | 11 +++++---
+ bootstrap/src/main.rs   |  5 ++++
+ bootstrap/src/mips64.ld | 59 +++++++++++++++++++++++++++++++++++++++++
+ bootstrap/src/mips64.rs | 57 +++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 128 insertions(+), 9 deletions(-)
+ create mode 100644 bootstrap/src/mips64.ld
+ create mode 100644 bootstrap/src/mips64.rs
+
+diff --git a/bootstrap/Cargo.lock b/bootstrap/Cargo.lock
+index f79cba6..8455fd7 100644
+--- a/bootstrap/Cargo.lock
++++ b/bootstrap/Cargo.lock
+@@ -41,7 +41,6 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+ [[package]]
+ name = "generic-rt"
+ version = "0.1.0"
+-source = "git+https://gitlab.redox-os.org/redox-os/relibc.git#6d14c9d2dcf2822d6c156912001b2a40f7d199d1"
+ 
+ [[package]]
+ name = "goblin"
+@@ -72,8 +71,6 @@ checksum = "5e571352c8a3b89074d12e3ee5173ffe162159105352aaaf1fc5764da747e31b"
+ [[package]]
+ name = "libc"
+ version = "0.2.190"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+ 
+ [[package]]
+ name = "libredox"
+@@ -151,7 +148,6 @@ checksum = "083c57139a99303d842a4cfe1f0fd6483d77d81eda1442be84bcb1a0f737ed96"
+ [[package]]
+ name = "redox-rt"
+ version = "0.1.0"
+-source = "git+https://gitlab.redox-os.org/redox-os/relibc.git#6d14c9d2dcf2822d6c156912001b2a40f7d199d1"
+ dependencies = [
+  "bitflags",
+  "generic-rt",
+@@ -176,7 +172,6 @@ dependencies = [
+ [[package]]
+ name = "redox_syscall"
+ version = "0.9.5"
+-source = "git+https://gitlab.redox-os.org/redox-os/kernel/#6cfaba5f8cbf3fb9a373170fc21ab78b972065c2"
+ dependencies = [
+  "bitflags",
+ ]
+diff --git a/bootstrap/Cargo.toml b/bootstrap/Cargo.toml
+index ba46940..df49a08 100644
+--- a/bootstrap/Cargo.toml
++++ b/bootstrap/Cargo.toml
+@@ -23,8 +23,8 @@ slab = { version = "0.4.9", default-features = false }
+ arrayvec = { version = "0.7.6", default-features = false }
+ 
+ [target.'cfg(target_os = "redox")'.dependencies]
+-redox-rt = { git = "https://gitlab.redox-os.org/redox-os/relibc.git", default-features = false }
+-#redox-rt = { path = "../../../relibc/source/redox-rt", default-features = false }
++#redox-rt = { git = "https://gitlab.redox-os.org/redox-os/relibc.git", default-features = false }
++redox-rt = { path = "../../../relibc/source/redox-rt", default-features = false }
+ 
+ [lints.clippy]
+ perf = { level = "deny", priority = -1 }
+@@ -39,5 +39,8 @@ panic = "abort"
+ opt-level = "s"
+ 
+ [patch.crates-io]
+-redox_syscall = { git = "https://gitlab.redox-os.org/redox-os/kernel/" }
+-#redox_syscall = { path = "../../../kernel/source/syscall" }
++#redox_syscall = { git = "https://gitlab.redox-os.org/redox-os/kernel/" }
++# The Indy port: the 0.9.5 crate with a mips64 arch file, and libc with Redox
++# mips64 definitions (bootstrap.md, Provenance).
++redox_syscall = { path = "../../../../../vendor/redox_syscall-0.9.5" }
++libc = { path = "../../../../../vendor/libc-0.2.190" }
+diff --git a/bootstrap/src/main.rs b/bootstrap/src/main.rs
+index 58b6b34..6c4628d 100644
+--- a/bootstrap/src/main.rs
++++ b/bootstrap/src/main.rs
+@@ -1,6 +1,7 @@
+ #![no_std]
+ #![no_main]
+ #![feature(abort_immediate, never_type)]
++#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
+ 
+ #[cfg(target_arch = "aarch64")]
+ #[path = "aarch64.rs"]
+@@ -18,6 +19,10 @@ pub mod arch;
+ #[path = "riscv64.rs"]
+ pub mod arch;
+ 
++#[cfg(target_arch = "mips64")]
++#[path = "mips64.rs"]
++pub mod arch;
++
+ pub mod exec;
+ pub mod initfs;
+ pub mod initnsmgr;
+diff --git a/bootstrap/src/mips64.ld b/bootstrap/src/mips64.ld
+new file mode 100644
+index 0000000..a0201b3
+--- /dev/null
++++ b/bootstrap/src/mips64.ld
+@@ -0,0 +1,59 @@
++ENTRY(_start)
++OUTPUT_FORMAT(elf32-ntradbigmips)
++
++SECTIONS {
++  . = 4096 + 4096; /* Reserved for the null page and the initfs header prepended by redox-initfs-ar */
++  __initfs_header = . - 4096;
++  . += SIZEOF_HEADERS;
++  . = ALIGN(4096);
++
++  .text : {
++    __text_start = .;
++    *(.text*)
++    . = ALIGN(4096);
++    __text_end = .;
++  }
++  .rodata : {
++    __rodata_start = .;
++    *(.rodata*)
++  }
++  .data.rel.ro : {
++    *(.data.rel.ro*)
++  }
++  .got : {
++    *(.got)
++  }
++  .got.plt : {
++    *(.got.plt)
++    . = ALIGN(4096);
++    __rodata_end = .;
++  }
++  .data : {
++    __data_start = .;
++    *(.data*)
++    *(.sdata*)
++    . = ALIGN(4096);
++    __data_end = .;
++
++    __bss_start = .;
++    *(.bss*)
++    *(.sbss*)
++    *(COMMON)
++    . = ALIGN(4096);
++    __bss_end = .;
++  }
++
++  /DISCARD/ : {
++      *(.comment*)
++      *(.eh_frame*)
++      *(.gcc_except_table*)
++      *(.note*)
++      *(.rel.eh_frame*)
++      *(.MIPS.abiflags)
++      *(.MIPS.options)
++      *(.reginfo)
++      *(.pdr)
++      *(.mdebug*)
++      *(.gnu.attributes)
++  }
++}
+diff --git a/bootstrap/src/mips64.rs b/bootstrap/src/mips64.rs
+new file mode 100644
+index 0000000..e3fd459
+--- /dev/null
++++ b/bootstrap/src/mips64.rs
+@@ -0,0 +1,57 @@
++//! SGI Indy: MIPS n32, 32-bit user addresses. useg ends at 0x8000_0000.
++
++use core::mem;
++
++use syscall::data::Map;
++use syscall::flag::MapFlags;
++use syscall::number::SYS_FMAP;
++
++const STACK_SIZE: usize = 64 * 1024; // 64 KiB
++pub const USERMODE_END: usize = 0x8000_0000;
++pub const STACK_START: usize = USERMODE_END - syscall::KERNEL_METADATA_SIZE - STACK_SIZE;
++
++static MAP: Map = Map {
++    offset: 0,
++    size: STACK_SIZE,
++    flags: MapFlags::PROT_READ
++        .union(MapFlags::PROT_WRITE)
++        .union(MapFlags::MAP_PRIVATE)
++        .union(MapFlags::MAP_FIXED_NOREPLACE),
++    address: STACK_START, // highest possible user address
++};
++
++core::arch::global_asm!(
++    "
++    .set noreorder
++    .globl _start
++_start:
++    # Setup a stack: SYS_FMAP(fd, &map, size). Number in $v0, result in $v0.
++    li      $2, {number}
++    li      $4, {fd}
++    la      $5, {map}
++    li      $6, {map_size}
++    syscall
++    nop
++
++    # Test for success (nonzero value).
++    bnez    $2, 2f
++    nop
++    # (failure)
++    break   0
++2:
++    li      $sp, {stack_size}
++    addu    $sp, $sp, $2
++    move    $30, $zero
++
++    jal     start
++    nop
++    # `start` must never return.
++    break   0
++    .set reorder
++    ",
++    fd = const usize::MAX, // dummy fd indicates anonymous map
++    map = sym MAP,
++    map_size = const mem::size_of::<Map>(),
++    number = const SYS_FMAP,
++    stack_size = const STACK_SIZE,
++);
+-- 
+2.56.0
+

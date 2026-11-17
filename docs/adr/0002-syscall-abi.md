@@ -15,6 +15,11 @@ of D2.
   `irix7/os` proved a 16-byte TCB header there.
 - Trap frame: `$1`..`$31` as 64-bit values, then EPC, Status, Cause,
   BadVAddr, HI, LO and a pad word: 304 bytes.
+- Every 32-bit value the kernel writes into a register slot (syscall result,
+  arguments, PC, SP, `proc:` register writes) is sign-extended to 64 bits.
+  n32 code compares registers as 64-bit values and assumes that invariant;
+  a zero-extended error code made `Error::demux` miss every error and sent
+  the bootstrap into a retry loop.
 
 ## Reasons
 
