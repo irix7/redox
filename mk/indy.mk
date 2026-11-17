@@ -8,6 +8,9 @@
 INDY_BUILD=build/indy
 INDY_TARGET=targets/mips64-sgi-redox.json
 INDY_TFTP_DIR?=/var/lib/sgi-netboot
+# Names to install the image under. A BOOTP server that names its own boot file
+# (dnsmasq dhcp-boot) makes the PROM fetch that name whatever was typed.
+INDY_TFTP_NAMES?=redox
 INDY_MARKER?=addr 192.168
 # The toolchain pin of this fork; the kernel checkout carries upstream's own.
 INDY_RUST_TOOLCHAIN?=nightly-2026-10-03
@@ -102,6 +105,6 @@ indy-gate: $(INDY_BUILD)/redox
 	WORK=$(CURDIR)/$(INDY_BUILD)/gate SHELL_CHECK=1 tools/indy-gate.sh $< "$(INDY_MARKER)"
 
 indy-netboot: $(INDY_BUILD)/redox
-	install -m 0644 $< $(INDY_TFTP_DIR)/redox
+	for name in $(INDY_TFTP_NAMES); do install -m 0644 $< $(INDY_TFTP_DIR)/$$name; done
 
 .PHONY: indy indy-gate indy-netboot indy-probe indy-probe-gate

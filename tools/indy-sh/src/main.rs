@@ -181,10 +181,38 @@ fn tcp_server() {
     }
 }
 
+/// True when the interface has a usable address.
+fn has_address() -> bool {
+    match read_trim("/scheme/netcfg/ifaces/eth0/addr/list") {
+        Some(addr) => {
+            !addr.is_empty() && !addr.starts_with("0.0.0.0") && !addr.starts_with("Not")
+        }
+        None => false,
+    }
+}
+
+/// Seconds to wait for DHCP before using the static address from the initfs.
+const DHCP_WAIT_SECS: u32 = 20;
+const STATIC_ADDR_FILE: &str = "/scheme/initfs/etc/net/ip";
+
 fn reporter() {
     let mut reported = String::new();
+    let mut waited = 0;
+    let mut fallback_done = false;
     loop {
         thread::sleep(Duration::from_secs(2));
+        waited += 2;
+        // A network whose server answers BOOTP only (the lab netboot server)
+        // gives no DHCP lease: fall back to the configured static address.
+        if !fallback_done && waited >= DHCP_WAIT_SECS && !has_address() {
+            fallback_done = true;
+            if let Some(addr) = read_trim(STATIC_ADDR_FILE) {
+                match fs::write("/scheme/netcfg/ifaces/eth0/addr/set", &addr) {
+                    Ok(()) => println!("REDOX-INDY-NET: no DHCP lease, static {addr}\r"),
+                    Err(err) => println!("REDOX-INDY-NET: static {addr} failed: {err}\r"),
+                }
+            }
+        }
         let line = net_line();
         if line != reported {
             println!("REDOX-INDY-NET: {line}\r");
