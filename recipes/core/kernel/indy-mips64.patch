@@ -1,4 +1,4 @@
-From f5d855ab0a374bdcaa9a8fcf9db547e48b92b37c Mon Sep 17 00:00:00 2001
+From bebca412a07463f5ccb69bee9fbcd35e05ad9b25 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -49,7 +49,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/ipi.rs                 |  24 ++
  src/arch/mips64/misc.rs                |  60 ++++
  src/arch/mips64/mod.rs                 |  91 ++++++
- src/arch/mips64/paging.rs              |  15 +
+ src/arch/mips64/paging.rs              |  25 ++
  src/arch/mips64/start.rs               | 307 ++++++++++++++++++++
  src/arch/mips64/stop.rs                |  30 ++
  src/arch/mips64/time.rs                |  61 ++++
@@ -68,7 +68,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 ++
- 40 files changed, 2786 insertions(+), 12 deletions(-)
+ 40 files changed, 2796 insertions(+), 12 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/consts.rs
@@ -858,7 +858,7 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..c6e18a7b
+index 00000000..db11c806
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
 @@ -0,0 +1,365 @@
@@ -890,35 +890,35 @@ index 00000000..c6e18a7b
 +const VECTOR_XTLB_REFILL: usize = 0x8000_0080;
 +const VECTOR_GENERAL: usize = 0x8000_0180;
 +
-+/// Copy the vector stub to the three vector addresses and make it visible to
-+/// the instruction cache.
++/// Copy the vector stub to the three vector addresses.
++///
++/// The stub is written through kseg1, so RAM holds it at once and no data
++/// cache geometry matters. Before the write, any cached copy of the line is
++/// written back and dropped (`Hit_Writeback_Inv_D`), so a stale dirty line
++/// cannot land on top of the stub later. After it, `Hit_Invalidate_I` makes
++/// the next fetch read RAM. Hit operations match by address, so they are
++/// right for the R4400 (16-byte lines, direct mapped) and for the R4600 and
++/// R5000 (32-byte lines, two ways). The load before the write-back is the
++/// workaround early R4600 revisions need for that operation.
 +pub unsafe fn install_vectors() {
 +    unsafe {
 +        let stub = vector_stub as usize as *const u32;
 +        for vector in [VECTOR_TLB_REFILL, VECTOR_XTLB_REFILL, VECTOR_GENERAL] {
-+            let dst = vector as *mut u32;
++            let _ = (vector as *const u32).read_volatile();
++            core::arch::asm!(
++                "cache 21, 0({0})", // Hit_Writeback_Inv_D
++                in(reg) vector,
++                options(nostack)
++            );
++            let dst = (vector | 0x2000_0000) as *mut u32;
 +            for i in 0..VECTOR_STUB_WORDS {
 +                dst.add(i).write_volatile(stub.add(i).read_volatile());
 +            }
-+        }
-+        flush_caches();
-+    }
-+}
-+
-+/// Write back and invalidate the whole primary data cache and invalidate the
-+/// primary instruction cache (R4400: 16 KiB each, direct mapped, 16- and
-+/// 32-byte lines). `cache` operations are indexed, so any kseg0 address works.
-+pub unsafe fn flush_caches() {
-+    unsafe {
-+        let mut addr: usize = 0x8000_0000;
-+        while addr < 0x8000_0000 + 16 * 1024 {
 +            core::arch::asm!(
-+                "cache 1, 0({0})",  // Index_Writeback_Inv_D
-+                "cache 0, 0({0})",  // Index_Invalidate_I
-+                in(reg) addr,
++                "cache 16, 0({0})", // Hit_Invalidate_I
++                in(reg) vector,
 +                options(nostack)
 +            );
-+            addr += 16;
 +        }
 +    }
 +}
@@ -1996,10 +1996,10 @@ index 00000000..5cd9dc7c
 +}
 diff --git a/src/arch/mips64/paging.rs b/src/arch/mips64/paging.rs
 new file mode 100644
-index 00000000..62d40404
+index 00000000..6822e66e
 --- /dev/null
 +++ b/src/arch/mips64/paging.rs
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,25 @@
 +//! TLB setup: 4 KiB pages, nothing wired, ASID 0, every entry cleared, and
 +//! the exception vectors in place so refills can be served.
 +
@@ -2008,16 +2008,26 @@ index 00000000..62d40404
 +#[cold]
 +pub unsafe fn init() {
 +    unsafe {
++        // Each step reports while the PROM's vectors are still in charge, so
++        // a hang on real hardware names the step it happened in.
++        info!(
++            "Indy: PRId {:#x}, Config {:#x}, Status {:#x}",
++            cp0::read_prid(),
++            cp0::read_config(),
++            cp0::read_status()
++        );
 +        cp0::write_entry_hi(0); // ASID 0
 +        rmm::mips::flush_all();
++        info!("Indy: TLB cleared");
 +        super::interrupt::exception::install_vectors();
++        info!("Indy: vectors written");
 +        // Vectors live in kseg0 now: leave the PROM's bootstrap vectors.
 +        cp0::write_status(cp0::read_status() & !cp0::status::BEV);
 +    }
 +}
 diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
 new file mode 100644
-index 00000000..eea2d40d
+index 00000000..33e9dbd5
 --- /dev/null
 +++ b/src/arch/mips64/start.rs
 @@ -0,0 +1,307 @@
@@ -2175,7 +2185,7 @@ index 00000000..eea2d40d
 +        // TLB cleared, exception vectors in kseg0, BEV off: from here a kernel
 +        // fault prints its registers instead of vanishing into the PROM.
 +        paging::init();
-+        info!("Indy: exception vectors installed, TLB cleared");
++        info!("Indy: BEV off, exceptions come to the kernel");
 +
 +        let ram = ram_bytes();
 +        let kernel_base = consts::RAM_PHYS_BASE + consts::LOW_RESERVED_BYTES;
