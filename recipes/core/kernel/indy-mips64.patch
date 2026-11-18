@@ -1,4 +1,4 @@
-From f8b7a9caf951f952f8cc8ea8fa42affdee1d1637 Mon Sep 17 00:00:00 2001
+From efa7c1532ecadca25706c0da83392703a50e1d03 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -33,19 +33,19 @@ Signed-off-by: belikh <io@belic.net>
  rmm/src/arch/mips.rs                   | 247 ++++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
- src/arch/mips64/cache.rs               | 467 ++++++++++++++++
+ src/arch/mips64/cache.rs               | 467 ++++++++++++++
  src/arch/mips64/consts.rs              |  24 +
  src/arch/mips64/cp0.rs                 | 112 ++++
  src/arch/mips64/debug.rs               |  22 +
  src/arch/mips64/device/arcs.rs         | 178 ++++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
- src/arch/mips64/device/kbd.rs          | 318 +++++++++++
- src/arch/mips64/device/mod.rs          |  69 +++
- src/arch/mips64/device/newport.rs      | 701 +++++++++++++++++++++++
+ src/arch/mips64/device/kbd.rs          | 318 ++++++++++
+ src/arch/mips64/device/mod.rs          |  69 ++
+ src/arch/mips64/device/newport.rs      | 836 +++++++++++++++++++++++++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 746 +++++++++++++++++++++++++
- src/arch/mips64/interrupt/handler.rs   | 396 +++++++++++++
- src/arch/mips64/interrupt/irq.rs       | 135 +++++
+ src/arch/mips64/interrupt/exception.rs | 746 ++++++++++++++++++++++
+ src/arch/mips64/interrupt/handler.rs   | 396 ++++++++++++
+ src/arch/mips64/interrupt/irq.rs       | 135 ++++
  src/arch/mips64/interrupt/mod.rs       |  47 ++
  src/arch/mips64/interrupt/syscall.rs   |   4 +
  src/arch/mips64/interrupt/trace.rs     |  19 +
@@ -53,31 +53,31 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/misc.rs                |  60 ++
  src/arch/mips64/mod.rs                 |  92 +++
  src/arch/mips64/paging.rs              |  26 +
- src/arch/mips64/start.rs               | 377 +++++++++++++
+ src/arch/mips64/start.rs               | 387 ++++++++++++
  src/arch/mips64/stop.rs                |  47 ++
- src/arch/mips64/time.rs                | 169 ++++++
+ src/arch/mips64/time.rs                | 169 +++++
  src/arch/mod.rs                        |   6 +
- src/context/arch/mips64.rs             | 235 ++++++++
+ src/context/arch/mips64.rs             | 235 +++++++
  src/context/memory.rs                  |  44 +-
  src/context/mod.rs                     |   4 +
  src/devices/mod.rs                     |   2 +
  src/devices/serial.rs                  |  27 +
- src/devices/uart_z85c30.rs             | 196 +++++++
+ src/devices/uart_z85c30.rs             | 196 ++++++
  src/main.rs                            |   1 +
  src/memory/mod.rs                      |  78 ++-
  src/panic.rs                           |  15 +
  src/scheme/irq.rs                      |   2 +
  src/scheme/proc.rs                     |   8 +-
- src/scheme/sys/kdbg.rs                 | 165 ++++++
+ src/scheme/sys/kdbg.rs                 | 165 +++++
  src/scheme/sys/mod.rs                  |  25 +
  src/scheme/user.rs                     |   4 +-
  src/startup/mod.rs                     |  20 +-
  src/syscall/process.rs                 |   4 +
- syscall/src/arch/mips64.rs             | 232 ++++++++
+ syscall/src/arch/mips64.rs             | 232 +++++++
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 +
- 49 files changed, 5468 insertions(+), 19 deletions(-)
+ 49 files changed, 5613 insertions(+), 19 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -1738,14 +1738,15 @@ index 00000000..956b016a
 +}
 diff --git a/src/arch/mips64/device/newport.rs b/src/arch/mips64/device/newport.rs
 new file mode 100644
-index 00000000..186eef1d
+index 00000000..9c660352
 --- /dev/null
 +++ b/src/arch/mips64/device/newport.rs
-@@ -0,0 +1,701 @@
+@@ -0,0 +1,836 @@
 +//! Text console on the Indy's Newport (XL) graphics board.
 +//!
-+//! The kernel draws its console itself: 160 columns by 64 rows of an 8 by 16
-+//! font on the 1280 by 1024 screen, through the REX3 drawing engine. The PROM
++//! The kernel draws its console itself in an 8 by 16 font through the REX3
++//! drawing engine: 160 columns by 64 rows at 1280 by 1024, 128 by 48 at
++//! 1024 by 768. The size comes from the VC2's video timing table. The PROM
 +//! is not called. It has already brought the board up (video timing, pixel
 +//! format, colour map), and that state is kept: the console sets only the
 +//! drawing registers it uses.
@@ -1795,6 +1796,25 @@ index 00000000..186eef1d
 +const STATUS: usize = 0x1338;
 +
 +const STATUS_GFXBUSY: u32 = 1 << 3;
++const STATUS_BACKBUSY: u32 = 1 << 4;
++
++// The display control bus, which reaches the VC2 video timing controller.
++const DCBMODE: usize = 0x0238;
++const DCBDATA0: usize = 0x0240;
++/// DCBMODE for the VC2 (bus address 0): asynchronous acknowledge, one
++/// cycle of chip select setup and hold.
++const VC2_PROTOCOL: u32 = 0x0000_1000 | 0x0080_0000 | 0x0004_0000;
++const DCB_WIDTH_1: u32 = 1;
++const DCB_WIDTH_2: u32 = 2;
++const DCB_WIDTH_3: u32 = 3;
++const DCB_REGISTER_INCREMENT: u32 = 1 << 3;
++/// VC2 register select: the index register, the indexed register, the RAM.
++const VC2_INDEX: u32 = 0x00;
++const VC2_IREG: u32 = 0x10;
++const VC2_RAM: u32 = 0x30;
++/// VC2 indexed registers: video entry pointer and RAM address.
++const VC2_VIDEO_ENTRY: u8 = 0x00;
++const VC2_RAM_ADDRESS: u8 = 0x07;
 +
 +// DRAWMODE0
 +const OP_DRAW: u32 = 2;
@@ -1816,12 +1836,12 @@ index 00000000..186eef1d
 +/// a board whose register reads back as zero.
 +const DM1_CI8: u32 = 1 | (1 << 3) | (1 << 7) | (1 << 8);
 +
-+pub const COLS: usize = 160;
-+pub const ROWS: usize = 64;
++/// The largest screen: 1280 by 1024. The console uses as many columns and
++/// rows as the video mode shows (`screen_size`).
++const MAX_COLS: usize = 160;
++const MAX_ROWS: usize = 64;
 +const CELL_W: usize = 8;
 +const CELL_H: usize = 16;
-+const WIDTH: usize = COLS * CELL_W;
-+const HEIGHT: usize = ROWS * CELL_H;
 +
 +static FONT: &[u8] = include_bytes!("../../../../res/unifont.font");
 +
@@ -1857,12 +1877,13 @@ index 00000000..186eef1d
 +    wr(GO + XYENDI, xy(x1, y1));
 +}
 +
-+/// Copy the rectangle by `dy` pixel rows (negative: up).
-+fn copy_rows(y0: usize, y1: usize, dy: i32) {
++/// Copy rows `y0..=y1` of a `width` pixel wide screen by `dy` pixel rows
++/// (negative: up).
++fn copy_rows(width: usize, y0: usize, y1: usize, dy: i32) {
 +    wait();
 +    wr(DRAWMODE0, OP_SCR2SCR | ADR_BLOCK | DOSETUP | STOPONX | STOPONY);
 +    wr(XYSTARTI, xy(0, y0));
-+    wr(XYENDI, xy(WIDTH - 1, y1));
++    wr(XYENDI, xy(width - 1, y1));
 +    wr(GO + XYMOVE, dy as u32 & 0xffff);
 +}
 +
@@ -1912,7 +1933,9 @@ index 00000000..186eef1d
 +}
 +
 +struct Console {
-+    cells: [[Cell; COLS]; ROWS],
++    cells: [[Cell; MAX_COLS]; MAX_ROWS],
++    cols: usize,
++    rows: usize,
 +    col: usize,
 +    row: usize,
 +    /// The cursor is past the last column: the next character wraps first.
@@ -1935,7 +1958,9 @@ index 00000000..186eef1d
 +}
 +
 +static CONSOLE: Mutex<Console> = Mutex::new(Console {
-+    cells: [[BLANK; COLS]; ROWS],
++    cells: [[BLANK; MAX_COLS]; MAX_ROWS],
++    cols: MAX_COLS,
++    rows: MAX_ROWS,
 +    col: 0,
 +    row: 0,
 +    wrap: false,
@@ -1977,7 +2002,7 @@ index 00000000..186eef1d
 +    }
 +
 +    fn draw_row(&self, row: usize, from: usize) {
-+        for col in from..COLS {
++        for col in from..self.cols {
 +            self.draw(col, row);
 +        }
 +    }
@@ -1985,13 +2010,13 @@ index 00000000..186eef1d
 +    fn hide_cursor(&mut self) {
 +        if self.cursor_drawn {
 +            self.cursor_drawn = false;
-+            self.draw(self.col.min(COLS - 1), self.row);
++            self.draw(self.col.min(self.cols - 1), self.row);
 +        }
 +    }
 +
 +    fn show_cursor(&mut self) {
 +        if self.cursor_on && !self.cursor_drawn {
-+            let col = self.col.min(COLS - 1);
++            let col = self.col.min(self.cols - 1);
 +            let cell = self.cells[self.row][col];
 +            glyph(col, self.row, cell.ch, cell.colours >> 4, cell.colours & 0xf);
 +            self.cursor_drawn = true;
@@ -2004,9 +2029,9 @@ index 00000000..186eef1d
 +        }
 +        let blank = self.blank();
 +        for row in from..to {
-+            self.cells[row] = [blank; COLS];
++            self.cells[row] = [blank; MAX_COLS];
 +        }
-+        fill(0, from * CELL_H, WIDTH - 1, to * CELL_H - 1, self.bg);
++        fill(0, from * CELL_H, self.cols * CELL_W - 1, to * CELL_H - 1, self.bg);
 +    }
 +
 +    fn clear_cols(&mut self, row: usize, from: usize, to: usize) {
@@ -2026,40 +2051,40 @@ index 00000000..186eef1d
 +        );
 +    }
 +
-+    /// Move rows `top + n..ROWS` up by `n` and blank the rows at the bottom.
++    /// Move rows `top + n..self.rows` up by `n` and blank the rows at the bottom.
 +    fn scroll_up(&mut self, top: usize, n: usize) {
-+        let n = n.min(ROWS - top);
++        let n = n.min(self.rows - top);
 +        if n == 0 {
 +            return;
 +        }
-+        if top + n < ROWS {
-+            self.cells.copy_within(top + n..ROWS, top);
-+            copy_rows((top + n) * CELL_H, HEIGHT - 1, -((n * CELL_H) as i32));
++        if top + n < self.rows {
++            self.cells.copy_within(top + n..self.rows, top);
++            copy_rows(self.cols * CELL_W, (top + n) * CELL_H, self.rows * CELL_H - 1, -((n * CELL_H) as i32));
 +        }
-+        self.clear_rows(ROWS - n, ROWS);
++        self.clear_rows(self.rows - n, self.rows);
 +    }
 +
-+    /// Move rows `top..ROWS - n` down by `n` and blank `n` rows at `top`.
++    /// Move rows `top..self.rows - n` down by `n` and blank `n` rows at `top`.
 +    /// The engine copies top to bottom, which would smear an overlapping
 +    /// downward copy, so the rows are redrawn from the cell buffer.
 +    fn scroll_down(&mut self, top: usize, n: usize) {
-+        let n = n.min(ROWS - top);
++        let n = n.min(self.rows - top);
 +        if n == 0 {
 +            return;
 +        }
-+        self.cells.copy_within(top..ROWS - n, top + n);
++        self.cells.copy_within(top..self.rows - n, top + n);
 +        let blank = self.blank();
 +        for row in top..top + n {
-+            self.cells[row] = [blank; COLS];
++            self.cells[row] = [blank; MAX_COLS];
 +        }
-+        for row in top..ROWS {
++        for row in top..self.rows {
 +            self.draw_row(row, 0);
 +        }
 +    }
 +
 +    fn newline(&mut self) {
 +        self.wrap = false;
-+        if self.row + 1 < ROWS {
++        if self.row + 1 < self.rows {
 +            self.row += 1;
 +        } else {
 +            self.scroll_up(0, 1);
@@ -2076,7 +2101,7 @@ index 00000000..186eef1d
 +            colours: self.colours(),
 +        };
 +        self.draw(self.col, self.row);
-+        if self.col + 1 < COLS {
++        if self.col + 1 < self.cols {
 +            self.col += 1;
 +        } else {
 +            self.wrap = true;
@@ -2160,66 +2185,66 @@ index 00000000..186eef1d
 +        let n = self.param(0, 1);
 +        match last {
 +            b'A' => self.row = self.row.saturating_sub(n),
-+            b'B' | b'e' => self.row = (self.row + n).min(ROWS - 1),
-+            b'C' | b'a' => self.col = (self.col + n).min(COLS - 1),
-+            b'D' => self.col = self.col.min(COLS - 1).saturating_sub(n),
++            b'B' | b'e' => self.row = (self.row + n).min(self.rows - 1),
++            b'C' | b'a' => self.col = (self.col + n).min(self.cols - 1),
++            b'D' => self.col = self.col.min(self.cols - 1).saturating_sub(n),
 +            b'E' => {
-+                self.row = (self.row + n).min(ROWS - 1);
++                self.row = (self.row + n).min(self.rows - 1);
 +                self.col = 0;
 +            }
 +            b'F' => {
 +                self.row = self.row.saturating_sub(n);
 +                self.col = 0;
 +            }
-+            b'G' | b'`' => self.col = (n - 1).min(COLS - 1),
-+            b'd' => self.row = (n - 1).min(ROWS - 1),
++            b'G' | b'`' => self.col = (n - 1).min(self.cols - 1),
++            b'd' => self.row = (n - 1).min(self.rows - 1),
 +            b'H' | b'f' => {
-+                self.row = (n - 1).min(ROWS - 1);
-+                self.col = (self.param(1, 1) - 1).min(COLS - 1);
++                self.row = (n - 1).min(self.rows - 1);
++                self.col = (self.param(1, 1) - 1).min(self.cols - 1);
 +            }
 +            b'J' => match self.param(0, 0) {
 +                0 => {
-+                    self.clear_cols(self.row, self.col.min(COLS - 1), COLS);
-+                    self.clear_rows(self.row + 1, ROWS);
++                    self.clear_cols(self.row, self.col.min(self.cols - 1), self.cols);
++                    self.clear_rows(self.row + 1, self.rows);
 +                }
 +                1 => {
 +                    self.clear_rows(0, self.row);
-+                    self.clear_cols(self.row, 0, self.col.min(COLS - 1) + 1);
++                    self.clear_cols(self.row, 0, self.col.min(self.cols - 1) + 1);
 +                }
-+                _ => self.clear_rows(0, ROWS),
++                _ => self.clear_rows(0, self.rows),
 +            },
 +            b'K' => match self.param(0, 0) {
-+                0 => self.clear_cols(self.row, self.col.min(COLS - 1), COLS),
-+                1 => self.clear_cols(self.row, 0, self.col.min(COLS - 1) + 1),
-+                _ => self.clear_cols(self.row, 0, COLS),
++                0 => self.clear_cols(self.row, self.col.min(self.cols - 1), self.cols),
++                1 => self.clear_cols(self.row, 0, self.col.min(self.cols - 1) + 1),
++                _ => self.clear_cols(self.row, 0, self.cols),
 +            },
 +            b'L' => self.scroll_down(self.row, n),
 +            b'M' => self.scroll_up(self.row, n),
 +            b'S' => self.scroll_up(0, n),
 +            b'T' => self.scroll_down(0, n),
 +            b'P' => {
-+                let col = self.col.min(COLS - 1);
-+                let n = n.min(COLS - col);
++                let col = self.col.min(self.cols - 1);
++                let n = n.min(self.cols - col);
 +                let blank = self.blank();
-+                self.cells[self.row].copy_within(col + n..COLS, col);
-+                for cell in &mut self.cells[self.row][COLS - n..] {
++                self.cells[self.row].copy_within(col + n..self.cols, col);
++                for cell in &mut self.cells[self.row][self.cols - n..] {
 +                    *cell = blank;
 +                }
 +                self.draw_row(self.row, col);
 +            }
 +            b'@' => {
-+                let col = self.col.min(COLS - 1);
-+                let n = n.min(COLS - col);
++                let col = self.col.min(self.cols - 1);
++                let n = n.min(self.cols - col);
 +                let blank = self.blank();
-+                self.cells[self.row].copy_within(col..COLS - n, col + n);
++                self.cells[self.row].copy_within(col..self.cols - n, col + n);
 +                for cell in &mut self.cells[self.row][col..col + n] {
 +                    *cell = blank;
 +                }
 +                self.draw_row(self.row, col);
 +            }
 +            b'X' => {
-+                let col = self.col.min(COLS - 1);
-+                self.clear_cols(self.row, col, (col + n).min(COLS));
++                let col = self.col.min(self.cols - 1);
++                self.clear_cols(self.row, col, (col + n).min(self.cols));
 +            }
 +            b'm' => self.sgr(),
 +            b's' => self.saved = (self.col, self.row),
@@ -2230,7 +2255,7 @@ index 00000000..186eef1d
 +                    self.reply(b"\x1b[");
 +                    self.reply_number(self.row + 1);
 +                    self.reply(b";");
-+                    self.reply_number(self.col.min(COLS - 1) + 1);
++                    self.reply_number(self.col.min(self.cols - 1) + 1);
 +                    self.reply(b"R");
 +                }
 +                _ => {}
@@ -2250,7 +2275,7 @@ index 00000000..186eef1d
 +        self.col = 0;
 +        self.row = 0;
 +        self.wrap = false;
-+        self.clear_rows(0, ROWS);
++        self.clear_rows(0, self.rows);
 +    }
 +
 +    fn ground(&mut self, byte: u8) {
@@ -2293,11 +2318,11 @@ index 00000000..186eef1d
 +                self.wrap = false;
 +            }
 +            0x08 => {
-+                self.col = self.col.min(COLS - 1).saturating_sub(1);
++                self.col = self.col.min(self.cols - 1).saturating_sub(1);
 +                self.wrap = false;
 +            }
 +            b'\t' => {
-+                self.col = ((self.col / 8 + 1) * 8).min(COLS - 1);
++                self.col = ((self.col / 8 + 1) * 8).min(self.cols - 1);
 +                self.wrap = false;
 +            }
 +            0x00..=0x1f | 0x7f => {}
@@ -2391,8 +2416,113 @@ index 00000000..186eef1d
 +    }
 +}
 +
++fn dcb_wait() {
++    for _ in 0..200_000 {
++        if rd(STATUS) & STATUS_BACKBUSY == 0 {
++            return;
++        }
++    }
++}
++
++fn vc2_set(register: u8, value: u16) {
++    wr(
++        DCBMODE,
++        VC2_INDEX | DCB_WIDTH_3 | DCB_REGISTER_INCREMENT | VC2_PROTOCOL,
++    );
++    wr(DCBDATA0, ((register as u32) << 24) | ((value as u32) << 8));
++}
++
++fn vc2_get(register: u8) -> u16 {
++    wr(
++        DCBMODE,
++        VC2_INDEX | DCB_WIDTH_1 | DCB_REGISTER_INCREMENT | VC2_PROTOCOL,
++    );
++    // One byte, in the low byte lane of the data register.
++    unsafe { ((REX3 + DCBDATA0 + 3) as *mut u8).write_volatile(register) };
++    wr(
++        DCBMODE,
++        VC2_IREG | DCB_WIDTH_2 | DCB_REGISTER_INCREMENT | VC2_PROTOCOL,
++    );
++    vc2_ram_word()
++}
++
++/// The next 16-bit word of whatever DCBMODE selects, from the low half of
++/// the data register.
++fn vc2_ram_word() -> u16 {
++    dcb_wait();
++    unsafe { ((REX3 + DCBDATA0 + 2) as *const u16).read_volatile() }
++}
++
++/// The visible size in pixels, from the video timing table the PROM loaded
++/// into the VC2. The frame table at the video entry pointer is pairs of
++/// (line table address, repeat count), ended by a zero count; a line table
++/// is a run of entries whose bit 0 clear marks displayed pixels, with the
++/// pixel count in bits 8..14 (times two) and bit 15 on the last entry. This
++/// is the method of Linux's Newport console (`newport_get_screensize`),
++/// reimplemented from its description of the table format.
++///
++/// Falls back to 1024 by 768, which every Indy monitor mode can show, when
++/// the result is not a plausible mode.
++fn screen_size() -> (usize, usize) {
++    let mut frame = [0u16; 128];
++    let entry = vc2_get(VC2_VIDEO_ENTRY);
++    vc2_set(VC2_RAM_ADDRESS, entry);
++    wr(DCBMODE, VC2_RAM | DCB_WIDTH_2 | VC2_PROTOCOL);
++    for word in frame.iter_mut() {
++        *word = vc2_ram_word();
++    }
++    let mut width = 0;
++    let mut height = 0;
++    let mut index = 0;
++    while index + 1 < frame.len() && frame[index + 1] != 0 {
++        let mut pixels = 0usize;
++        vc2_set(VC2_RAM_ADDRESS, frame[index]);
++        wr(DCBMODE, VC2_RAM | DCB_WIDTH_2 | VC2_PROTOCOL);
++        // Bounded: a table that never ends must not hang the boot.
++        for _ in 0..256 {
++            let mut entry = vc2_ram_word();
++            if entry & 1 == 0 {
++                pixels += ((entry >> 7) & 0xfe) as usize;
++            }
++            if entry & 0x80 == 0 {
++                entry = vc2_ram_word();
++            }
++            if entry & 0x8000 != 0 {
++                break;
++            }
++        }
++        if pixels != 0 {
++            width = width.max(pixels);
++            height += frame[index + 1] as usize;
++        }
++        index += 2;
++    }
++    *RAW.lock() = (entry, [frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]], width, height);
++    // The pixel count runs a couple of pixels over the nominal width
++    // (1282 for 1280).
++    if (640..=1300).contains(&width) && (480..=1024).contains(&height) {
++        (width.min(1280), height)
++    } else {
++        (1024, 768)
++    }
++}
++
++/// What `screen_size` read, for the boot log: the video entry pointer, the
++/// first frame table words, and the size they add up to.
++pub static RAW: Mutex<(u16, [u16; 6], usize, usize)> = Mutex::new((0, [0; 6], 0, 0));
++
++static SIZE: Mutex<(usize, usize)> = Mutex::new((0, 0));
++
++/// The screen size in pixels that `init` found.
++pub fn size() -> (usize, usize) {
++    *SIZE.lock()
++}
++
 +/// Take over the screen. Call when the PROM's console is the graphics board.
 +pub fn init() {
++    wait();
++    let (width, height) = screen_size();
++    *SIZE.lock() = (width, height);
 +    wait();
 +    // Screen coordinates start at (0, 0) at the top left.
 +    wr(XYWIN, (4096 << 16) | 4096);
@@ -2404,7 +2534,12 @@ index 00000000..186eef1d
 +    let planes = if prom & 7 == 0 { DM1_CI8 } else { prom };
 +    wr(DRAWMODE1, planes | DM1_COMPARE_OFF | DM1_LOGIC_SRC);
 +    let mut console = CONSOLE.lock();
-+    console.clear_rows(0, ROWS);
++    console.cols = (width / CELL_W).min(MAX_COLS);
++    console.rows = (height / CELL_H).min(MAX_ROWS);
++    // Clear the whole frame, also the part past the last text row.
++    fill(0, 0, 1279, 1023, DEFAULT_BG);
++    let rows = console.rows;
++    console.clear_rows(0, rows);
 +    console.show_cursor();
 +    drop(console);
 +    ACTIVE.store(true, Ordering::Relaxed);
@@ -4074,10 +4209,10 @@ index 00000000..599f5488
 +}
 diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
 new file mode 100644
-index 00000000..72848cf5
+index 00000000..fcb5e1be
 --- /dev/null
 +++ b/src/arch/mips64/start.rs
-@@ -0,0 +1,377 @@
+@@ -0,0 +1,387 @@
 +//! Kernel entry from the SGI PROM.
 +//!
 +//! `boot -f bootp()redox` loads the ECOFF image at kseg0 0x8804_0000 and
@@ -4271,11 +4406,21 @@ index 00000000..72848cf5
 +
 +        info!("Redox OS starting...");
 +        match keyboard {
-+            Some(true) => {
-+                info!("Indy: console on the Newport screen and the IOC2 keyboard");
-+            }
-+            Some(false) => {
-+                info!("Indy: console on the Newport screen; the keyboard did not answer");
++            Some(answered) => {
++                let (width, height) = device::newport::size();
++                {
++                    let raw = device::newport::RAW.lock();
++                    info!(
++                        "Indy: VC2 video entry {:#x}, frame table {:x?}, timing table adds up to {} by {}",
++                        raw.0, raw.1, raw.2, raw.3
++                    );
++                }
++                info!(
++                    "Indy: console on the Newport screen, {} by {}, and the IOC2 keyboard{}",
++                    width,
++                    height,
++                    if answered { "" } else { " (no answer from the keyboard)" }
++                );
 +            }
 +            None => {
 +                info!("Indy: console on Serial Port 1");

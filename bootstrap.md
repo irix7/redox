@@ -790,6 +790,13 @@ and none of them is on the critical path to "the machine runs our code".
   counts and how many keyboard bytes that fallback found (0 in iris). `ping` works:
   netutils built a `TimeSpec` in an unaligned byte array, which `libredox` asserts on
   where `time_t` needs 8-byte alignment.
+  Real machine, same day: 1,444 serial interrupts by the time the TCP shell was up, so
+  the mappable line reaches the CPU; keyboard interrupts need someone typing.
+- **T8g — console size.** 2026-11-18. The owner's Indy runs 1024 by 768 and the first
+  console assumed 1280 by 1024, so its last 16 rows were below the screen. The console
+  now reads the VC2's video timing table through the DCB and sizes itself: 128 by 48
+  there, 160 by 64 in iris. The table adds up to exactly 1024 by 768 on the real VC2
+  (video entry 0x400) and to 1282 by 1024 in iris.
 - **T9 — next.** T8f on the real machine (`cachestat` after typing); a faster scroll
   (TOPSCAN). Then: each process is still a
   private static image read whole (no shared or demand-paged text), `zerod` runs twice,
