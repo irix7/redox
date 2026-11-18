@@ -797,6 +797,19 @@ and none of them is on the critical path to "the machine runs our code".
   now reads the VC2's video timing table through the DCB and sizes itself: 128 by 48
   there, 160 by 64 in iris. The table adds up to exactly 1024 by 768 on the real VC2
   (video entry 0x400) and to 1282 by 1024 in iris.
+- **T8h — Doom.** 2026-11-18, in the emulator. `doom-rs` (github.com/bejiihiu/doom-rs,
+  GPL-2.0-or-later, a Rust rewrite of linuxdoom-1.10 with fixed-point maths and UDP net
+  play) runs as `/usr/bin/doom` with the shareware `doom1.wad`. The engine library builds
+  for the target unchanged; `recipes/games/doom-rs/indy-mips64.patch` adds the front end
+  (`indy/`): frames go to REX3 from user mode as one block draw with host colour data,
+  doubled to 640 by 400, the palette goes to the colour maps through the DCB, and keys
+  come from the console. The kernel console lends the screen and the keyboard with
+  `CSI ? 9900 h` (it stops drawing, and scancodes arrive as two letters per byte) and
+  takes them back with `CSI ? 9900 l` or Control-Alt-Backspace. With `-nosound`, which
+  the front end forces, the engine no longer renders music (a whole track up front,
+  33 MB for E1M1) or preloads sounds: its heap in E1M1 is 8.4 MB on the host. In iris:
+  title, menu, E1M1, walking and firing, quit back to the shell, 24.9 frames a second.
+  Not run on the real machine; no sound; net play not tried yet.
 - **T9 — next.** T8f on the real machine (`cachestat` after typing); a faster scroll
   (TOPSCAN). Then: each process is still a
   private static image read whole (no shared or demand-paged text), `zerod` runs twice,

@@ -1,4 +1,4 @@
-From efa7c1532ecadca25706c0da83392703a50e1d03 Mon Sep 17 00:00:00 2001
+From 8aad1556f4110bd9cfc5337834b5ac676aeced42 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -30,21 +30,21 @@ Signed-off-by: belikh <io@belic.net>
 ---
  Makefile                               |   7 +
  linkers/mips64.ld                      |  60 ++
- rmm/src/arch/mips.rs                   | 247 ++++++++
+ rmm/src/arch/mips.rs                   | 247 +++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
- src/arch/mips64/cache.rs               | 467 ++++++++++++++
+ src/arch/mips64/cache.rs               | 467 +++++++++++++
  src/arch/mips64/consts.rs              |  24 +
- src/arch/mips64/cp0.rs                 | 112 ++++
+ src/arch/mips64/cp0.rs                 | 112 +++
  src/arch/mips64/debug.rs               |  22 +
- src/arch/mips64/device/arcs.rs         | 178 ++++++
+ src/arch/mips64/device/arcs.rs         | 178 +++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
- src/arch/mips64/device/kbd.rs          | 318 ++++++++++
+ src/arch/mips64/device/kbd.rs          | 362 ++++++++++
  src/arch/mips64/device/mod.rs          |  69 ++
- src/arch/mips64/device/newport.rs      | 836 +++++++++++++++++++++++++
+ src/arch/mips64/device/newport.rs      | 933 +++++++++++++++++++++++++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 746 ++++++++++++++++++++++
- src/arch/mips64/interrupt/handler.rs   | 396 ++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 746 ++++++++++++++++++++
+ src/arch/mips64/interrupt/handler.rs   | 396 +++++++++++
  src/arch/mips64/interrupt/irq.rs       | 135 ++++
  src/arch/mips64/interrupt/mod.rs       |  47 ++
  src/arch/mips64/interrupt/syscall.rs   |   4 +
@@ -53,7 +53,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/misc.rs                |  60 ++
  src/arch/mips64/mod.rs                 |  92 +++
  src/arch/mips64/paging.rs              |  26 +
- src/arch/mips64/start.rs               | 387 ++++++++++++
+ src/arch/mips64/start.rs               | 387 ++++++++++
  src/arch/mips64/stop.rs                |  47 ++
  src/arch/mips64/time.rs                | 169 +++++
  src/arch/mod.rs                        |   6 +
@@ -73,11 +73,11 @@ Signed-off-by: belikh <io@belic.net>
  src/scheme/user.rs                     |   4 +-
  src/startup/mod.rs                     |  20 +-
  src/syscall/process.rs                 |   4 +
- syscall/src/arch/mips64.rs             | 232 +++++++
+ syscall/src/arch/mips64.rs             | 232 ++++++
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 +
- 49 files changed, 5613 insertions(+), 19 deletions(-)
+ 49 files changed, 5754 insertions(+), 19 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -1339,10 +1339,10 @@ index 00000000..e8c7e2c3
 +}
 diff --git a/src/arch/mips64/device/kbd.rs b/src/arch/mips64/device/kbd.rs
 new file mode 100644
-index 00000000..3b5f2454
+index 00000000..f3f6a8ff
 --- /dev/null
 +++ b/src/arch/mips64/device/kbd.rs
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,362 @@
 +//! The Indy's keyboard, read from the IOC2's 8042-compatible controller.
 +//!
 +//! The controller is in the IOC2 (0x1FBD_9800): data at offset 0x40, command
@@ -1383,6 +1383,22 @@ index 00000000..3b5f2454
 +const ACK: u8 = 0xfa;
 +
 +static ACTIVE: AtomicBool = AtomicBool::new(false);
++
++/// Raw mode, for a program that needs key presses and releases (the
++/// console's mode 9900): every scancode byte is sent as two letters, the
++/// high nibble as `A`..`P` and the low nibble as `a`..`p`. Letters pass
++/// through a terminal's line discipline whatever its settings, which the
++/// bytes themselves (0x03, 0x11, 0x1A, 0x1C are all key codes) would not.
++/// Control-Alt-Backspace is not sent: it gives the screen back to the
++/// console, for a program that died with the screen.
++static RAW: AtomicBool = AtomicBool::new(false);
++
++pub fn set_raw(raw: bool) {
++    RAW.store(raw, Ordering::Relaxed);
++    BREAK.store(false, Ordering::Relaxed);
++    EXTENDED.store(false, Ordering::Relaxed);
++    MODIFIERS.fetch_and(CAPS, Ordering::Relaxed);
++}
 +
 +// Decoder state. Only the timer tick touches it.
 +static BREAK: AtomicBool = AtomicBool::new(false);
@@ -1574,6 +1590,34 @@ index 00000000..3b5f2454
 +
 +/// Decode one scancode byte; `emit` receives the bytes of a key press.
 +fn decode(byte: u8, emit: &mut dyn FnMut(u8)) {
++    if RAW.load(Ordering::Relaxed) {
++        // Follow the prefixes and Control and Alt far enough to see the
++        // escape chord.
++        let released = byte != 0xf0 && BREAK.swap(false, Ordering::Relaxed);
++        match byte {
++            0xf0 => BREAK.store(true, Ordering::Relaxed),
++            0xe0 => {}
++            0x14 | 0x11 => {
++                let bit = if byte == 0x14 { CONTROL } else { ALT };
++                if released {
++                    MODIFIERS.fetch_and(!bit, Ordering::Relaxed);
++                } else {
++                    MODIFIERS.fetch_or(bit, Ordering::Relaxed);
++                }
++            }
++            0x66 if !released
++                && MODIFIERS.load(Ordering::Relaxed) & (CONTROL | ALT) == CONTROL | ALT =>
++            {
++                if super::newport::force_text() {
++                    return;
++                }
++            }
++            _ => {}
++        }
++        emit(b'A' + (byte >> 4));
++        emit(b'a' + (byte & 0xf));
++        return;
++    }
 +    match byte {
 +        0xe0 => {
 +            EXTENDED.store(true, Ordering::Relaxed);
@@ -1738,10 +1782,10 @@ index 00000000..956b016a
 +}
 diff --git a/src/arch/mips64/device/newport.rs b/src/arch/mips64/device/newport.rs
 new file mode 100644
-index 00000000..9c660352
+index 00000000..672a1485
 --- /dev/null
 +++ b/src/arch/mips64/device/newport.rs
-@@ -0,0 +1,836 @@
+@@ -0,0 +1,933 @@
 +//! Text console on the Indy's Newport (XL) graphics board.
 +//!
 +//! The kernel draws its console itself in an 8 by 16 font through the REX3
@@ -1847,6 +1891,37 @@ index 00000000..9c660352
 +
 +static ACTIVE: AtomicBool = AtomicBool::new(false);
 +
++/// A program has the screen (`CSI ? 9900 h`): it maps REX3 itself and draws
++/// its own frames. The console keeps its cell buffer up to date and draws
++/// nothing until the program gives the screen back (`CSI ? 9900 l`) or the
++/// user presses Control-Alt-Backspace. The keyboard sends key codes instead
++/// of characters meanwhile (`kbd::set_raw`).
++static LENT: AtomicBool = AtomicBool::new(false);
++
++/// DRAWMODE1 for console drawing, kept so that the screen can be taken back
++/// after a program changed it.
++static CONSOLE_DRAWMODE1: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++
++/// DCBMODE for the colour maps (bus address 1, both): the address register
++/// takes a 16-bit index, the palette buffer three bytes of red, green, blue.
++const CMAP_PROTOCOL: u32 = 0x0000_8000 | 0x0004_0000 | 0x0080_0000;
++const CMAP_ALL: u32 = 1 << 7;
++const CMAP_ADDRESS: u32 = 0x00;
++const CMAP_PALETTE: u32 = 0x20;
++const DCB_SWAP: u32 = 1 << 28;
++
++/// The console's eight colours, as the PROM loads them.
++const CONSOLE_COLOURS: [[u8; 3]; 8] = [
++    [0, 0, 0],
++    [255, 0, 0],
++    [0, 255, 0],
++    [255, 255, 0],
++    [0, 0, 255],
++    [255, 0, 255],
++    [0, 255, 255],
++    [255, 255, 255],
++];
++
 +fn rd(reg: usize) -> u32 {
 +    unsafe { ((REX3 + reg) as *const u32).read_volatile() }
 +}
@@ -1870,6 +1945,9 @@ index 00000000..9c660352
 +}
 +
 +fn fill(x0: usize, y0: usize, x1: usize, y1: usize, colour: u8) {
++    if LENT.load(Ordering::Relaxed) {
++        return;
++    }
 +    wait();
 +    wr(DRAWMODE0, OP_DRAW | ADR_BLOCK | DOSETUP | STOPONX | STOPONY);
 +    wr(COLORI, colour as u32);
@@ -1880,6 +1958,9 @@ index 00000000..9c660352
 +/// Copy rows `y0..=y1` of a `width` pixel wide screen by `dy` pixel rows
 +/// (negative: up).
 +fn copy_rows(width: usize, y0: usize, y1: usize, dy: i32) {
++    if LENT.load(Ordering::Relaxed) {
++        return;
++    }
 +    wait();
 +    wr(DRAWMODE0, OP_SCR2SCR | ADR_BLOCK | DOSETUP | STOPONX | STOPONY);
 +    wr(XYSTARTI, xy(0, y0));
@@ -1888,6 +1969,9 @@ index 00000000..9c660352
 +}
 +
 +fn glyph(col: usize, row: usize, ch: u8, fg: u8, bg: u8) {
++    if LENT.load(Ordering::Relaxed) {
++        return;
++    }
 +    let x = col * CELL_W;
 +    let y = row * CELL_H;
 +    wait();
@@ -2172,13 +2256,18 @@ index 00000000..9c660352
 +
 +    fn csi(&mut self, last: u8) {
 +        if self.private {
-+            // DEC private modes: only cursor visibility matters here.
-+            if self.param(0, 0) == 25 {
-+                match last {
-+                    b'h' => self.cursor_on = true,
-+                    b'l' => self.cursor_on = false,
-+                    _ => {}
++            // DEC private modes: cursor visibility, and this console's own
++            // mode 9900, which lends the screen and the keyboard to a
++            // program that draws through REX3 itself.
++            match (self.param(0, 0), last) {
++                (25, b'h') => self.cursor_on = true,
++                (25, b'l') => self.cursor_on = false,
++                (9900, b'h') => {
++                    LENT.store(true, Ordering::Relaxed);
++                    super::kbd::set_raw(true);
 +                }
++                (9900, b'l') => self.take_back(),
++                _ => {}
 +            }
 +            return;
 +        }
@@ -2264,6 +2353,24 @@ index 00000000..9c660352
 +        }
 +        if !matches!(last, b'm' | b'n' | b's') {
 +            self.wrap = false;
++        }
++    }
++
++    /// Take the screen back from a program: console registers, the eight
++    /// console colours, and everything redrawn from the cell buffer.
++    fn take_back(&mut self) {
++        super::kbd::set_raw(false);
++        if !LENT.swap(false, Ordering::Relaxed) {
++            return;
++        }
++        registers();
++        for (index, colour) in CONSOLE_COLOURS.iter().enumerate() {
++            cmap_set(index as u16, *colour);
++        }
++        fill(0, 0, 1279, 1023, DEFAULT_BG);
++        self.cursor_drawn = false;
++        for row in 0..self.rows {
++            self.draw_row(row, 0);
 +        }
 +    }
 +
@@ -2518,11 +2625,23 @@ index 00000000..9c660352
 +    *SIZE.lock()
 +}
 +
-+/// Take over the screen. Call when the PROM's console is the graphics board.
-+pub fn init() {
-+    wait();
-+    let (width, height) = screen_size();
-+    *SIZE.lock() = (width, height);
++/// Load one colour map entry.
++fn cmap_set(index: u16, [red, green, blue]: [u8; 3]) {
++    dcb_wait();
++    wr(
++        DCBMODE,
++        CMAP_ALL | CMAP_PROTOCOL | DCB_SWAP | DCB_REGISTER_INCREMENT | CMAP_ADDRESS | DCB_WIDTH_2,
++    );
++    unsafe { ((REX3 + DCBDATA0 + 2) as *mut u16).write_volatile(index) };
++    wr(DCBMODE, CMAP_ALL | CMAP_PROTOCOL | CMAP_PALETTE | DCB_WIDTH_3);
++    wr(
++        DCBDATA0,
++        ((red as u32) << 24) | ((green as u32) << 16) | ((blue as u32) << 8),
++    );
++}
++
++/// The drawing registers the console relies on.
++fn registers() {
 +    wait();
 +    // Screen coordinates start at (0, 0) at the top left.
 +    wr(XYWIN, (4096 << 16) | 4096);
@@ -2530,9 +2649,31 @@ index 00000000..9c660352
 +    // No screen masks; the window ID comparison stays as the PROM set it.
 +    wr(CLIPMODE, rd(CLIPMODE) & !0x1f);
 +    wr(WRMASK, 0xffff_ffff);
++    wr(DRAWMODE1, CONSOLE_DRAWMODE1.load(Ordering::Relaxed));
++}
++
++/// Give the screen back to the console, from the keyboard driver's
++/// Control-Alt-Backspace. Returns false when the console is busy; the
++/// caller tries again on the next key.
++pub fn force_text() -> bool {
++    let Some(mut console) = CONSOLE.try_lock() else {
++        return false;
++    };
++    console.take_back();
++    console.show_cursor();
++    true
++}
++
++/// Take over the screen. Call when the PROM's console is the graphics board.
++pub fn init() {
++    wait();
++    let (width, height) = screen_size();
++    *SIZE.lock() = (width, height);
++    wait();
 +    let prom = rd(DRAWMODE1) & DM1_KEEP;
 +    let planes = if prom & 7 == 0 { DM1_CI8 } else { prom };
-+    wr(DRAWMODE1, planes | DM1_COMPARE_OFF | DM1_LOGIC_SRC);
++    CONSOLE_DRAWMODE1.store(planes | DM1_COMPARE_OFF | DM1_LOGIC_SRC, Ordering::Relaxed);
++    registers();
 +    let mut console = CONSOLE.lock();
 +    console.cols = (width / CELL_W).min(MAX_COLS);
 +    console.rows = (height / CELL_H).min(MAX_ROWS);

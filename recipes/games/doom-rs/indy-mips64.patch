@@ -1,0 +1,892 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 83faed5..71fbfda 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -644,6 +644,14 @@ dependencies = [
+  "tracing-subscriber",
+ ]
+ 
++[[package]]
++name = "doom-indy"
++version = "1.0.0"
++dependencies = [
++ "doom-engine",
++ "libc",
++]
++
+ [[package]]
+ name = "doom-rs"
+ version = "1.0.0"
+@@ -1069,8 +1077,6 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
+ [[package]]
+ name = "libc"
+ version = "0.2.191"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+ 
+ [[package]]
+ name = "libloading"
+@@ -2997,3 +3003,11 @@ name = "zmij"
+ version = "1.0.23"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
++
++[[patch.unused]]
++name = "redox_syscall"
++version = "0.9.6"
++
++[[patch.unused]]
++name = "redox_syscall"
++version = "0.5.11"
+diff --git a/Cargo.toml b/Cargo.toml
+index ba36397..ba7d938 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3,6 +3,7 @@ resolver = "3"
+ members = [
+     "engine",
+     "doom-rs",
++    "indy",
+     "tools/wad-inspector",
+     "tools/asset-inspector",
+     "tools/demo-analyzer",
+diff --git a/engine/src/game/game.rs b/engine/src/game/game.rs
+index 4aca5d7..c65dc28 100644
+--- a/engine/src/game/game.rs
++++ b/engine/src/game/game.rs
+@@ -489,7 +489,11 @@ impl Game {
+             sfx_volume: sfx_volume * 8,
+             map_number: 0,
+         });
+-        sound.preload_sounds(&resources)?;
++        // With -nosound nothing is ever mixed: leave the samples (about
++        // 1.5 MB decoded) in the WAD.
++        if !args.no_sound {
++            sound.preload_sounds(&resources)?;
++        }
+ 
+         // genmidi bank (optional)
+         let genmidi = resources
+@@ -504,6 +508,7 @@ impl Game {
+ 
+         let mut music = MusicEngine::new(crate::music::DEFAULT_SAMPLE_RATE);
+         music.set_volume((music_volume * 8) as u8);
++        music.set_enabled(!args.no_sound);
+ 
+         // renderer assets
+         let assets = super::render::RenderAssets::build(&resources)?;
+diff --git a/engine/src/music/engine.rs b/engine/src/music/engine.rs
+index 68a866c..82a6e58 100644
+--- a/engine/src/music/engine.rs
++++ b/engine/src/music/engine.rs
+@@ -56,6 +56,10 @@ pub struct MusicEngine {
+     samples: Option<Vec<f32>>,
+     cursor: usize,
+     playing: bool,
++    /// False with `-nosound`: tracks are not rendered at all. Rendering a
++    /// track means synthesizing all of it up front, tens of megabytes of
++    /// samples, which a platform without audio output should not pay for.
++    enabled: bool,
+ }
+ 
+ impl Default for MusicEngine {
+@@ -74,6 +78,16 @@ impl MusicEngine {
+             samples: None,
+             cursor: 0,
+             playing: false,
++            enabled: true,
++        }
++    }
++
++    /// Turns track rendering on or off. Off, `play_mus` and
++    /// `play_mus_fallback` succeed without doing anything.
++    pub fn set_enabled(&mut self, enabled: bool) {
++        self.enabled = enabled;
++        if !enabled {
++            self.stop();
+         }
+     }
+ 
+@@ -129,6 +143,9 @@ impl MusicEngine {
+     /// from the `GENMIDI` lump, or [`GenmidiBank::fallback_bank`] via
+     /// [`MusicEngine::play_mus_fallback`] when the lump is missing.
+     pub fn play_mus(&mut self, mus_data: &[u8], bank: &GenmidiBank) -> Result<(), MusicError> {
++        if !self.enabled {
++            return Ok(());
++        }
+         let song = parse_mus(mus_data)?;
+         let opl_bank = bank.to_opl_bank();
+         let pcm = synthesize(&song, Some(bank), &opl_bank, self.sample_rate)?;
+@@ -144,6 +161,9 @@ impl MusicEngine {
+     /// bright, sustaining voice shared by every program — but keeps the
+     /// music audible for WADs that do not ship a `GENMIDI` lump.
+     pub fn play_mus_fallback(&mut self, mus_data: &[u8]) -> Result<(), MusicError> {
++        if !self.enabled {
++            return Ok(());
++        }
+         let song = parse_mus(mus_data)?;
+         let opl_bank = GenmidiBank::fallback_bank();
+         let pcm = synthesize(&song, None, &opl_bank, self.sample_rate)?;
+diff --git a/indy/Cargo.toml b/indy/Cargo.toml
+new file mode 100644
+index 0000000..45f7894
+--- /dev/null
++++ b/indy/Cargo.toml
+@@ -0,0 +1,15 @@
++[package]
++name = "doom-indy"
++description = "doom-rs front end for Redox on the SGI Indy: Newport (REX3) video, console keyboard"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++repository.workspace = true
++
++[[bin]]
++name = "doom"
++path = "src/main.rs"
++
++[dependencies]
++doom-engine = { path = "../engine" }
++libc = "0.2"
+diff --git a/indy/src/keyboard.rs b/indy/src/keyboard.rs
+new file mode 100644
+index 0000000..b05b67a
+--- /dev/null
++++ b/indy/src/keyboard.rs
+@@ -0,0 +1,240 @@
++//! The terminal in raw mode and the keyboard's scancodes.
++//!
++//! While the console lends the keyboard (see `main.rs`), every scancode
++//! byte arrives as two letters. The keyboard sends scancode set 2: a make
++//! code on press, 0xF0 then the code on release, 0xE0 before the codes of
++//! the cursor and right-hand modifier keys.
++
++use std::io::{Read, Write};
++use std::time::{Duration, Instant};
++
++use doom_engine::game::{InputEvent, keys};
++
++const RALT: u8 = 0x80 + 0x38;
++
++pub struct Terminal {
++    saved: libc::termios,
++}
++
++impl Terminal {
++    /// Standard input without echo, line editing or signal keys, and
++    /// non-blocking.
++    pub fn raw() -> Result<Self, String> {
++        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
++        if unsafe { libc::tcgetattr(0, &mut saved) } != 0 {
++            return Err("standard input is not a terminal".into());
++        }
++        let mut raw = saved;
++        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
++        raw.c_iflag &= !(libc::IXON | libc::ICRNL | libc::INLCR | libc::ISTRIP);
++        raw.c_cc[libc::VMIN] = 0;
++        raw.c_cc[libc::VTIME] = 0;
++        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
++            return Err("could not put the terminal in raw mode".into());
++        }
++        unsafe {
++            let flags = libc::fcntl(0, libc::F_GETFL);
++            libc::fcntl(0, libc::F_SETFL, flags | libc::O_NONBLOCK);
++        }
++        Ok(Self { saved })
++    }
++
++    pub fn restore(&mut self) {
++        unsafe {
++            let flags = libc::fcntl(0, libc::F_GETFL);
++            libc::fcntl(0, libc::F_SETFL, flags & !libc::O_NONBLOCK);
++            libc::tcsetattr(0, libc::TCSANOW, &self.saved);
++        }
++    }
++
++    /// What is waiting on standard input, without blocking.
++    pub fn read(&mut self, buf: &mut [u8]) -> usize {
++        std::io::stdin().read(buf).unwrap_or(0)
++    }
++
++    pub fn drain(&mut self) {
++        let mut buf = [0u8; 64];
++        while self.read(&mut buf) != 0 {}
++    }
++
++    /// The screen size in pixels, from the console's cursor position report
++    /// for the bottom right corner (cells are 8 by 16). 1024 by 768 when
++    /// the console does not answer within a second.
++    pub fn screen_pixels(&mut self) -> (usize, usize) {
++        let mut out = std::io::stdout();
++        let _ = out.write_all(b"\x1b[s\x1b[999;999H\x1b[6n\x1b[u");
++        let _ = out.flush();
++        let deadline = Instant::now() + Duration::from_secs(1);
++        let mut reply = Vec::new();
++        let mut buf = [0u8; 32];
++        while Instant::now() < deadline && !reply.contains(&b'R') {
++            let n = self.read(&mut buf);
++            reply.extend_from_slice(&buf[..n]);
++            if n == 0 {
++                std::thread::sleep(Duration::from_millis(10));
++            }
++        }
++        let text = String::from_utf8_lossy(&reply);
++        let size = text
++            .rsplit_once('[')
++            .and_then(|(_, rest)| rest.split_once('R'))
++            .and_then(|(body, _)| body.split_once(';'))
++            .and_then(|(rows, cols)| Some((cols.parse::<usize>().ok()?, rows.parse::<usize>().ok()?)));
++        match size {
++            Some((cols, rows)) if cols >= 80 && rows >= 25 => (cols * 8, rows * 16),
++            _ => (1024, 768),
++        }
++    }
++}
++
++/// Scancode set 2 to the engine's key codes (`doomdef.h`).
++fn key(code: u8, extended: bool) -> Option<u8> {
++    if extended {
++        return Some(match code {
++            0x75 => keys::UPARROW,
++            0x72 => keys::DOWNARROW,
++            0x6b => keys::LEFTARROW,
++            0x74 => keys::RIGHTARROW,
++            0x14 => keys::RCTRL,
++            0x11 => RALT,
++            0x5a => keys::ENTER,
++            0x4a => b'/',
++            _ => return None,
++        });
++    }
++    Some(match code {
++        0x76 => keys::ESCAPE,
++        0x0d => keys::TAB,
++        0x5a => keys::ENTER,
++        0x66 => keys::BACKSPACE,
++        0x14 => keys::RCTRL,
++        0x12 | 0x59 => keys::RSHIFT,
++        0x11 => RALT,
++        0x29 => b' ',
++        0x05 => keys::F1,
++        0x06 => keys::F2,
++        0x04 => keys::F3,
++        0x0c => keys::F4,
++        0x03 => keys::F5,
++        0x0b => keys::F6,
++        0x83 => 0x80 + 0x41,
++        0x0a => keys::F8,
++        0x01 => keys::F9,
++        0x09 => keys::F10,
++        0x78 => keys::F11,
++        0x07 => keys::F12,
++        0x1c => b'a',
++        0x32 => b'b',
++        0x21 => b'c',
++        0x23 => b'd',
++        0x24 => b'e',
++        0x2b => b'f',
++        0x34 => b'g',
++        0x33 => b'h',
++        0x43 => b'i',
++        0x3b => b'j',
++        0x42 => b'k',
++        0x4b => b'l',
++        0x3a => b'm',
++        0x31 => b'n',
++        0x44 => b'o',
++        0x4d => b'p',
++        0x15 => b'q',
++        0x2d => b'r',
++        0x1b => b's',
++        0x2c => b't',
++        0x3c => b'u',
++        0x2a => b'v',
++        0x1d => b'w',
++        0x22 => b'x',
++        0x35 => b'y',
++        0x1a => b'z',
++        0x16 => b'1',
++        0x1e => b'2',
++        0x26 => b'3',
++        0x25 => b'4',
++        0x2e => b'5',
++        0x36 => b'6',
++        0x3d => b'7',
++        0x3e => b'8',
++        0x46 => b'9',
++        0x45 => b'0',
++        0x4e => b'-',
++        0x55 => b'=',
++        0x41 => b',',
++        0x49 => b'.',
++        0x4a => b'/',
++        0x4c => b';',
++        0x52 => b'\'',
++        0x54 => b'[',
++        0x5b => b']',
++        0x5d => b'\\',
++        0x0e => b'`',
++        // Keypad cursor keys with Num Lock off, as vanilla players use them.
++        0x75 => keys::UPARROW,
++        0x72 => keys::DOWNARROW,
++        0x6b => keys::LEFTARROW,
++        0x74 => keys::RIGHTARROW,
++        _ => return None,
++    })
++}
++
++pub struct Decoder {
++    high: Option<u8>,
++    extended: bool,
++    released: bool,
++    /// Keys held down, so that the keyboard's own repeat is not a new press.
++    down: [bool; 256],
++}
++
++impl Decoder {
++    pub fn new() -> Self {
++        Self {
++            high: None,
++            extended: false,
++            released: false,
++            down: [false; 256],
++        }
++    }
++
++    pub fn feed(&mut self, bytes: &[u8], emit: &mut dyn FnMut(InputEvent)) {
++        for &byte in bytes {
++            match byte {
++                b'A'..=b'P' => self.high = Some(byte - b'A'),
++                b'a'..=b'p' => {
++                    if let Some(high) = self.high.take() {
++                        self.scancode((high << 4) | (byte - b'a'), emit);
++                    }
++                }
++                _ => self.high = None,
++            }
++        }
++    }
++
++    fn scancode(&mut self, code: u8, emit: &mut dyn FnMut(InputEvent)) {
++        match code {
++            0xe0 => {
++                self.extended = true;
++                return;
++            }
++            0xf0 => {
++                self.released = true;
++                return;
++            }
++            _ => {}
++        }
++        let extended = std::mem::take(&mut self.extended);
++        let released = std::mem::take(&mut self.released);
++        let Some(key) = key(code, extended) else {
++            return;
++        };
++        let held = &mut self.down[key as usize];
++        if released {
++            *held = false;
++            emit(InputEvent::KeyUp(key));
++        } else if !*held {
++            *held = true;
++            emit(InputEvent::KeyDown(key));
++        }
++    }
++}
+diff --git a/indy/src/main.rs b/indy/src/main.rs
+new file mode 100644
+index 0000000..37f2270
+--- /dev/null
++++ b/indy/src/main.rs
+@@ -0,0 +1,266 @@
++//! doom-rs on Redox on the SGI Indy.
++//!
++//! The engine is the `doom-engine` library, unchanged. This front end is
++//! the platform: it shows the engine's 320 by 200 indexed frame on the
++//! Newport graphics board, reads key presses and releases from the kernel
++//! console, and paces the loop. Sound is off; the Indy port has no audio
++//! driver.
++//!
++//! The kernel console owns the screen and the keyboard. `CSI ? 9900 h` on
++//! standard output borrows both: the console stops drawing and the keyboard
++//! sends each scancode byte as two letters (`A`..`P` for the high nibble,
++//! `a`..`p` for the low one) on standard input. `CSI ? 9900 l` gives them
++//! back, and Control-Alt-Backspace does the same from the keyboard if this
++//! program dies first.
++
++mod keyboard;
++mod video;
++
++use std::env;
++use std::ffi::OsString;
++use std::io::Write;
++use std::path::PathBuf;
++use std::process::ExitCode;
++use std::time::{Duration, Instant};
++
++use doom_engine::args;
++use doom_engine::config::DoomConfig;
++use doom_engine::game::{Game, GameConfig, KeyBindings, TicCmdInput};
++use doom_engine::gfx::palette::parse_playpal;
++use doom_engine::log::init_logging_with_default;
++use doom_engine::menu::GameMode;
++use doom_engine::render::IndexedFramebuffer;
++use doom_engine::resources::ResourceManager;
++use doom_engine::wad::WadFile;
++
++/// Where the root tree keeps IWADs, after the current directory.
++const IWAD_DIR: &str = "/usr/share/games/doom";
++const IWAD_NAMES: &[&str] = &["doom2.wad", "doomu.wad", "doom.wad", "doom1.wad"];
++
++/// One game tic: the engine runs 35 a second.
++const TIC: Duration = Duration::from_millis(1000 / 35);
++
++fn find_iwad(given: Option<PathBuf>) -> Result<PathBuf, String> {
++    if let Some(path) = given {
++        return if path.is_file() {
++            Ok(path)
++        } else {
++            Err(format!("the IWAD given with -iwad is not a file: {}", path.display()))
++        };
++    }
++    for dir in [".", IWAD_DIR] {
++        for name in IWAD_NAMES {
++            let path = PathBuf::from(dir).join(name);
++            if path.is_file() {
++                return Ok(path);
++            }
++        }
++    }
++    Err(format!("no IWAD in the current directory or {IWAD_DIR}; pass -iwad PATH"))
++}
++
++fn game_mode(iwad: &std::path::Path) -> GameMode {
++    let stem = iwad
++        .file_stem()
++        .and_then(|s| s.to_str())
++        .unwrap_or("")
++        .to_ascii_lowercase();
++    match stem.as_str() {
++        "doom2" | "doom2f" | "plutonia" | "tnt" => return GameMode::Commercial,
++        "doomu" => return GameMode::Retail,
++        "doom" => return GameMode::Registered,
++        "doom1" => return GameMode::Shareware,
++        _ => {}
++    }
++    match WadFile::open(iwad) {
++        Ok(wad) if wad.find_lump("MAP01").is_some() => GameMode::Commercial,
++        Ok(wad) if wad.find_lump("E4M1").is_some() => GameMode::Retail,
++        Ok(wad) if wad.find_lump("E3M1").is_some() => GameMode::Registered,
++        _ => GameMode::Shareware,
++    }
++}
++
++/// Puts the terminal back when the game ends, however it ends.
++struct Session {
++    terminal: keyboard::Terminal,
++}
++
++impl Session {
++    fn end() {
++        let mut out = std::io::stdout();
++        let _ = out.write_all(b"\x1b[?9900l");
++        let _ = out.flush();
++    }
++}
++
++impl Drop for Session {
++    fn drop(&mut self) {
++        Session::end();
++        // Key codes typed before the console switched back are still on
++        // their way (the release of the key that quit, at least): let them
++        // arrive and drop them, or the shell reads them as text.
++        std::thread::sleep(Duration::from_millis(300));
++        self.terminal.drain();
++        self.terminal.restore();
++    }
++}
++
++fn run() -> Result<String, String> {
++    let raw: Vec<OsString> = env::args_os().collect();
++    // Errors only: with sound off the engine warns for every sound it
++    // would have played.
++    init_logging_with_default("error");
++    let mut engine_args = args::parse(&raw).map_err(|err| err.to_string())?;
++    // No audio driver on this machine.
++    engine_args.no_sound = true;
++
++    let iwad = find_iwad(engine_args.iwad.clone())?;
++    let config_path = engine_args
++        .config_path
++        .clone()
++        .unwrap_or_else(|| PathBuf::from("doom.cfg"));
++    // A missing file is the defaults. The check is made here because the RAM
++    // filesystem answers "permission denied" for a file that does not exist.
++    let config = if config_path.is_file() {
++        DoomConfig::load(&config_path)
++            .map_err(|err| format!("could not read {}: {err}", config_path.display()))?
++    } else {
++        DoomConfig::default()
++    };
++
++    let mode = game_mode(&iwad);
++    let mut wads = vec![iwad.clone()];
++    wads.extend(engine_args.pwads.iter().cloned());
++    let resources = ResourceManager::from_paths(wads)
++        .map_err(|err| format!("could not load the WAD file(s): {err}"))?;
++    let playpal = resources
++        .lump_data("PLAYPAL")
++        .map(|data| data.to_vec())
++        .map_err(|err| format!("could not read PLAYPAL: {err}"))?;
++    let palette = parse_playpal(&playpal)
++        .map_err(|err| format!("could not parse PLAYPAL: {err}"))?
++        .into_iter()
++        .next()
++        .ok_or("PLAYPAL holds no palette")?;
++    let gamma_level = config
++        .get_i32("usegamma")
++        .clamp(0, doom_engine::render::GAMMA_LEVELS as i32 - 1) as usize;
++    let gamma = *doom_engine::render::level_table(gamma_level);
++
++    let keys = KeyBindings {
++        key_right: config.get_i32("key_right") as u8,
++        key_left: config.get_i32("key_left") as u8,
++        key_up: config.get_i32("key_up") as u8,
++        key_down: config.get_i32("key_down") as u8,
++        key_strafeleft: config.get_i32("key_strafeleft") as u8,
++        key_straferight: config.get_i32("key_straferight") as u8,
++        key_fire: config.get_i32("key_fire") as u8,
++        key_use: config.get_i32("key_use") as u8,
++        key_strafe: config.get_i32("key_strafe") as u8,
++        key_speed: config.get_i32("key_speed") as u8,
++    };
++    let game_config = GameConfig {
++        game_mode: mode,
++        save_dir: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
++        sfx_volume: 0,
++        music_volume: 0,
++        detail_level: config.get_i32("detaillevel"),
++        screen_blocks: config.get_i32("screenblocks"),
++        show_messages: config.get_bool("show_messages"),
++        mouse_sensitivity: config.get_i32("mouse_sensitivity"),
++        keys,
++    };
++    let mut game = Game::new(game_config, resources, &engine_args)
++        .map_err(|err| format!("could not start the game: {err}"))?;
++
++    // The terminal goes raw, then the screen is measured while the console
++    // still answers, then the console lends the screen.
++    let mut session = Session {
++        terminal: keyboard::Terminal::raw()?,
++    };
++    let (width, height) = session.terminal.screen_pixels();
++    {
++        let mut out = std::io::stdout();
++        let _ = out.write_all(b"\x1b[?9900h");
++        let _ = out.flush();
++    }
++    // The request travels through the terminal to the console; drawing
++    // before it arrives would race the console's own drawing.
++    std::thread::sleep(Duration::from_millis(300));
++    session.terminal.drain();
++
++    let mut screen = video::Screen::open(width, height)?;
++    screen.load_palette(&palette.colors, &gamma);
++    screen.clear();
++
++    let mut keyboard = keyboard::Decoder::new();
++    let mut fb = Box::new(IndexedFramebuffer::new());
++    let started = Instant::now();
++    let mut last = started;
++    let mut frames = 0u32;
++    let mut failures = 0;
++    let mut input = [0u8; 256];
++    let result = loop {
++        let frame_start = Instant::now();
++        let n = session.terminal.read(&mut input);
++        keyboard.feed(&input[..n], &mut |event| {
++            game.handle_event(&event);
++        });
++
++        let elapsed = frame_start.duration_since(last).as_millis() as u64;
++        last = frame_start;
++        match game.advance(&TicCmdInput::default(), elapsed, &mut fb) {
++            Ok(()) => failures = 0,
++            Err(err) => {
++                failures += 1;
++                if game.is_net_game() || failures >= 10 {
++                    break Err(format!("the game loop failed: {err}"));
++                }
++            }
++        }
++        screen.present(fb.as_slice());
++        frames += 1;
++        if game.should_quit() {
++            break Ok(());
++        }
++        // A frame that took less than a tic has nothing new to draw yet.
++        let spent = frame_start.elapsed();
++        if spent < TIC {
++            std::thread::sleep(TIC - spent);
++        }
++    };
++    game.net_quit();
++    let seconds = started.elapsed().as_secs_f32().max(0.001);
++    drop(screen);
++    drop(session);
++    result.map(|()| format!("{frames} frames in {seconds:.1} s ({:.1} a second)", frames as f32 / seconds))
++}
++
++fn main() -> ExitCode {
++    // A panic must not leave the console without its screen.
++    let hook = std::panic::take_hook();
++    std::panic::set_hook(Box::new(move |info| {
++        Session::end();
++        hook(info);
++    }));
++    // The engine keeps large tables on the stack; the main thread's 1 MiB
++    // is not enough for it. Pages of the larger stack are only allocated
++    // when touched.
++    let game = std::thread::Builder::new()
++        .name("doom".into())
++        .stack_size(8 << 20)
++        .spawn(run)
++        .map_err(|err| format!("could not start the game thread: {err}"))
++        .and_then(|thread| thread.join().map_err(|_| "the game thread panicked".to_string()))
++        .and_then(|result| result);
++    match game {
++        Ok(summary) => {
++            println!("doom: {summary}");
++            ExitCode::SUCCESS
++        }
++        Err(message) => {
++            eprintln!("doom: {message}");
++            ExitCode::FAILURE
++        }
++    }
++}
+diff --git a/indy/src/video.rs b/indy/src/video.rs
+new file mode 100644
+index 0000000..b9060c0
+--- /dev/null
++++ b/indy/src/video.rs
+@@ -0,0 +1,218 @@
++//! The Newport (XL) graphics board, driven from user mode.
++//!
++//! REX3's registers are mapped from physical 0x1F0F_0000. A frame is one
++//! block draw with host colour data: the destination rectangle, then the
++//! pixels through HOSTRW0, four 8-bit colour indices to a word, most
++//! significant byte first. A register written at its offset plus 0x800
++//! also starts the command. The engine's 320 by 200 frame is doubled to
++//! 640 by 400 and centred.
++//!
++//! The 256 colours go to the colour maps through the display control bus,
++//! one address write and one three-byte palette write per entry.
++//!
++//! Register facts: SGI's REX3 documentation as summarised in the IRIX 7
++//! project's hardware notes, and the register model of the iris emulator.
++
++use std::os::fd::AsRawFd;
++
++const REX3_PHYS: usize = 0x1f0f_0000;
++const REX3_SPAN: usize = 0x2000;
++const GO: usize = 0x0800;
++
++const DRAWMODE1: usize = 0x0000;
++const DRAWMODE0: usize = 0x0004;
++const XYSTARTI: usize = 0x0150;
++const XYENDI: usize = 0x0154;
++const WRMASK: usize = 0x0220;
++const COLORI: usize = 0x0224;
++const HOSTRW0: usize = 0x0230;
++const DCBMODE: usize = 0x0238;
++const DCBDATA0: usize = 0x0240;
++const TOPSCAN: usize = 0x1320;
++const XYWIN: usize = 0x1324;
++const CLIPMODE: usize = 0x1328;
++const STATUS: usize = 0x1338;
++
++const STATUS_GFXBUSY: u32 = 1 << 3;
++const STATUS_BACKBUSY: u32 = 1 << 4;
++
++const OP_DRAW: u32 = 2;
++const ADR_BLOCK: u32 = 1 << 2;
++const DOSETUP: u32 = 1 << 5;
++const COLORHOST: u32 = 1 << 6;
++const STOPONX: u32 = 1 << 8;
++const STOPONY: u32 = 1 << 9;
++
++// DRAWMODE1: keep the plane and depth selection the console uses, and set
++// 8-bit packed host pixels, no comparison, logic op "source".
++const DM1_PLANES_DEPTH: u32 = 0x0000_007f;
++const DM1_RWPACKED: u32 = 1 << 7;
++const DM1_HOSTDEPTH_8: u32 = 1 << 8;
++const DM1_COMPARE_OFF: u32 = 7 << 12;
++const DM1_LOGIC_SRC: u32 = 3 << 28;
++
++const CMAP_PROTOCOL: u32 = 0x0000_8000 | 0x0004_0000 | 0x0080_0000;
++const CMAP_ALL: u32 = 1 << 7;
++const CMAP_ADDRESS: u32 = 0x00;
++const CMAP_PALETTE: u32 = 0x20;
++const DCB_SWAP: u32 = 1 << 28;
++const DCB_INCREMENT: u32 = 1 << 3;
++const DCB_WIDTH_2: u32 = 2;
++const DCB_WIDTH_3: u32 = 3;
++
++const SRC_W: usize = 320;
++const SRC_H: usize = 200;
++
++pub struct Screen {
++    regs: *mut u8,
++    /// Top left corner of the doubled frame.
++    x: usize,
++    y: usize,
++    scale: usize,
++    width: usize,
++    height: usize,
++    row: Vec<u32>,
++}
++
++impl Screen {
++    pub fn open(width: usize, height: usize) -> Result<Self, String> {
++        let file = std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open("/scheme/memory/physical@dev")
++            .map_err(|err| format!("cannot open device memory (are you root?): {err}"))?;
++        let regs = unsafe {
++            libc::mmap(
++                std::ptr::null_mut(),
++                REX3_SPAN,
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_SHARED,
++                file.as_raw_fd(),
++                REX3_PHYS as libc::off_t,
++            )
++        };
++        if regs == libc::MAP_FAILED {
++            return Err("cannot map the graphics board".into());
++        }
++        let scale = if width >= SRC_W * 2 && height >= SRC_H * 2 { 2 } else { 1 };
++        let screen = Self {
++            regs: regs.cast(),
++            x: (width - SRC_W * scale) / 2,
++            y: (height - SRC_H * scale) / 2,
++            scale,
++            width,
++            height,
++            row: vec![0; SRC_W * scale / 4],
++        };
++        screen.wait();
++        screen.wr(XYWIN, (4096 << 16) | 4096);
++        screen.wr(TOPSCAN, 0x3ff);
++        screen.wr(CLIPMODE, screen.rd(CLIPMODE) & !0x1f);
++        screen.wr(WRMASK, 0xffff_ffff);
++        let planes = screen.rd(DRAWMODE1) & DM1_PLANES_DEPTH;
++        screen.wr(
++            DRAWMODE1,
++            planes | DM1_RWPACKED | DM1_HOSTDEPTH_8 | DM1_COMPARE_OFF | DM1_LOGIC_SRC,
++        );
++        Ok(screen)
++    }
++
++    fn rd(&self, reg: usize) -> u32 {
++        unsafe { self.regs.add(reg).cast::<u32>().read_volatile() }
++    }
++
++    fn wr(&self, reg: usize, value: u32) {
++        unsafe { self.regs.add(reg).cast::<u32>().write_volatile(value) }
++    }
++
++    fn wait(&self) {
++        for _ in 0..2_000_000 {
++            if self.rd(STATUS) & STATUS_GFXBUSY == 0 {
++                return;
++            }
++        }
++    }
++
++    fn dcb_wait(&self) {
++        for _ in 0..200_000 {
++            if self.rd(STATUS) & STATUS_BACKBUSY == 0 {
++                return;
++            }
++        }
++    }
++
++    fn xy(x: usize, y: usize) -> u32 {
++        ((x as u32) << 16) | y as u32
++    }
++
++    pub fn clear(&self) {
++        self.wait();
++        self.wr(DRAWMODE0, OP_DRAW | ADR_BLOCK | DOSETUP | STOPONX | STOPONY);
++        self.wr(COLORI, 0);
++        self.wr(XYSTARTI, Self::xy(0, 0));
++        self.wr(GO + XYENDI, Self::xy(self.width.max(1280) - 1, self.height.max(1024) - 1));
++    }
++
++    /// Load the 256 colours, through the gamma table.
++    pub fn load_palette(&self, colours: &[[u8; 3]; 256], gamma: &[u8; 256]) {
++        for (index, [red, green, blue]) in colours.iter().enumerate() {
++            self.dcb_wait();
++            self.wr(
++                DCBMODE,
++                CMAP_ALL | CMAP_PROTOCOL | DCB_SWAP | DCB_INCREMENT | CMAP_ADDRESS | DCB_WIDTH_2,
++            );
++            unsafe {
++                self.regs
++                    .add(DCBDATA0 + 2)
++                    .cast::<u16>()
++                    .write_volatile(index as u16)
++            };
++            self.wr(DCBMODE, CMAP_ALL | CMAP_PROTOCOL | CMAP_PALETTE | DCB_WIDTH_3);
++            self.wr(
++                DCBDATA0,
++                ((gamma[*red as usize] as u32) << 24)
++                    | ((gamma[*green as usize] as u32) << 16)
++                    | ((gamma[*blue as usize] as u32) << 8),
++            );
++        }
++    }
++
++    /// Show one 320 by 200 frame of colour indices.
++    pub fn present(&mut self, frame: &[u8]) {
++        let scale = self.scale;
++        self.wait();
++        // No stop flags: the block runs on through its rows and takes
++        // four pixels from each host word as they arrive.
++        self.wr(DRAWMODE0, OP_DRAW | ADR_BLOCK | COLORHOST);
++        self.wr(XYSTARTI, Self::xy(self.x, self.y));
++        self.wr(
++            XYENDI,
++            Self::xy(self.x + SRC_W * scale - 1, self.y + SRC_H * scale - 1),
++        );
++        let hostrw = unsafe { self.regs.add(GO + HOSTRW0).cast::<u32>() };
++        for line in frame.chunks_exact(SRC_W).take(SRC_H) {
++            if scale == 2 {
++                for (word, pair) in self.row.iter_mut().zip(line.chunks_exact(2)) {
++                    let (a, b) = (pair[0] as u32, pair[1] as u32);
++                    *word = (a << 24) | (a << 16) | (b << 8) | b;
++                }
++            } else {
++                for (word, quad) in self.row.iter_mut().zip(line.chunks_exact(4)) {
++                    *word = u32::from_be_bytes([quad[0], quad[1], quad[2], quad[3]]);
++                }
++            }
++            for _ in 0..scale {
++                for &word in &self.row {
++                    unsafe { hostrw.write_volatile(word) };
++                }
++            }
++        }
++    }
++}
++
++impl Drop for Screen {
++    fn drop(&mut self) {
++        self.wait();
++        unsafe { libc::munmap(self.regs.cast(), REX3_SPAN) };
++    }
++}

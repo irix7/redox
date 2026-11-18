@@ -140,6 +140,7 @@ indy: $(INDY_BUILD)/redox
 # runs it again.
 USERLAND_DIR=$(INDY_BUILD)/userland
 USERLAND_STAMP=$(USERLAND_DIR)/.built
+GAMES_DIR=$(INDY_BUILD)/games
 
 # libc.a is order-only here: its rule runs every time, and a relink of every
 # program takes 25 minutes. After a relibc change run `make indy-userland`.
@@ -158,6 +159,11 @@ indy-root: $(WEBFS_HOST) $(WEBFS_ELF) $(INIT_ELF) $(KDBG_ELF) $(BASE_OUT)/init $
 	mkdir -p $(ROOT_DIR)/usr/bin
 	cp -r config/indy/root/. $(ROOT_DIR)/
 	cp -r $(USERLAND_DIR)/usr $(ROOT_DIR)/
+	# Game data that is not in this repository: IWADs put in $(GAMES_DIR)/doom
+	# (the shareware doom1.wad, sha1 5b2e249b9c5133ec987b3ea77596381dc0d6bc1d).
+	if ls $(GAMES_DIR)/doom/*.wad >/dev/null 2>&1; then \
+		mkdir -p $(ROOT_DIR)/usr/share/games/doom && \
+		cp $(GAMES_DIR)/doom/*.wad $(ROOT_DIR)/usr/share/games/doom/; fi
 	for bin in $(ROOT_BINS); do install -m 0755 $(BASE_OUT)/$$bin $(ROOT_DIR)/usr/bin/$$bin; done
 	install -m 0755 $(INIT_ELF) $(ROOT_DIR)/usr/bin/indy-sh
 	install -m 0755 $(KDBG_ELF) $(ROOT_DIR)/usr/bin/kdbg

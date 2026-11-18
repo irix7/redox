@@ -1,0 +1,11 @@
+[package]
+description = "DOOM engine rewritten in Rust (doom-rs), with the Indy front end from indy-mips64.patch"
+
+# GPL-2.0-or-later, like the patch that adds the Indy front end to it. The
+# program is built and shipped on its own; nothing of it is linked into the
+# MIT-licensed parts of this repository.
+[source]
+git = "https://github.com/bejiihiu/doom-rs"
+
+[build]
+template = "cargo"

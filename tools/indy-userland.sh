@@ -31,6 +31,7 @@ extrautils|recipes/core/extrautils|https://gitlab.redox-os.org/redox-os/extrauti
 kibi|recipes/text/kibi|https://github.com/ilai-deutel/kibi|v0.3.3||kibi
 grep|recipes/tools/uutils-grep|https://github.com/uutils/grep|6754749fa5db1ea7f2df2df2f200567a2094f83c||grep
 sed|recipes/tools/uutils-sed|https://github.com/uutils/sed|ce791636917b4d4d9d79353a69d2e743ab8c5d92||sed
+doom|recipes/games/doom-rs|https://github.com/bejiihiu/doom-rs|9f5b61294b14cfb2fed3fddcd61cf55e3cdf7b85|-p doom-indy|doom
 uutils|recipes/core/uutils|https://github.com/uutils/coreutils|0.11.0|UUTILS|UUTILS
 '
 # uutils builds one package per program (uu_<name>).
