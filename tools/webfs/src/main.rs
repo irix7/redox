@@ -120,9 +120,9 @@ fn ls(mut options: Options) -> Result<(), String> {
     let url = options.words.first().cloned().ok_or(USAGE)?;
     let path = options.words.get(1).cloned().unwrap_or_default();
     let store = store(&mut options, &url)?;
-    let entry = store.resolve(&path, true).map_err(|err| format!("{path}: {err}"))?;
+    let entry = store.resolve(&path, true, true).map_err(|err| format!("{path}: {err}"))?;
     let entries = match entry.kind {
-        Kind::Dir => store.list(&entry).map_err(|err| format!("{path}: {err}"))?,
+        Kind::Dir => store.list(&entry, true).map_err(|err| format!("{path}: {err}"))?,
         _ => vec![entry],
     };
     for entry in entries {
@@ -141,12 +141,12 @@ fn cat(mut options: Options) -> Result<(), String> {
         return Err(USAGE.to_string());
     };
     let store = store(&mut options, &url)?;
-    let entry = store.resolve(&path, true).map_err(|err| format!("{path}: {err}"))?;
+    let entry = store.resolve(&path, true, true).map_err(|err| format!("{path}: {err}"))?;
     let mut out = std::io::stdout().lock();
     let mut buf = vec![0; format::CHUNK];
     let mut offset = 0;
     loop {
-        let n = store.read(&entry, offset, &mut buf).map_err(|err| format!("{path}: {err}"))?;
+        let n = store.read(&entry, offset, &mut buf, true).map_err(|err| format!("{path}: {err}"))?;
         if n == 0 {
             break;
         }

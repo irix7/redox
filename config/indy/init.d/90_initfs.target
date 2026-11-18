@@ -2,7 +2,6 @@
 description = "initfs finalized"
 requires_weak = [
     "00_randd.service",
-    "10_seeqd.service",
     "20_netstack.service",
     "50_rootfs.service",
 ]

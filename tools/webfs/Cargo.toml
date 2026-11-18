@@ -34,3 +34,7 @@ lto = true
 codegen-units = 1
 debug = false
 strip = "symbols"
+
+# SHA-256 runs over every byte read; the rest of the program stays small.
+[profile.release.package.sha2]
+opt-level = 3

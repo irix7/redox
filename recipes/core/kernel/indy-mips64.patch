@@ -1,4 +1,4 @@
-From 8aad1556f4110bd9cfc5337834b5ac676aeced42 Mon Sep 17 00:00:00 2001
+From 47805720787984d3e78ea3b2d0d2123f3eb8070b Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -30,20 +30,20 @@ Signed-off-by: belikh <io@belic.net>
 ---
  Makefile                               |   7 +
  linkers/mips64.ld                      |  60 ++
- rmm/src/arch/mips.rs                   | 247 +++++++
+ rmm/src/arch/mips.rs                   | 332 +++++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
- src/arch/mips64/cache.rs               | 467 +++++++++++++
+ src/arch/mips64/cache.rs               | 622 +++++++++++++++++
  src/arch/mips64/consts.rs              |  24 +
  src/arch/mips64/cp0.rs                 | 112 +++
  src/arch/mips64/debug.rs               |  22 +
- src/arch/mips64/device/arcs.rs         | 178 +++++
+ src/arch/mips64/device/arcs.rs         | 288 ++++++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
  src/arch/mips64/device/kbd.rs          | 362 ++++++++++
  src/arch/mips64/device/mod.rs          |  69 ++
  src/arch/mips64/device/newport.rs      | 933 +++++++++++++++++++++++++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 746 ++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 750 ++++++++++++++++++++
  src/arch/mips64/interrupt/handler.rs   | 396 +++++++++++
  src/arch/mips64/interrupt/irq.rs       | 135 ++++
  src/arch/mips64/interrupt/mod.rs       |  47 ++
@@ -51,33 +51,35 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/interrupt/trace.rs     |  19 +
  src/arch/mips64/ipi.rs                 |  24 +
  src/arch/mips64/misc.rs                |  60 ++
- src/arch/mips64/mod.rs                 |  92 +++
- src/arch/mips64/paging.rs              |  26 +
- src/arch/mips64/start.rs               | 387 ++++++++++
+ src/arch/mips64/mod.rs                 | 146 ++++
+ src/arch/mips64/paging.rs              |  75 ++
+ src/arch/mips64/start.rs               | 392 +++++++++++
  src/arch/mips64/stop.rs                |  47 ++
- src/arch/mips64/time.rs                | 169 +++++
+ src/arch/mips64/time.rs                | 172 +++++
  src/arch/mod.rs                        |   6 +
  src/context/arch/mips64.rs             | 235 +++++++
- src/context/memory.rs                  |  44 +-
+ src/context/context.rs                 |  93 ++-
+ src/context/memory.rs                  |  83 ++-
  src/context/mod.rs                     |   4 +
  src/devices/mod.rs                     |   2 +
  src/devices/serial.rs                  |  27 +
  src/devices/uart_z85c30.rs             | 196 ++++++
  src/main.rs                            |   1 +
- src/memory/mod.rs                      |  78 ++-
+ src/memory/mod.rs                      | 103 ++-
  src/panic.rs                           |  15 +
+ src/percpu.rs                          |   8 +
  src/scheme/irq.rs                      |   2 +
  src/scheme/proc.rs                     |   8 +-
  src/scheme/sys/kdbg.rs                 | 165 +++++
- src/scheme/sys/mod.rs                  |  25 +
- src/scheme/user.rs                     |   4 +-
+ src/scheme/sys/mod.rs                  |  34 +
+ src/scheme/user.rs                     |  18 +-
  src/startup/mod.rs                     |  20 +-
  src/syscall/process.rs                 |   4 +
  syscall/src/arch/mips64.rs             | 232 ++++++
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 +
- 49 files changed, 5754 insertions(+), 19 deletions(-)
+ 51 files changed, 6382 insertions(+), 44 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -209,10 +211,10 @@ index 00000000..b6bf3827
 +}
 diff --git a/rmm/src/arch/mips.rs b/rmm/src/arch/mips.rs
 new file mode 100644
-index 00000000..467d7cbc
+index 00000000..08a84247
 --- /dev/null
 +++ b/rmm/src/arch/mips.rs
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,332 @@
 +//! MIPS R4000-class paging for the SGI Indy (R4400, n32 kernel, 32-bit addresses).
 +//!
 +//! The TLB is refilled by software. `rmm` keeps a two-level table of 4-byte
@@ -323,6 +325,9 @@ index 00000000..467d7cbc
 +/// # Safety
 +/// Changes address translation for the whole CPU.
 +pub unsafe fn write_random(virt: usize, entry_lo0: usize, entry_lo1: usize) {
++    // Kernel pages (kseg2) are the same in every address space: the G bit in
++    // both halves makes the entry match under any ASID.
++    let global = usize::from(virt >= 0x8000_0000) * ENTRYLO_GLOBAL;
 +    unsafe {
 +        asm!(
 +            ".set push",
@@ -348,11 +353,72 @@ index 00000000..467d7cbc
 +            "nop",
 +            "nop",
 +            ".set pop",
-+            hi = in(reg) virt & !0x1fff,
-+            lo0 = in(reg) entry_lo0,
-+            lo1 = in(reg) entry_lo1,
++            hi = in(reg) (virt & !0x1fff) | CURRENT_ASID.load(Ordering::Relaxed),
++            lo0 = in(reg) entry_lo0 | global,
++            lo1 = in(reg) entry_lo1 | global,
 +            probe = out(reg) _,
 +            options(nostack),
++        );
++    }
++}
++
++/// EntryLo G: with it set in both halves the entry ignores the ASID.
++pub const ENTRYLO_GLOBAL: usize = 1;
++
++/// The address space identifier in EntryHi: TLB entries of user pages carry
++/// the one they were written under and match only under it, so a context
++/// switch changes this register and leaves the TLB alone. 0 is the kernel's
++/// own (no user mappings); the kernel hands out 1..=255 (arch::paging).
++pub static CURRENT_ASID: AtomicUsize = AtomicUsize::new(0);
++
++/// Make `table` the table refills walk and `asid` the current identifier.
++///
++/// # Safety
++/// Changes address translation for the whole CPU.
++pub unsafe fn switch_table(table: usize, asid: usize) {
++    CURRENT_TABLE.store(table, Ordering::Release);
++    CURRENT_ASID.store(asid, Ordering::Relaxed);
++    unsafe {
++        asm!("mtc0 {asid}, $10", "nop", "nop", "nop", asid = in(reg) asid, options(nostack));
++    }
++}
++
++/// Drop every entry written under `asid` (global entries stay).
++///
++/// # Safety
++/// Changes address translation for the whole CPU.
++pub unsafe fn flush_asid(asid: usize) {
++    unsafe {
++        for index in 0..TLB_ENTRIES {
++            let (hi, lo0, lo1): (usize, usize, usize);
++            asm!(
++                "mtc0 {index}, $0",
++                "nop",
++                "nop",
++                "tlbr",
++                "nop",
++                "nop",
++                "mfc0 {hi}, $10",
++                "mfc0 {lo0}, $2",
++                "mfc0 {lo1}, $3",
++                index = in(reg) index,
++                hi = out(reg) hi,
++                lo0 = out(reg) lo0,
++                lo1 = out(reg) lo1,
++                options(nostack),
++            );
++            if hi & 0xff == asid && lo0 & lo1 & ENTRYLO_GLOBAL == 0 {
++                write_indexed(index, unmapped_entry_hi(index), 0, 0);
++            }
++        }
++        // `tlbr` and the writes left another identifier in EntryHi.
++        asm!(
++            "mtc0 {asid}, $10",
++            "nop",
++            "nop",
++            "nop",
++            asid = in(reg) CURRENT_ASID.load(Ordering::Relaxed),
++            options(nostack)
 +        );
 +    }
 +}
@@ -373,6 +439,14 @@ index 00000000..467d7cbc
 +        for index in 0..TLB_ENTRIES {
 +            write_indexed(index, unmapped_entry_hi(index), 0, 0);
 +        }
++        asm!(
++            "mtc0 {asid}, $10",
++            "nop",
++            "nop",
++            "nop",
++            asid = in(reg) CURRENT_ASID.load(Ordering::Relaxed),
++            options(nostack)
++        );
 +    }
 +}
 +
@@ -393,7 +467,7 @@ index 00000000..467d7cbc
 +    const ENTRY_FLAG_PAGE_USER: usize = 1 << 31; // software
 +    const ENTRY_FLAG_NO_EXEC: usize = 1 << 30; // software; the R4400 has no execute permission
 +    const ENTRY_FLAG_EXEC: usize = 0;
-+    const ENTRY_FLAG_GLOBAL: usize = 0; // one ASID, flushed on switch
++    const ENTRY_FLAG_GLOBAL: usize = 0; // kernel entries get G when written (write_random)
 +    const ENTRY_FLAG_NO_GLOBAL: usize = 0;
 +    const ENTRY_FLAG_DEVICE_MEMORY: usize = PTE_UNCACHED;
 +    const ENTRY_FLAG_UNCACHEABLE: usize = PTE_UNCACHED;
@@ -414,13 +488,21 @@ index 00000000..467d7cbc
 +                "nop",
 +                "nop",
 +                "mfc0 {index}, $0",
-+                hi = in(reg) address.data() & !0x1fff,
++                hi = in(reg) (address.data() & !0x1fff) | CURRENT_ASID.load(Ordering::Relaxed),
 +                index = out(reg) index,
 +                options(nostack),
 +            );
 +            if index >= 0 {
 +                let index = index as usize;
 +                write_indexed(index, unmapped_entry_hi(index), 0, 0);
++                asm!(
++                    "mtc0 {asid}, $10",
++                    "nop",
++                    "nop",
++                    "nop",
++                    asid = in(reg) CURRENT_ASID.load(Ordering::Relaxed),
++                    options(nostack)
++                );
 +            }
 +        }
 +    }
@@ -437,8 +519,13 @@ index 00000000..467d7cbc
 +
 +    #[inline(always)]
 +    unsafe fn set_table(_table_kind: TableKind, address: PhysicalAddress) {
-+        CURRENT_TABLE.store(address.data(), Ordering::Release);
-+        unsafe { flush_all() }
++        // The general switch: no identifier is known for this table, so the
++        // TLB is emptied and identifier 0 is used. The kernel's context
++        // switch goes through `switch_table` with an identifier instead.
++        unsafe {
++            switch_table(address.data(), 0);
++            flush_all()
++        }
 +    }
 +
 +    fn virt_is_valid(_address: VirtualAddress) -> bool {
@@ -489,10 +576,10 @@ index 1f2c1a13..ccbee701 100644
  
 diff --git a/src/arch/mips64/cache.rs b/src/arch/mips64/cache.rs
 new file mode 100644
-index 00000000..7ee6390f
+index 00000000..692b0096
 --- /dev/null
 +++ b/src/arch/mips64/cache.rs
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,622 @@
 +//! Primary cache coherence.
 +//!
 +//! The R4x00 and R5000 primary caches are indexed by virtual address, and a
@@ -631,6 +718,15 @@ index 00000000..7ee6390f
 +    FRAME_STATE.get(index)
 +}
 +
++/// Frames went back to the allocator: forget what is known about them.
++pub fn forget(first: Frame, order: u32) {
++    for index in 0..1usize << order {
++        if let Some(state) = frame_state(first.base().data() + index * PAGE) {
++            state.store(0, Ordering::Relaxed);
++        }
++    }
++}
++
 +/// User pages mapped on another colour than their frame since the last
 +/// `before_frames`. Single CPU, and only touched with interrupts off.
 +const LIST_LEN: usize = 24;
@@ -657,6 +753,20 @@ index 00000000..7ee6390f
 +    let mut data_flushed = false;
 +
 +    let state = frame_state(phys);
++    if pte & rmm::mips::PTE_UNCACHED != 0 {
++        // Device registers and DMA memory: the mapping uses no cache, so it
++        // has no colour and needs no place on the list. RAM (DMA memory)
++        // may still have lines in kseg0 from when the kernel cleared it;
++        // they are written back once, or a later eviction would overwrite
++        // what the device stored.
++        if let Some(state) = state
++            && state.load(Ordering::Relaxed) & KSEG0_SETTLED == 0
++        {
++            flush_data_page(phys);
++            state.fetch_or(KSEG0_SETTLED, Ordering::Relaxed);
++        }
++        return 0;
++    }
 +    if colour(page) != colour(phys) {
 +        // A kernel (kseg2) page is only ever used through this mapping once
 +        // it is mapped, so its kseg0 lines need writing back once.
@@ -703,9 +813,6 @@ index 00000000..7ee6390f
 +        }
 +    }
 +
-+    if pte & rmm::mips::PTE_UNCACHED != 0 {
-+        return 0;
-+    }
 +    let on_colour = colour(page) == colour(phys);
 +    if !user {
 +        // Kernel pages: on colour, or off colour with kseg0 settled.
@@ -811,10 +918,15 @@ index 00000000..7ee6390f
 +    }
 +    let (keep, spare) = match chosen {
 +        Some(frame) => (frame, Some(first)),
-+        None => {
-+            STAT_RECOLOUR_FAILED.fetch_add(1, Ordering::Relaxed);
-+            (first, None)
-+        }
++        // The free lists held no frame of this colour near their heads:
++        // cut one from a block that holds every colour.
++        None => match crate::memory::allocate_frame_of_colour(want, colours(), must_be_zero) {
++            Some(frame) => (frame, Some(first)),
++            None => {
++                STAT_RECOLOUR_FAILED.fetch_add(1, Ordering::Relaxed);
++                (first, None)
++            }
++        },
 +    };
 +    for frame in rejects.into_iter().flatten().chain(spare) {
 +        unsafe { crate::memory::deallocate_frame(frame) };
@@ -863,6 +975,103 @@ index 00000000..7ee6390f
 +    flush_instructions();
 +}
 +
++/// The Indy's R4600SC and R5000SC modules carry a 512 KiB secondary cache
++/// outside the CPU, which the R4600 does not know about (its Config has no
++/// SC bit). The module watches the bus: it answers block reads it holds and
++/// is controlled by stores to physical 0x8000_0000 through the uncached
++/// 64-bit segment, with KX set: a byte store switches it on, a halfword
++/// store switches it off, and a word store at an offset invalidates the
++/// line of that offset (Linux arch/mips/mm/sc-ip22.c, NetBSD
++/// sgimips/ip22_cache.c). The PROM hands the machine over with it off.
++///
++/// `enable` != 0: walk the code once without storing, so every line of it
++/// is in the primary cache before the secondary cache can answer a fetch,
++/// then switch on and invalidate all 16384 lines. `enable` == 0: switch
++/// off. Runs with interrupts off.
++#[unsafe(naked)]
++unsafe extern "C" fn scache_control(enable: usize) {
++    core::arch::naked_asm!(
++        "
++        .set noreorder
++        .set noat
++        .balign 32
++        mfc0    $8, $12
++        li      $9, 0x80                // KX only: 64-bit addresses, interrupts off
++        mtc0    $9, $12
++        nop
++        nop
++        nop
++        nop
++        lui     $9, 0x9000
++        dsll    $9, $9, 16
++        ori     $9, $9, 0x8000
++        dsll    $9, $9, 16              // 0x9000_0000_8000_0000
++        beqz    $4, 5f
++        li      $12, 1                  // first pass stores nothing
++    1:  move    $10, $9
++        lui     $11, 0x8                // 512 KiB
++        daddu   $11, $11, $9
++    2:  bnez    $12, 3f
++        nop
++        sw      $0, 0($10)              // invalidate one line
++    3:  daddiu  $10, $10, 32
++        bne     $10, $11, 2b
++        nop
++        beqz    $12, 6f                 // second pass done
++        nop
++        bnez    $4, 4f
++        move    $12, $0
++        // The store and the branch after it share one cache line, fetched
++        // while the secondary cache is still off.
++        .balign 32
++    4:  sb      $0, 0($9)               // on
++        b       1b
++        nop
++    5:  sh      $0, 0($9)               // off
++    6:  mtc0    $8, $12
++        nop
++        nop
++        nop
++        nop
++        jr      $31
++        nop
++        .set at
++        .set reorder
++        "
++    )
++}
++
++static SCACHE_ON: AtomicBool = AtomicBool::new(false);
++
++/// Switch the module's secondary cache on or off. Only when the PROM's
++/// inventory lists one of 512 KiB with 32-byte lines.
++pub fn scache(enable: bool) -> bool {
++    if crate::arch::device::arcs::secondary_cache_key() != 0x0105_0007 {
++        return false;
++    }
++    unsafe { scache_control(usize::from(enable)) };
++    SCACHE_ON.store(enable, Ordering::Relaxed);
++    info!("Indy: secondary cache (512 KiB) {}", if enable { "on" } else { "off" });
++    true
++}
++
++/// Around a firmware call: the PROM expects the cache as it left it, off.
++/// Returns whether it was on, for `scache_resume`.
++pub fn scache_pause() -> bool {
++    let was_on = SCACHE_ON.swap(false, Ordering::Relaxed);
++    if was_on {
++        unsafe { scache_control(0) };
++    }
++    was_on
++}
++
++pub fn scache_resume(was_on: bool) {
++    if was_on {
++        unsafe { scache_control(1) };
++        SCACHE_ON.store(true, Ordering::Relaxed);
++    }
++}
++
 +/// Counters since boot, for `echo cachestat > /scheme/sys/kstop`.
 +pub fn log_stats() {
 +    log_notes();
@@ -880,6 +1089,13 @@ index 00000000..7ee6390f
 +            }
 +        }
 +    }
++    info!(
++        "Indy: secondary cache {}, PRId {:#x}, Config {:#x}, PROM inventory (class/type/key):{}",
++        if SCACHE_ON.load(Ordering::Relaxed) { "on" } else { "off" },
++        cp0::read_prid(),
++        cp0::read_config(),
++        crate::arch::device::arcs::inventory()
++    );
 +    info!(
 +        "Indy: console: {} keyboard interrupts, {} serial interrupts, {} keyboard bytes found by the fallback poll",
 +        crate::arch::device::KEYBOARD_INTERRUPTS.load(Ordering::Relaxed),
@@ -910,35 +1126,61 @@ index 00000000..7ee6390f
 +pub static STAT_RECOLOUR: AtomicUsize = AtomicUsize::new(0);
 +pub static STAT_RECOLOUR_FAILED: AtomicUsize = AtomicUsize::new(0);
 +
-+/// The off-colour pages seen most, for tuning: (page | flags, count).
++/// The off-colour pages seen most, for tuning: (page | flags, the last four
++/// characters of the running context's name, count).
 +const NOTE_LEN: usize = 48;
-+static NOTES: SyncUnsafeCell<[(usize, u32); NOTE_LEN]> = SyncUnsafeCell::new([(0, 0); NOTE_LEN]);
++static NOTES: SyncUnsafeCell<[(usize, u32, u32); NOTE_LEN]> =
++    SyncUnsafeCell::new([(0, 0, 0); NOTE_LEN]);
++
++/// The end of the running context's name, read without its lock: one CPU,
++/// interrupts off, and the result is only printed.
++fn current_tag() -> u32 {
++    let mut tag = [b' '; 4];
++    let current = crate::context::try_current();
++    if let Some(context) = current.as_ref() {
++        let name = unsafe { &(*context.as_mut_ptr()).name };
++        let bytes = name.as_bytes();
++        let tail = &bytes[bytes.len().saturating_sub(4)..];
++        tag[..tail.len()].copy_from_slice(tail);
++    }
++    u32::from_be_bytes(tag)
++}
 +
 +fn note_off_colour(page: usize, writable: bool, executable: bool) {
 +    let key = page | usize::from(writable) | (usize::from(executable) << 1);
++    let tag = if page < crate::USER_END_OFFSET { current_tag() } else { 0 };
 +    let notes = unsafe { &mut *NOTES.get() };
 +    let mut weakest = 0;
 +    for (i, note) in notes.iter_mut().enumerate() {
-+        if note.0 == key {
-+            note.1 = note.1.saturating_add(1);
++        if note.0 == key && note.1 == tag {
++            note.2 = note.2.saturating_add(1);
 +            return;
 +        }
-+        if note.1 < unsafe { (*NOTES.get())[weakest].1 } {
++        if note.2 < unsafe { (*NOTES.get())[weakest].2 } {
 +            weakest = i;
 +        }
 +    }
-+    notes[weakest] = (key, 1);
++    notes[weakest] = (key, tag, 1);
 +}
 +
 +pub fn log_notes() {
 +    let notes = unsafe { &*NOTES.get() };
 +    let mut sorted = *notes;
-+    sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
++    sorted.sort_unstable_by(|a, b| b.2.cmp(&a.2));
 +    for chunk in sorted.chunks(6) {
 +        let mut line = alloc::string::String::new();
-+        for (key, count) in chunk {
++        for (key, tag, count) in chunk {
 +            use core::fmt::Write;
-+            let _ = write!(line, " {:#x}{}{}x{}", key & !0xfff, if key & 1 != 0 { "w" } else { "" }, if key & 2 != 0 { "x" } else { "" }, count);
++            let tag = tag.to_be_bytes();
++            let _ = write!(
++                line,
++                " {}:{:#x}{}{}x{}",
++                core::str::from_utf8(&tag).unwrap_or("?").trim(),
++                key & !0xfff,
++                if key & 1 != 0 { "w" } else { "" },
++                if key & 2 != 0 { "x" } else { "" },
++                count
++            );
 +        }
 +        info!("Indy: off-colour:{}", line);
 +    }
@@ -1138,10 +1380,10 @@ index 00000000..b82f61d2
 +}
 diff --git a/src/arch/mips64/device/arcs.rs b/src/arch/mips64/device/arcs.rs
 new file mode 100644
-index 00000000..99935733
+index 00000000..a96cbf59
 --- /dev/null
 +++ b/src/arch/mips64/device/arcs.rs
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,288 @@
 +//! Calls into the ARCS firmware (the Indy PROM).
 +//!
 +//! The PROM leaves a system parameter block at physical 0x1000. Its firmware
@@ -1171,6 +1413,8 @@ index 00000000..99935733
 +const SPB_FIRMWARE_VECTOR: usize = 8;
 +
 +const FN_REBOOT: usize = 6;
++const FN_GET_PEER: usize = 9;
++const FN_GET_CHILD: usize = 10;
 +const FN_GET_MEMORY_DESCRIPTOR: usize = 18;
 +const FN_GET_ENVIRONMENT_VARIABLE: usize = 30;
 +
@@ -1239,7 +1483,9 @@ index 00000000..99935733
 +        let entry = vector.add(index).read_volatile() as usize;
 +        let status = cp0::read_status();
 +        cp0::write_status(status & !cp0::status::IE);
++        let cache_was_on = crate::arch::cache::scache_pause();
 +        let ret = arcs_call(a0, a1, a2, a3, entry);
++        crate::arch::cache::scache_resume(cache_was_on);
 +        cp0::write_status(status);
 +        ret
 +    }
@@ -1299,6 +1545,112 @@ index 00000000..99935733
 +        cp0::write_status(cp0::status::BEV);
 +        call(FN_REBOOT, 0, 0, 0, 0);
 +    }
++}
++
++/// The inventory as text, `class/type/key'name'` per component, written
++/// once at boot by `log_components`.
++pub struct Inventory {
++    text: [u8; 640],
++    len: usize,
++}
++
++impl core::fmt::Write for Inventory {
++    fn write_str(&mut self, s: &str) -> core::fmt::Result {
++        let room = self.text.len() - self.len;
++        let n = s.len().min(room);
++        self.text[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
++        self.len += n;
++        Ok(())
++    }
++}
++
++static INVENTORY: core::cell::SyncUnsafeCell<Inventory> =
++    core::cell::SyncUnsafeCell::new(Inventory { text: [0; 640], len: 0 });
++
++static SECONDARY_CACHE_KEY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++
++/// The key of the secondary cache component, 0 when the PROM lists none.
++pub fn secondary_cache_key() -> u32 {
++    SECONDARY_CACHE_KEY.load(Ordering::Relaxed)
++}
++
++/// The PROM's inventory as recorded at boot.
++pub fn inventory() -> &'static str {
++    let inventory = unsafe { &*INVENTORY.get() };
++    core::str::from_utf8(&inventory.text[..inventory.len]).unwrap_or("")
++}
++
++/// One node of the PROM's configuration tree, as the PROM lays it out.
++#[repr(C)]
++struct Component {
++    class: u32,
++    kind: u32,
++    flags: u32,
++    version: u16,
++    revision: u16,
++    key: u32,
++    affinity: u32,
++    data_size: u32,
++    identifier_len: u32,
++    identifier: u32,
++}
++
++/// Log the PROM's hardware inventory, the data its `hinv` command prints:
++/// class, type and key of every component, with its name. A cache
++/// component's key holds its size: the low byte is log2 of the size in
++/// 4 KiB pages, the next byte log2 of the line size. The secondary cache of
++/// an R4600SC or R5000SC module shows here; nothing else reports it without
++/// touching the module.
++pub fn log_components() {
++    fn walk(node: usize, depth: usize, budget: &mut usize) {
++        let mut node = node;
++        while node != 0 && *budget != 0 {
++            *budget -= 1;
++            let component = unsafe { &*(node as *const Component) };
++            let mut name = [0u8; 32];
++            let len = (component.identifier_len as usize).min(name.len());
++            if component.identifier != 0 {
++                for (i, byte) in name[..len].iter_mut().enumerate() {
++                    *byte = unsafe { (component.identifier as usize as *const u8).add(i).read() };
++                }
++            }
++            let text = core::str::from_utf8(&name[..len]).unwrap_or("?");
++            // Class 2 is a cache, type 7 the secondary cache.
++            if component.class == 2 && component.kind == 7 {
++                SECONDARY_CACHE_KEY.store(component.key, Ordering::Relaxed);
++            }
++            {
++                // Kept for `cachestat`: the log scheme starts later than this.
++                use core::fmt::Write;
++                let _ = write!(
++                    unsafe { &mut *INVENTORY.get() },
++                    " {}/{}/{:#x}'{}'",
++                    component.class,
++                    component.kind,
++                    component.key,
++                    text.trim_end_matches('\0')
++                );
++            }
++            info!(
++                "Indy: PROM component depth {} class {} type {} key {:#x} '{}'",
++                depth,
++                component.class,
++                component.kind,
++                component.key,
++                text.trim_end_matches('\0')
++            );
++            if depth < 6 {
++                let child = unsafe { call(FN_GET_CHILD, node, 0, 0, 0) } as usize;
++                walk(child, depth + 1, budget);
++            }
++            node = unsafe { call(FN_GET_PEER, node, 0, 0, 0) } as usize;
++        }
++    }
++    if !present() {
++        return;
++    }
++    let root = unsafe { call(FN_GET_CHILD, 0, 0, 0, 0) } as usize;
++    walk(root, 0, &mut 48);
 +}
 +
 +/// The value of a PROM environment variable. `name` ends with a NUL byte.
@@ -2741,10 +3093,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..d117b932
+index 00000000..eb34fa50
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,746 @@
+@@ -0,0 +1,750 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -2935,7 +3287,9 @@ index 00000000..d117b932
 +        ori     $3, $3, 0xffc6
 +        and     $4, $2, $3
 +        ori     $4, $4, 0x18            // cacheable, noncoherent
-+    2:  mtc0    $4, $2                  // EntryLo0
++    2:  srl     $3, $1, 31              // G for a kernel address
++        or      $4, $4, $3
++        mtc0    $4, $2                  // EntryLo0
 +
 +        // Odd half.
 +        lw      $2, 4($27)
@@ -2974,7 +3328,9 @@ index 00000000..d117b932
 +        ori     $3, $3, 0xffc6
 +        and     $4, $2, $3
 +        ori     $4, $4, 0x18
-+    2:  mtc0    $4, $3                  // EntryLo1
++    2:  srl     $3, $1, 31
++        or      $4, $4, $3
++        mtc0    $4, $3                  // EntryLo1
 +        la      $26, {fast_count}
 +        lw      $2, 0($26)
 +        addiu   $2, $2, 1
@@ -4220,10 +4576,10 @@ index 00000000..cff02765
 +}
 diff --git a/src/arch/mips64/mod.rs b/src/arch/mips64/mod.rs
 new file mode 100644
-index 00000000..7b971873
+index 00000000..240894e6
 --- /dev/null
 +++ b/src/arch/mips64/mod.rs
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,146 @@
 +//! SGI Indy (IP24): MIPS R4400, n32 kernel with 32-bit addresses, big-endian.
 +//!
 +//! Address space: useg (0..0x8000_0000) is user and TLB mapped; kseg0
@@ -4270,7 +4626,9 @@ index 00000000..7b971873
 +
 +pub use arch_copy_to_user as arch_copy_from_user;
 +
-+/// Copy `len` bytes from `src` to `dst`, one of them in userspace. A fault
++/// Copy `len` bytes from `src` to `dst`, one of them in userspace, in 64-bit
++/// words once the destination is aligned. A leaf that leaves `$ra` and `$sp`
++/// alone: the fault path returns through `$ra`. A fault
 +/// inside `__usercopy_start..__usercopy_end` is turned into a non-zero
 +/// return by the page fault handler (`recover_and_efault`).
 +#[unsafe(naked)]
@@ -4280,15 +4638,67 @@ index 00000000..7b971873
 +        .set noreorder
 +    .global __usercopy_start
 +    __usercopy_start:
-+        beqz    $6, 2f
++        sltiu   $8, $6, 16
++        bnez    $8, 7f                  // short: bytes only
 +        nop
-+    1:  lbu     $8, 0($5)
++        // Bytes until the destination is 8-byte aligned.
++        negu    $8, $4
++        andi    $8, $8, 7
++        beqz    $8, 2f
++        subu    $6, $6, $8
++    1:  lbu     $9, 0($5)
++        addiu   $5, $5, 1
++        addiu   $8, $8, -1
++        sb      $9, 0($4)
++        bnez    $8, 1b
++        addiu   $4, $4, 1
++    2:  srl     $10, $6, 3              // whole 64-bit words
++        andi    $9, $5, 7
++        bnez    $9, 5f                  // source not aligned
++        andi    $6, $6, 7               // bytes after the words
++        srl     $11, $10, 2             // rounds of four words
++        beqz    $11, 4f
++        andi    $10, $10, 3
++    3:  ld      $8, 0($5)
++        ld      $9, 8($5)
++        ld      $12, 16($5)
++        ld      $13, 24($5)
++        addiu   $5, $5, 32
++        sd      $8, 0($4)
++        sd      $9, 8($4)
++        sd      $12, 16($4)
++        sd      $13, 24($4)
++        addiu   $11, $11, -1
++        bnez    $11, 3b
++        addiu   $4, $4, 32
++    4:  beqz    $10, 7f
++        nop
++    41: ld      $8, 0($5)
++        addiu   $5, $5, 8
++        addiu   $10, $10, -1
++        sd      $8, 0($4)
++        bnez    $10, 41b
++        addiu   $4, $4, 8
++        b       7f
++        nop
++    5:  beqz    $10, 7f
++        nop
++    6:  ldl     $8, 0($5)               // big-endian unaligned load
++        ldr     $8, 7($5)
++        addiu   $5, $5, 8
++        addiu   $10, $10, -1
++        sd      $8, 0($4)
++        bnez    $10, 6b
++        addiu   $4, $4, 8
++    7:  beqz    $6, 9f
++        nop
++    8:  lbu     $8, 0($5)
 +        addiu   $5, $5, 1
 +        addiu   $6, $6, -1
 +        sb      $8, 0($4)
-+        bnez    $6, 1b
++        bnez    $6, 8b
 +        addiu   $4, $4, 1
-+    2:  jr      $31
++    9:  jr      $31
 +        move    $2, $zero
 +    .global __usercopy_end
 +    __usercopy_end:
@@ -4318,12 +4728,20 @@ index 00000000..7b971873
 +}
 diff --git a/src/arch/mips64/paging.rs b/src/arch/mips64/paging.rs
 new file mode 100644
-index 00000000..599f5488
+index 00000000..c468b8a5
 --- /dev/null
 +++ b/src/arch/mips64/paging.rs
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,75 @@
 +//! TLB setup: 4 KiB pages, nothing wired, ASID 0, every entry cleared, and
 +//! the exception vectors in place so refills can be served.
++//!
++//! Address space identifiers: the R4600's EntryHi has an 8-bit ASID, and a
++//! user TLB entry matches only under the one it was written with. Each
++//! address space gets one of 1..=255 from its key (the address of its
++//! `AddrSpaceWrapper::used_by`, which the switch code and the `Flusher`
++//! both have). A context switch then changes EntryHi and keeps the TLB;
++//! kernel entries are global. Two spaces whose keys fall on one identifier
++//! share it in turn: the newcomer drops the other's entries first.
 +
 +use super::cp0;
 +
@@ -4348,12 +4766,53 @@ index 00000000..599f5488
 +        cp0::write_status(cp0::read_status() & !cp0::status::BEV);
 +    }
 +}
++
++use core::sync::atomic::{AtomicUsize, Ordering};
++
++/// The key of the address space that last ran under each identifier.
++static OWNER: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
++
++fn identifier(key: usize) -> usize {
++    ((key >> 4) ^ (key >> 12)) % 255 + 1
++}
++
++/// Make the address space `key`, with page table `table`, the current one.
++pub unsafe fn switch_to(key: usize, table: usize) {
++    // Off-colour pages on the cache list belong to the space being left:
++    // their entries can only be found under its identifier.
++    super::cache::before_frames();
++    let asid = identifier(key);
++    unsafe {
++        if OWNER[asid].swap(key, Ordering::Relaxed) != key {
++            rmm::mips::flush_asid(asid);
++        }
++        rmm::mips::switch_table(table, asid);
++    }
++}
++
++/// Mappings of the address space `key` changed: drop its TLB entries,
++/// whether or not it is the current one.
++pub fn flush_space(key: usize) {
++    let asid = identifier(key);
++    if OWNER[asid].load(Ordering::Relaxed) == key {
++        unsafe { rmm::mips::flush_asid(asid) };
++    }
++}
++
++/// A new address space takes `key`: drop what an earlier one left under it.
++pub fn retire(key: usize) {
++    let asid = identifier(key);
++    if OWNER[asid].load(Ordering::Relaxed) == key {
++        unsafe { rmm::mips::flush_asid(asid) };
++        OWNER[asid].store(0, Ordering::Relaxed);
++    }
++}
 diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
 new file mode 100644
-index 00000000..fcb5e1be
+index 00000000..08a911ff
 --- /dev/null
 +++ b/src/arch/mips64/start.rs
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,392 @@
 +//! Kernel entry from the SGI PROM.
 +//!
 +//! `boot -f bootp()redox` loads the ECOFF image at kseg0 0x8804_0000 and
@@ -4623,6 +5082,7 @@ index 00000000..fcb5e1be
 +            // ranges stay out of the allocator so its console keeps working.
 +            let floor = kernel_base as u64;
 +            let ceiling = (consts::RAM_PHYS_BASE + ram) as u64;
++            device::arcs::log_components();
 +            let mut descriptor = device::arcs::memory_descriptor(None);
 +            while let Some(d) = descriptor {
 +                let start = (d.base_page as u64) << 12;
@@ -4653,6 +5113,10 @@ index 00000000..fcb5e1be
 +            };
 +            area_count = 2;
 +        }
++
++        // The CPU module's secondary cache, where the PROM's inventory
++        // (read above) lists one: the PROM leaves it off.
++        crate::arch::cache::scache(true);
 +
 +        let env_len = build_env();
 +        let stack_base = STACK.get() as usize - PHYS_OFFSET;
@@ -4796,10 +5260,10 @@ index 00000000..49d7eee0
 +}
 diff --git a/src/arch/mips64/time.rs b/src/arch/mips64/time.rs
 new file mode 100644
-index 00000000..411e3cdb
+index 00000000..2462ac5e
 --- /dev/null
 +++ b/src/arch/mips64/time.rs
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,172 @@
 +//! Monotonic time from CP0 Count.
 +//!
 +//! Count runs at half the pipeline clock. The PROM measures the CPU clock
@@ -4915,7 +5379,10 @@ index 00000000..411e3cdb
 +}
 +
 +pub fn monotonic_absolute(_token: &mut CleanLockToken) -> u128 {
-+    count64() as u128 * 1_000_000_000u128 / count_hz() as u128
++    // 64-bit arithmetic: the CPU divides 64 bits in one instruction, and a
++    // 128-bit division is a library routine on every context switch.
++    let (count, hz) = (count64(), count_hz());
++    ((count / hz) * 1_000_000_000 + (count % hz) * 1_000_000_000 / hz) as u128
 +}
 +
 +pub fn monotonic_resolution() -> u128 {
@@ -5224,11 +5691,164 @@ index 00000000..c8d1533a
 +        switch_hook = sym crate::context::switch_finish_hook,
 +    );
 +}
+diff --git a/src/context/context.rs b/src/context/context.rs
+index f63da921..f4597709 100644
+--- a/src/context/context.rs
++++ b/src/context/context.rs
+@@ -233,8 +233,8 @@ impl Context {
+             sched_cpu_time: 0,
+             sched_affinity: LogicalCpuSet::all(),
+             inside_syscall: false,
+-            syscall_head: SyscallFrame::Free(RaiiFrame::allocate()?),
+-            syscall_tail: SyscallFrame::Free(RaiiFrame::allocate()?),
++            syscall_head: SyscallFrame::Free(syscall_frame(0)?),
++            syscall_tail: SyscallFrame::Free(syscall_frame(PAGE_SIZE)?),
+             wake: None,
+             arch: arch::Context::new(),
+             kfx: AlignedBox::<[u8], { arch::KFX_ALIGN }>::try_zeroed_slice(crate::arch::kfx_size())?,
+@@ -412,6 +412,14 @@ impl Context {
+                 Some(ref new) => {
+                     new.used_by.atomic_set(this_percpu.cpu_id);
+                     let new_addrsp = new.acquire_read(token);
++                    #[cfg(target_arch = "mips64")]
++                    unsafe {
++                        crate::arch::paging::switch_to(
++                            &new.used_by as *const _ as usize,
++                            new_addrsp.table.utable.table().phys().data(),
++                        );
++                    }
++                    #[cfg(not(target_arch = "mips64"))]
+                     unsafe {
+                         new_addrsp.table.utable.make_current();
+                     }
+@@ -487,6 +495,18 @@ impl Context {
+     }
+ }
+ 
++/// A frame for the syscall head or tail buffer, on the cache colour of
++/// `_colour_of` where caches are virtually indexed: the two buffers of a
++/// context start on neighbouring colours (BorrowedHtBuf::take).
++fn syscall_frame(_colour_of: usize) -> Result<RaiiFrame, Enomem> {
++    #[cfg(target_arch = "mips64")]
++    crate::arch::cache::set_alloc_colour(Some(_colour_of));
++    let frame = RaiiFrame::allocate();
++    #[cfg(target_arch = "mips64")]
++    crate::arch::cache::set_alloc_colour(None);
++    frame
++}
++
+ /// Wrapper struct for borrowing the syscall head or tail buf.
+ #[derive(Debug)]
+ pub struct BorrowedHtBuf {
+@@ -495,32 +515,65 @@ pub struct BorrowedHtBuf {
+ }
+ impl BorrowedHtBuf {
+     pub fn head_locked(token: LockToken<L3>) -> Result<Self> {
+-        let current = context::current();
+-        let frame = &mut current.write(token).syscall_head;
+-        match mem::replace(frame, SyscallFrame::Dummy) {
+-            SyscallFrame::Free(free_frame) => {
+-                *frame = SyscallFrame::Used {
+-                    _frame: free_frame.get(),
+-                };
+-                Ok(Self {
+-                    inner: Some(free_frame),
+-                    head_and_not_tail: true,
+-                })
+-            }
+-            SyscallFrame::Used { .. } | SyscallFrame::Dummy => Err(Error::new(EAGAIN)),
+-        }
++        Self::take(token, true, None)
+     }
+     pub fn tail_locked(token: LockToken<L3>) -> Result<Self> {
++        Self::take(token, false, None)
++    }
++    /// The head buffer, to be mapped at a user page of the cache colour of
++    /// `user_addr`.
++    pub fn head_locked_at(token: LockToken<L3>, user_addr: usize) -> Result<Self> {
++        Self::take(token, true, Some(user_addr))
++    }
++    /// The tail buffer, to be mapped at a user page of the cache colour of
++    /// `user_addr`.
++    pub fn tail_locked_at(token: LockToken<L3>, user_addr: usize) -> Result<Self> {
++        Self::take(token, false, Some(user_addr))
++    }
++    fn take(token: LockToken<L3>, head: bool, _user_addr: Option<usize>) -> Result<Self> {
+         let current = context::current();
+-        let frame = &mut current.write(token).syscall_tail;
+-        match mem::replace(frame, SyscallFrame::Dummy) {
++        let mut guard = current.write(token);
++        let context = &mut *guard;
++        let (slot, _other) = if head {
++            (&mut context.syscall_head, &mut context.syscall_tail)
++        } else {
++            (&mut context.syscall_tail, &mut context.syscall_head)
++        };
++        // Virtually indexed caches (arch::cache): the kernel fills this frame
++        // through kseg0 and the scheme reads it at a user page. On different
++        // colours every call costs two write-backs of the page's cache lines
++        // and a refill trap. The two frames of a context start on different
++        // colours, so the other one usually fits; otherwise the frame is
++        // exchanged for one of the wanted colour.
++        #[cfg(target_arch = "mips64")]
++        if let Some(addr) = _user_addr {
++            use crate::arch::cache::colour;
++            let want = colour(addr);
++            let fits = |slot: &SyscallFrame| match slot {
++                SyscallFrame::Free(frame) => Some(colour(frame.get().base().data()) == want),
++                _ => None,
++            };
++            if fits(&*slot) == Some(false) {
++                if fits(&*_other) == Some(true) {
++                    mem::swap(slot, _other);
++                } else {
++                    crate::arch::cache::set_alloc_colour(Some(addr));
++                    let fresh = RaiiFrame::allocate();
++                    crate::arch::cache::set_alloc_colour(None);
++                    if let Ok(fresh) = fresh {
++                        *slot = SyscallFrame::Free(fresh);
++                    }
++                }
++            }
++        }
++        match mem::replace(slot, SyscallFrame::Dummy) {
+             SyscallFrame::Free(free_frame) => {
+-                *frame = SyscallFrame::Used {
++                *slot = SyscallFrame::Used {
+                     _frame: free_frame.get(),
+                 };
+                 Ok(Self {
+                     inner: Some(free_frame),
+-                    head_and_not_tail: false,
++                    head_and_not_tail: head,
+                 })
+             }
+             SyscallFrame::Used { .. } | SyscallFrame::Dummy => Err(Error::new(EAGAIN)),
 diff --git a/src/context/memory.rs b/src/context/memory.rs
-index 74ef9e74..703646f1 100644
+index 74ef9e74..72d0218a 100644
 --- a/src/context/memory.rs
 +++ b/src/context/memory.rs
-@@ -389,7 +389,11 @@ impl AddrSpaceWrapper {
+@@ -99,11 +99,17 @@ pub struct AddrSpaceWrapper {
+ }
+ impl AddrSpaceWrapper {
+     pub fn new() -> Result<Arc<Self>> {
+-        Ok(Arc::new(Self {
++        let this = Arc::new(Self {
+             inner: RwLock::new(AddrSpace::new()?),
+             tlb_ack: AtomicU32::new(0),
+             used_by: LogicalCpuSet::empty(),
+-        }))
++        });
++        // The key of this space's TLB identifier is the address of
++        // `used_by`. A space that died at this address may have left
++        // entries under it.
++        #[cfg(target_arch = "mips64")]
++        crate::arch::paging::retire(&this.used_by as *const _ as usize);
++        Ok(this)
+     }
+     pub fn acquire_read<'a>(
+         &'a self,
+@@ -389,7 +395,11 @@ impl AddrSpaceWrapper {
              }
              _ => {
                  dst.grants
@@ -5241,7 +5861,37 @@ index 74ef9e74..703646f1 100644
                      .ok_or(Error::new(ENOMEM))?
                      .base
              }
-@@ -1029,6 +1033,30 @@ impl UserGrants {
+@@ -694,6 +704,29 @@ impl AddrSpace {
+     ) -> Result<Page> {
+         self.mmap(dst_lock, None, page_count, flags, None, map)
+     }
++    /// Map at a free place chosen by the kernel that has the cache colour
++    /// of `near` where caches are virtually indexed.
++    pub fn mmap_near(
++        &mut self,
++        dst_lock: &AddrSpaceWrapper,
++        near: Page,
++        page_count: NonZeroUsize,
++        flags: MapFlags,
++        map: impl FnOnce(Page, PageFlags<RmmA>, &mut PageMapper, &mut Flusher) -> Result<Grant>,
++    ) -> Result<Page> {
++        let span = self
++            .grants
++            .find_free_near(self.mmap_min, page_count.get(), Some(near))
++            .ok_or(Error::new(ENOMEM))?;
++        self.mmap(
++            dst_lock,
++            Some(span.base),
++            page_count,
++            flags | MapFlags::MAP_FIXED_NOREPLACE,
++            None,
++            map,
++        )
++    }
+     pub fn mmap(
+         &mut self,
+         dst_lock: &AddrSpaceWrapper,
+@@ -1029,6 +1062,30 @@ impl UserGrants {
                  usable_start + req_size <= hole_end
              })?;
          // Create new region
@@ -5272,7 +5922,7 @@ index 74ef9e74..703646f1 100644
          Some(PageSpan::new(
              Page::containing_address(VirtualAddress::new(cmp::max(hole_start.data(), min))),
              page_count,
-@@ -1810,8 +1838,14 @@ impl Grant {
+@@ -1810,8 +1867,14 @@ impl Grant {
                      } else {
                          // TODO: Omit the unnecessary subsequent add_ref call.
                          let must_be_zero = true;
@@ -5287,7 +5937,7 @@ index 74ef9e74..703646f1 100644
                          let src_flush = unsafe {
                              src_mapper
                                  .map_phys(src_page.start_address(), new_frame.base(), flags, 0)
-@@ -2527,7 +2561,13 @@ fn map_zeroed(
+@@ -2527,7 +2590,13 @@ fn map_zeroed(
      _writable: bool,
  ) -> Result<Frame, PfError> {
      let must_be_zero = true;
@@ -5302,6 +5952,19 @@ index 74ef9e74..703646f1 100644
  
      unsafe {
          mapper
+@@ -3035,6 +3104,12 @@ impl<'a, 'addrsp> Flusher<'a, 'addrsp> {
+             }
+         }
+ 
++        // With address space identifiers the entries of a space that is
++        // not running stay in the TLB: drop this space's, current or not.
++        // `active_cpus` is the space's `used_by`, the key of its identifier.
++        #[cfg(target_arch = "mips64")]
++        crate::arch::paging::flush_space(self.active_cpus as *const _ as usize);
++        #[cfg(not(target_arch = "mips64"))]
+         if self.active_cpus.contains(current_cpu_id) {
+             rmm::PageFlushAll::<RmmA>::new().flush();
+         }
 diff --git a/src/context/mod.rs b/src/context/mod.rs
 index 161eefb3..3e1ec214 100644
 --- a/src/context/mod.rs
@@ -5608,7 +6271,7 @@ index a29621fa..3f05f23d 100644
  #![feature(sync_unsafe_cell)]
  #![feature(btree_cursors)]
 diff --git a/src/memory/mod.rs b/src/memory/mod.rs
-index eddfa494..e9d39153 100644
+index eddfa494..b6cca3b6 100644
 --- a/src/memory/mod.rs
 +++ b/src/memory/mod.rs
 @@ -54,6 +54,46 @@ pub(crate) fn areas() -> &'static [rmm::MemoryArea] {
@@ -5672,7 +6335,46 @@ index eddfa494..e9d39153 100644
  }
  
  // TODO: Flags, strategy
-@@ -785,7 +830,12 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
+@@ -240,6 +285,8 @@ fn get_index_for_deallocation(addr: usize) -> Option<usize> {
+ }
+ 
+ pub unsafe fn deallocate_p2frame(orig_frame: Frame, order: u32) {
++    #[cfg(target_arch = "mips64")]
++    crate::arch::cache::forget(orig_frame, order);
+     let index = if numa::is_supported() {
+         get_index_for_deallocation(orig_frame.physaddr.get()).expect("Expected an index")
+     } else {
+@@ -387,6 +434,29 @@ fn allocate_frames(count: usize, alloc_order: impl FnOnce(u32) -> Option<Frame>)
+     Some(base)
+ }
+ 
++/// One frame of cache colour `want`, cut from an aligned block of `colours`
++/// frames (a power of two), which holds one frame of every colour. The other
++/// frames go back to the allocator.
++#[cfg(target_arch = "mips64")]
++pub fn allocate_frame_of_colour(want: usize, colours: usize, must_be_zero: bool) -> Option<Frame> {
++    let base = allocate_p2frame(colours.trailing_zeros(), must_be_zero)?;
++    for i in 0..colours {
++        let info = get_page_info(base.next_by(i)).expect("allocated frame missing PageInfo");
++        info.refcount.store(RC_USED_NOT_FREE, Ordering::Relaxed);
++        info.next.store(0, Ordering::Relaxed);
++    }
++    let mut kept = None;
++    for i in 0..colours {
++        let frame = base.next_by(i);
++        if (frame.base().data() / PAGE_SIZE) & (colours - 1) == want {
++            kept = Some(frame);
++        } else {
++            unsafe { deallocate_p2frame(frame, 0) };
++        }
++    }
++    kept
++}
++
+ // Helper function for quickly mapping device memory
+ pub unsafe fn map_device_memory(addr: PhysicalAddress, len: usize) -> VirtualAddress {
+     unsafe {
+@@ -785,7 +855,12 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
  
                  (aligned_end - aligned_start) / MAX_SECTION_SIZE
              })
@@ -5686,7 +6388,7 @@ index eddfa494..e9d39153 100644
          let section_array_page_count =
              (max_section_count * size_of::<Section>()).div_ceil(PAGE_SIZE);
  
-@@ -902,10 +952,23 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
+@@ -902,10 +977,23 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
          None
      };
  
@@ -5710,7 +6412,7 @@ index eddfa494..e9d39153 100644
      // The bump allocator has been used during the section array and page info array allocation
      // phases, which means some of the PageInfos will be pointing to those arrays themselves.
      // Mark those pages as used!
-@@ -978,6 +1041,9 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
+@@ -978,6 +1066,9 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
              {
                  continue;
              }
@@ -5720,7 +6422,7 @@ index eddfa494..e9d39153 100644
  
              let mut base = section.base;
              let mut frames = section.frames;
-@@ -1412,7 +1478,13 @@ pub fn page_fault_handler(
+@@ -1412,7 +1503,13 @@ pub fn page_fault_handler(
          let mut token = unsafe { CleanLockToken::new() };
          match context::memory::try_correcting_page_tables(faulting_page, mode, &mut token) {
              Ok(()) => return Ok(()),
@@ -5761,6 +6463,25 @@ index ded62e62..45143468 100644
          let elf_header: &FileHeader<NativeEndian> = object::pod::from_bytes(slice::from_raw_parts(
              kernel_ptr,
              size_of::<FileHeader<NativeEndian>>(),
+diff --git a/src/percpu.rs b/src/percpu.rs
+index 558f9672..feb54c83 100644
+--- a/src/percpu.rs
++++ b/src/percpu.rs
+@@ -206,6 +206,14 @@ pub unsafe fn switch_arch_hook() {
+         }
+         match next_addrsp_guard {
+             Some(next_addrsp) => {
++                #[cfg(target_arch = "mips64")]
++                if let Some(wrapper) = &*percpu.current_addrsp.borrow() {
++                    crate::arch::paging::switch_to(
++                        &wrapper.used_by as *const _ as usize,
++                        next_addrsp.table.utable.table().phys().data(),
++                    );
++                }
++                #[cfg(not(target_arch = "mips64"))]
+                 next_addrsp.table.utable.make_current();
+                 drop(next_addrsp);
+             }
 diff --git a/src/scheme/irq.rs b/src/scheme/irq.rs
 index 10abe0b8..984843bd 100644
 --- a/src/scheme/irq.rs
@@ -5974,7 +6695,7 @@ index 00000000..05282a3f
 +    }
 +}
 diff --git a/src/scheme/sys/mod.rs b/src/scheme/sys/mod.rs
-index f4c0dba6..fdcbcc3b 100644
+index f4c0dba6..096deac5 100644
 --- a/src/scheme/sys/mod.rs
 +++ b/src/scheme/sys/mod.rs
 @@ -31,6 +31,8 @@ mod cpu;
@@ -5999,7 +6720,7 @@ index f4c0dba6..fdcbcc3b 100644
      // Disabled because the debugger is inherently unsafe and probably will break the system.
      /*
      ("trigger_debugger", Rd(|token| unsafe {
-@@ -103,6 +111,23 @@ const FILES: &[(&str, Kind)] = &[
+@@ -103,6 +111,32 @@ const FILES: &[(&str, Kind)] = &[
              match arg.trim_ascii() {
                  b"shutdown" => crate::stop::kstop(token),
                  b"reset" => crate::stop::kreset(),
@@ -6015,6 +6736,15 @@ index f4c0dba6..fdcbcc3b 100644
 +                    crate::arch::cache::log_stats();
 +                    Ok(0)
 +                }
++                // The CPU module's secondary cache (arch::cache::scache).
++                #[cfg(target_arch = "mips64")]
++                b"scache-on" | b"scache-off" => {
++                    if crate::arch::cache::scache(arg.trim_ascii() == b"scache-on") {
++                        Ok(arg.len())
++                    } else {
++                        Err(Error::new(EINVAL))
++                    }
++                }
 +                #[cfg(target_arch = "mips64")]
 +                b"disarm" => {
 +                    crate::arch::time::disarm_deadman();
@@ -6024,10 +6754,46 @@ index f4c0dba6..fdcbcc3b 100644
                  _ => Err(Error::new(EINVAL)),
              }
 diff --git a/src/scheme/user.rs b/src/scheme/user.rs
-index d91ae0ab..6ca05079 100644
+index d91ae0ab..7a98cf3a 100644
 --- a/src/scheme/user.rs
 +++ b/src/scheme/user.rs
-@@ -597,9 +597,11 @@ impl UserInner {
+@@ -430,8 +430,12 @@ impl UserInner {
+ 
+             dst_addr_space
+                 .acquire_write(lock_token.downgrade())
+-                .mmap_anywhere(
++                .mmap_near(
+                     &dst_addr_space,
++                    // Any address of the frame's cache colour (mips64).
++                    Page::containing_address(VirtualAddress::new(
++                        tail_frame.base().data() % (16 * PAGE_SIZE),
++                    )),
+                     ONE,
+                     PROT_READ,
+                     |dst_page, flags, mapper, flusher| {
+@@ -557,7 +561,8 @@ impl UserInner {
+ 
+         let head_buf_opt = if !head_part_of_buf.is_empty() {
+             // FIXME: Signal context can probably recursively use head/tail.
+-            let mut array = BorrowedHtBuf::head_locked(token.downgrade())?;
++            let mut array =
++                BorrowedHtBuf::head_locked_at(token.downgrade(), src_page.start_address().data())?;
+             if READ {
+                 array.buf_mut()[..offset].fill(0_u8);
+                 array.buf_mut()[offset + head_len..].fill(0_u8);
+@@ -576,7 +581,10 @@ impl UserInner {
+ 
+         let tail_buf_opt = if !tail_part_of_buf.is_empty() {
+             // FIXME: Signal context can probably recursively use head/tail.
+-            let mut array = BorrowedHtBuf::tail_locked(token.downgrade())?;
++            let mut array = BorrowedHtBuf::tail_locked_at(
++                token.downgrade(),
++                src_page.next_by(page_count - 1).start_address().data(),
++            )?;
+ 
+             if READ {
+                 let (to_copy, to_zero) = array.buf_mut().split_at_mut(tail_size);
+@@ -597,9 +605,11 @@ impl UserInner {
          let mut dst_space_guard = dst_space_lock.acquire_write(token.downgrade());
          let (dst_space, _token_split) = dst_space_guard.token_split();
  

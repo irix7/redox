@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build std programs from the base workspace for the Indy target.
 #
-#   tools/base-indy.sh PACKAGE...      e.g. tools/base-indy.sh seeqd netstack
+#   tools/base-indy.sh PACKAGE...      e.g. tools/base-indy.sh randd netstack
 #
 # Needs the static relibc sysroot (tools/relibc-indy.sh). The link flags are
 # passed in the environment: a cargo config in the base checkout would also

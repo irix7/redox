@@ -133,12 +133,25 @@ impl Conn {
         }
     }
 
-    /// Move `len` body bytes to `out`.
+    /// Move `len` body bytes to `out`. What the buffer does not hold is read
+    /// from the stream straight into `out`, as much per read as is left: on
+    /// Redox each read is a call to the network stack, which can hand over
+    /// its whole receive buffer at once.
     fn take_exact(&mut self, len: usize, out: &mut Vec<u8>) -> io::Result<()> {
-        while self.buffer.len() < len {
-            self.fill()?;
+        let buffered = len.min(self.buffer.len());
+        out.extend(self.buffer.drain(..buffered));
+        let start = out.len();
+        let end = start + (len - buffered);
+        out.resize(end, 0);
+        let mut filled = start;
+        while filled < end {
+            match self.stream.read(&mut out[filled..end]) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
         }
-        out.extend(self.buffer.drain(..len));
         Ok(())
     }
 

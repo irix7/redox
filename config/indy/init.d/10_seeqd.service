@@ -1,7 +1,0 @@
-[unit]
-description = "Seeq 8003 Ethernet driver"
-requires_weak = ["00_randd.service"]
-
-[service]
-cmd = "seeqd"
-type = "notify"

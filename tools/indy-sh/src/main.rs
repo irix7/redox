@@ -140,6 +140,22 @@ fn run(line: &str, out: &mut dyn Write) -> bool {
                 }
             }
         }
+        // The CPU module's secondary cache, where the PROM lists one.
+        "scache" => {
+            let command = if args.first().copied() == Some("off") {
+                "scache-off"
+            } else {
+                "scache-on"
+            };
+            match fs::write("/scheme/sys/kstop", command) {
+                Ok(()) => {
+                    let _ = writeln!(out, "{command}: done\r");
+                }
+                Err(err) => {
+                    let _ = writeln!(out, "{command}: {err}\r");
+                }
+            }
+        }
         "sigtest" => sigtest(out),
         "reboot" => {
             let _ = writeln!(out, "rebooting to the PROM\r");

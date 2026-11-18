@@ -29,6 +29,10 @@ pub enum Error {
     CrossScheme(String),
     /// The store or the network failed; the text says how.
     Io(String),
+    /// The answer needs a request to the server and the caller asked for
+    /// none (`fetch` false): the scheme's dispatch thread answers from the
+    /// cache and leaves requests that wait for the network to its workers.
+    WouldFetch,
 }
 
 impl From<io::Error> for Error {
@@ -46,6 +50,7 @@ impl std::fmt::Display for Error {
             Error::Loop => f.write_str("too many symbolic links"),
             Error::CrossScheme(_) => f.write_str("symbolic link into another scheme"),
             Error::Io(text) => f.write_str(text),
+            Error::WouldFetch => f.write_str("not in the cache"),
         }
     }
 }
@@ -161,11 +166,14 @@ impl Store {
 
     /// The tree this client reads. Fetched on first use and then kept, so
     /// one run sees one snapshot. Other threads wait while one fetches it.
-    pub fn root(&self) -> Result<Root> {
+    pub fn root(&self, fetch: bool) -> Result<Root> {
         let mut root = lock(&self.root);
         loop {
             if let Some(root) = *root {
                 return Ok(root);
+            }
+            if !fetch {
+                return Err(Error::WouldFetch);
             }
             match self.fetch_root() {
                 Ok(fetched) => {
@@ -184,9 +192,12 @@ impl Store {
 
     /// The blob named `hash`, from the cache or the server. The content is
     /// checked against the name before it is used.
-    pub fn blob(&self, hash: &Hash) -> Result<Arc<[u8]>> {
+    pub fn blob(&self, hash: &Hash, fetch: bool) -> Result<Arc<[u8]>> {
         if let Some(blob) = lock(&self.cache).get(hash) {
             return Ok(blob);
+        }
+        if !fetch {
+            return Err(Error::WouldFetch);
         }
         // Two threads that miss on the same blob both fetch it; the second
         // insert replaces the first.
@@ -200,25 +211,25 @@ impl Store {
     }
 
     /// Entries of a directory.
-    pub fn list(&self, dir: &Entry) -> Result<Vec<Entry>> {
+    pub fn list(&self, dir: &Entry, fetch: bool) -> Result<Vec<Entry>> {
         if dir.kind != Kind::Dir {
             return Err(Error::NotDir);
         }
-        let blob = self.blob(&dir.hash)?;
+        let blob = self.blob(&dir.hash, fetch)?;
         format::parse_dir(&blob).ok_or_else(|| Error::Io("malformed directory blob".into()))
     }
 
     /// Target of a symbolic link.
-    pub fn target(&self, link: &Entry) -> Result<String> {
-        let blob = self.blob(&link.hash)?;
+    pub fn target(&self, link: &Entry, fetch: bool) -> Result<String> {
+        let blob = self.blob(&link.hash, fetch)?;
         String::from_utf8(blob.to_vec()).map_err(|_| Error::Io("malformed link blob".into()))
     }
 
     /// The entry at `path`, relative to the root of the tree. Links are
     /// followed inside the tree; `follow_last` says whether a link in the
     /// last component is followed too.
-    pub fn resolve(&self, path: &str, follow_last: bool) -> Result<Entry> {
-        let root = self.root()?;
+    pub fn resolve(&self, path: &str, follow_last: bool, fetch: bool) -> Result<Entry> {
+        let root = self.root(fetch)?;
         let mut stack = vec![Entry {
             kind: Kind::Dir,
             mode: 0o755,
@@ -243,14 +254,14 @@ impl Store {
             if dir.kind != Kind::Dir {
                 return Err(Error::NotDir);
             }
-            let blob = self.blob(&dir.hash)?;
+            let blob = self.blob(&dir.hash, fetch)?;
             let entry = format::find_in_dir(&blob, &part).ok_or(Error::NotFound)?;
             if entry.kind == Kind::Link && (follow_last || todo.iter().any(|p| !p.is_empty())) {
                 links += 1;
                 if links > MAX_LINKS {
                     return Err(Error::Loop);
                 }
-                let target = self.target(&entry)?;
+                let target = self.target(&entry, fetch)?;
                 // A link into another scheme (`/dev/null` -> `/scheme/null`)
                 // is not ours to follow: the caller reads the link and opens
                 // the target itself.
@@ -276,11 +287,11 @@ impl Store {
     }
 
     /// Read from a file at `offset`. Fills `buf` unless the file ends first.
-    pub fn read(&self, file: &Entry, offset: u64, buf: &mut [u8]) -> Result<usize> {
+    pub fn read(&self, file: &Entry, offset: u64, buf: &mut [u8], fetch: bool) -> Result<usize> {
         match file.kind {
             Kind::Dir => return Err(Error::IsDir),
             Kind::Link => {
-                let target = self.blob(&file.hash)?;
+                let target = self.blob(&file.hash, fetch)?;
                 return Ok(copy_from(&target, offset, buf));
             }
             Kind::File => {}
@@ -289,7 +300,7 @@ impl Store {
             return Ok(0);
         }
         if file.size <= CHUNK as u64 {
-            let content = self.blob(&file.hash)?;
+            let content = self.blob(&file.hash, fetch)?;
             if content.len() as u64 != file.size {
                 return Err(Error::Io("file blob has the wrong size".into()));
             }
@@ -303,12 +314,12 @@ impl Store {
             let index = (position / CHUNK as u64) as usize;
             // Looked up for every piece: the cache may have dropped the list
             // while the previous piece was fetched.
-            let list = self.blob(&file.hash)?;
+            let list = self.blob(&file.hash, fetch)?;
             let hash: Hash = list
                 .get(index * HASH_LEN..(index + 1) * HASH_LEN)
                 .and_then(|bytes| bytes.try_into().ok())
                 .ok_or_else(|| Error::Io("piece list is shorter than the file".into()))?;
-            let piece = self.blob(&hash)?;
+            let piece = self.blob(&hash, fetch)?;
             let copied = copy_from(&piece, position % CHUNK as u64, &mut buf[done..want]);
             if copied == 0 {
                 return Err(Error::Io("piece is shorter than the file".into()));

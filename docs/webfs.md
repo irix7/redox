@@ -71,7 +71,7 @@ scheme `file`. init then switches root to `/usr` and `/etc` and starts every uni
 `/usr/lib/init.d`.
 
 ```sh
-make indy            # kernel + initfs: init, randd, seeqd, netstack, webfs
+make indy            # kernel + initfs: init, randd, netstack, webfs
 make indy-root       # build/indy/root, packed into build/indy/store
 tools/webfs/target/release/webfs serve build/indy/store --listen 0.0.0.0:8734
 ```
@@ -101,8 +101,9 @@ rest of the path appended (`/scheme/tmp/tmp/x`).
 
 Status 2026-11-18 on the real Indy (R4600, 32 MiB): the store mounts as the root, files
 of 46 bytes to 2 MiB read back with the right CRC-32, and programs run from `/usr/bin`.
-Reading runs at about 45 KiB/s; the kernel's cache flushing on every trap is the main
-cost.
+Reading runs at about 355 KiB/s (2026-11-19: 1.2 MB in 3.4 s, CRC included; 77 KiB/s the
+day before; bootstrap.md T8i lists what changed). The machine is CPU-bound for the whole
+read.
 
 A second store can be mounted beside the root with `tools/webfs-unit.sh`, which adds
 `50_webfs.service` for `/scheme/web`; the gate uses it for the TLS path.
@@ -117,7 +118,8 @@ Mount options:
 | `--connect IP` | DNS | connect to IP; the URL still names the host |
 | `--ca FILE` | none | trust the certificates in FILE too (DER or PEM) |
 
-The daemon registers the scheme at once and fetches `root` on the first open. For the
+The daemon's dispatch thread answers a request itself when the blob cache holds everything
+the answer needs; a request that needs the server goes to a worker thread. The daemon registers the scheme at once and fetches `root` on the first open. For the
 first 60 seconds after start it retries a failed mount every 2 seconds, which covers the
 wait for DHCP. It keeps the root it fetched until it exits, so one boot sees one
 snapshot. Symbolic links are followed inside the tree. Writes return `EROFS`.

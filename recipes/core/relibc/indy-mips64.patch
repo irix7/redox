@@ -1,4 +1,4 @@
-From a25a8578031c1002ea8946bd31a6db2d91cc57e5 Mon Sep 17 00:00:00 2001
+From 5e4f3ac1e8cdc682b94634cf47f598440da4e122 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:49 +1000
 Subject: [PATCH] redox-rt, generic-rt: add mips64 n32 (SGI Indy)
@@ -38,6 +38,7 @@ Signed-off-by: belikh <io@belic.net>
  src/header/signal/redox.rs                 |  12 +-
  src/header/stdio/printf.rs                 |   5 +
  src/header/stdlib/mod.rs                   |   4 +-
+ src/header/string/mod.rs                   | 122 +++-
  src/header/sys_epoll/mod.rs                |  40 +-
  src/header/sys_procfs/mod.rs               |   2 +
  src/header/sys_select/mod.rs               |   5 +-
@@ -50,7 +51,7 @@ Signed-off-by: belikh <io@belic.net>
  src/platform/redox/epoll.rs                |  40 +-
  src/platform/redox/ptrace.rs               |  12 +
  stripcore.sh                               |   5 +-
- 35 files changed, 932 insertions(+), 108 deletions(-)
+ 36 files changed, 1038 insertions(+), 124 deletions(-)
  create mode 100644 redox-rt/src/arch/mips64.rs
  create mode 100644 src/header/arch_mips64_user/cbindgen.toml
  create mode 100644 src/header/arch_mips64_user/mod.rs
@@ -1299,6 +1300,154 @@ index 08bbc00..c1c2bd4 100644
      c_long::try_from(k).unwrap()
  }
  
+diff --git a/src/header/string/mod.rs b/src/header/string/mod.rs
+index cbd9143..8295d29 100644
+--- a/src/header/string/mod.rs
++++ b/src/header/string/mod.rs
+@@ -109,8 +109,49 @@ pub unsafe extern "C" fn memcmp(s1: *const c_void, s2: *const c_void, n: size_t)
+ ///     - `s2` is convertible to a `&[MaybeUninit<u8>]` with length `n`.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn memcpy(s1: *mut c_void, s2: *const c_void, n: size_t) -> *mut c_void {
+-    for i in 0..n {
+-        unsafe { *s1.cast::<u8>().add(i) = *s2.cast::<u8>().add(i) };
++    // 64-bit words once the destination is aligned: a byte at a time costs
++    // about five instructions per byte on a machine without vector units.
++    // The loops stay in this function: the compiler does not turn a loop
++    // into a call to `memcpy` inside `memcpy` itself.
++    let mut d = s1.cast::<u8>();
++    let mut s = s2.cast::<u8>();
++    let mut n = n;
++    unsafe {
++        if n >= 16 {
++            while d as usize & 7 != 0 {
++                *d = *s;
++                d = d.add(1);
++                s = s.add(1);
++                n -= 1;
++            }
++            if s as usize & 7 == 0 {
++                while n >= 32 {
++                    let a = s.cast::<u64>().read();
++                    let b = s.add(8).cast::<u64>().read();
++                    let c = s.add(16).cast::<u64>().read();
++                    let e = s.add(24).cast::<u64>().read();
++                    d.cast::<u64>().write(a);
++                    d.add(8).cast::<u64>().write(b);
++                    d.add(16).cast::<u64>().write(c);
++                    d.add(24).cast::<u64>().write(e);
++                    d = d.add(32);
++                    s = s.add(32);
++                    n -= 32;
++                }
++            }
++            while n >= 8 {
++                d.cast::<u64>().write(s.cast::<u64>().read_unaligned());
++                d = d.add(8);
++                s = s.add(8);
++                n -= 8;
++            }
++        }
++        while n != 0 {
++            *d = *s;
++            d = d.add(1);
++            s = s.add(1);
++            n -= 1;
++        }
+     }
+     s1
+ }
+@@ -155,19 +196,39 @@ pub unsafe extern "C" fn memmem(
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/memmove.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn memmove(s1: *mut c_void, s2: *const c_void, n: size_t) -> *mut c_void {
+-    if s2 < s1.cast_const() {
+-        // copy from end
+-        let mut i = n;
+-        while i != 0 {
+-            i -= 1;
+-            unsafe { *s1.cast::<u8>().add(i) = *s2.cast::<u8>().add(i) };
++    let dst = s1.cast::<u8>();
++    let src = s2.cast::<u8>();
++    if (dst as usize).wrapping_sub(src as usize) >= n {
++        // The destination starts below the source or past its end: copying
++        // upwards never writes a byte that is still to be read, which holds
++        // for `memcpy`'s word loops as well.
++        return unsafe { memcpy(s1, s2, n) };
++    }
++    // The destination starts inside the source: copy from the end, in
++    // 64-bit words once the end of the destination is aligned.
++    unsafe {
++        let mut d = dst.add(n);
++        let mut s = src.add(n);
++        let mut n = n;
++        if n >= 16 {
++            while d as usize & 7 != 0 {
++                d = d.sub(1);
++                s = s.sub(1);
++                *d = *s;
++                n -= 1;
++            }
++            while n >= 8 {
++                d = d.sub(8);
++                s = s.sub(8);
++                d.cast::<u64>().write(s.cast::<u64>().read_unaligned());
++                n -= 8;
++            }
+         }
+-    } else {
+-        // copy from beginning
+-        let mut i = 0;
+-        while i < n {
+-            unsafe { *s1.cast::<u8>().add(i) = *s2.cast::<u8>().add(i) };
+-            i += 1;
++        while n != 0 {
++            d = d.sub(1);
++            s = s.sub(1);
++            *d = *s;
++            n -= 1;
+         }
+     }
+     s1
+@@ -199,8 +260,37 @@ pub unsafe extern "C" fn memrchr(
+ /// Casting of `c` may result in truncation or sign loss.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn memset(s: *mut c_void, c: c_int, n: size_t) -> *mut c_void {
+-    for i in 0..n {
+-        unsafe { *s.cast::<u8>().add(i) = c as u8 };
++    // 64-bit words once the pointer is aligned, as in `memcpy`.
++    let byte = c as u8;
++    let mut d = s.cast::<u8>();
++    let mut n = n;
++    unsafe {
++        if n >= 16 {
++            while d as usize & 7 != 0 {
++                *d = byte;
++                d = d.add(1);
++                n -= 1;
++            }
++            let word = u64::from_ne_bytes([byte; 8]);
++            while n >= 32 {
++                d.cast::<u64>().write(word);
++                d.add(8).cast::<u64>().write(word);
++                d.add(16).cast::<u64>().write(word);
++                d.add(24).cast::<u64>().write(word);
++                d = d.add(32);
++                n -= 32;
++            }
++            while n >= 8 {
++                d.cast::<u64>().write(word);
++                d = d.add(8);
++                n -= 8;
++            }
++        }
++        while n != 0 {
++            *d = byte;
++            d = d.add(1);
++            n -= 1;
++        }
+     }
+     s
+ }
 diff --git a/src/header/sys_epoll/mod.rs b/src/header/sys_epoll/mod.rs
 index b4180e2..e1ee62b 100644
 --- a/src/header/sys_epoll/mod.rs

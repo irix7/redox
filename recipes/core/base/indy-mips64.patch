@@ -1,4 +1,4 @@
-From e8baebaebf676103839aa0daa6db843c355b1bb9 Mon Sep 17 00:00:00 2001
+From fb7a346d777a849bc8333794b4580ab702274d94 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:40 +1000
 Subject: [PATCH] Indy (mips64 n32): bootstrap entry, Seeq 8003 driver,
@@ -20,29 +20,32 @@ Subject: [PATCH] Indy (mips64 n32): bootstrap entry, Seeq 8003 driver,
 Signed-off-by: belikh <io@jupiter.au>
 Signed-off-by: belikh <io@belic.net>
 ---
- Cargo.lock                      | 133 ++++++-------
- Cargo.toml                      |   6 +
- bootstrap/Cargo.lock            |   7 +-
- bootstrap/Cargo.toml            |  11 +-
- bootstrap/src/initfs.rs         |  53 +++++-
- bootstrap/src/initnsmgr.rs      |   4 +-
- bootstrap/src/main.rs           |   5 +
- bootstrap/src/mips64.ld         |  59 ++++++
- bootstrap/src/mips64.rs         |  58 ++++++
- drivers/common/src/dma.rs       |   3 +
- drivers/net/seeqd/Cargo.toml    |  19 ++
- drivers/net/seeqd/src/device.rs | 318 ++++++++++++++++++++++++++++++++
- drivers/net/seeqd/src/main.rs   | 113 ++++++++++++
- netstack/src/scheme/mod.rs      |  33 +++-
- 14 files changed, 747 insertions(+), 75 deletions(-)
+ Cargo.lock                            | 121 +++++----
+ Cargo.toml                            |   5 +
+ bootstrap/Cargo.lock                  |   7 +-
+ bootstrap/Cargo.toml                  |  11 +-
+ bootstrap/src/initfs.rs               |  53 +++-
+ bootstrap/src/initnsmgr.rs            |   4 +-
+ bootstrap/src/main.rs                 |   5 +
+ bootstrap/src/mips64.ld               |  59 +++++
+ bootstrap/src/mips64.rs               |  58 +++++
+ drivers/common/src/dma.rs             |   3 +
+ drivers/net/driver-network/src/lib.rs |  45 +++-
+ netstack/Cargo.toml                   |   4 +
+ netstack/src/link/ethernet.rs         | 205 ++++++++++++---
+ netstack/src/link/mod.rs              |  12 +
+ netstack/src/link/seeq.rs             | 355 ++++++++++++++++++++++++++
+ netstack/src/main.rs                  |  80 +++++-
+ netstack/src/router/mod.rs            |  18 ++
+ netstack/src/scheme/mod.rs            |  47 +++-
+ netstack/src/scheme/tcp.rs            |  19 +-
+ 19 files changed, 970 insertions(+), 141 deletions(-)
  create mode 100644 bootstrap/src/mips64.ld
  create mode 100644 bootstrap/src/mips64.rs
- create mode 100644 drivers/net/seeqd/Cargo.toml
- create mode 100644 drivers/net/seeqd/src/device.rs
- create mode 100644 drivers/net/seeqd/src/main.rs
+ create mode 100644 netstack/src/link/seeq.rs
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 641aaaf..5bf827e 100644
+index 641aaaf..11b0fab 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -14,7 +14,7 @@ dependencies = [
@@ -290,7 +293,14 @@ index 641aaaf..5bf827e 100644
  ]
  
  [[package]]
-@@ -1521,7 +1519,7 @@ dependencies = [
+@@ -1515,13 +1513,14 @@ name = "netstack"
+ version = "0.1.0"
+ dependencies = [
+  "anyhow",
++ "common",
+  "daemon",
+  "libredox 0.2.0",
+  "log",
   "redox-log",
   "redox-scheme",
   "redox_event",
@@ -299,7 +309,7 @@ index 641aaaf..5bf827e 100644
   "scheme-utils",
   "smoltcp",
  ]
-@@ -1590,7 +1588,7 @@ dependencies = [
+@@ -1590,7 +1589,7 @@ dependencies = [
   "partitionlib",
   "pcid",
   "redox_event",
@@ -308,7 +318,7 @@ index 641aaaf..5bf827e 100644
   "smallvec",
  ]
  
-@@ -1700,7 +1698,7 @@ dependencies = [
+@@ -1700,7 +1699,7 @@ dependencies = [
   "pico-args",
   "plain",
   "redox-scheme",
@@ -317,7 +327,7 @@ index 641aaaf..5bf827e 100644
   "scheme-utils",
   "serde",
  ]
-@@ -1717,7 +1715,7 @@ dependencies = [
+@@ -1717,7 +1716,7 @@ dependencies = [
   "log",
   "pcid",
   "pico-args",
@@ -326,7 +336,7 @@ index 641aaaf..5bf827e 100644
   "serde",
   "toml",
  ]
-@@ -1822,7 +1820,7 @@ dependencies = [
+@@ -1822,7 +1821,7 @@ dependencies = [
   "orbclient",
   "redox-scheme",
   "redox_event",
@@ -335,7 +345,7 @@ index 641aaaf..5bf827e 100644
  ]
  
  [[package]]
-@@ -1845,7 +1843,7 @@ dependencies = [
+@@ -1845,7 +1844,7 @@ dependencies = [
   "libredox 0.2.0",
   "redox-scheme",
   "redox_event",
@@ -344,7 +354,7 @@ index 641aaaf..5bf827e 100644
   "redox_termios",
   "scheme-utils",
  ]
-@@ -1884,7 +1882,7 @@ dependencies = [
+@@ -1884,7 +1883,7 @@ dependencies = [
   "redox-rings",
   "redox-scheme",
   "redox_event",
@@ -353,7 +363,7 @@ index 641aaaf..5bf827e 100644
   "scheme-utils",
   "zerocopy",
  ]
-@@ -1932,7 +1930,7 @@ dependencies = [
+@@ -1932,7 +1931,7 @@ dependencies = [
   "rand_core 0.5.1",
   "raw-cpuid",
   "redox-scheme",
@@ -362,7 +372,7 @@ index 641aaaf..5bf827e 100644
   "scheme-utils",
   "sha2",
  ]
-@@ -1978,7 +1976,7 @@ version = "0.1.0"
+@@ -1978,7 +1977,7 @@ version = "0.1.0"
  source = "git+https://gitlab.redox-os.org/redox-os/relibc.git#82a552657ca3cb6d1852016e81c89aa25812d186"
  dependencies = [
   "drm-sys",
@@ -371,7 +381,7 @@ index 641aaaf..5bf827e 100644
  ]
  
  [[package]]
-@@ -2005,7 +2003,7 @@ source = "git+https://gitlab.redox-os.org/redox-os/redox-rings.git#d787c28c2dba7
+@@ -2005,7 +2004,7 @@ source = "git+https://gitlab.redox-os.org/redox-os/redox-rings.git#d787c28c2dba7
  dependencies = [
   "bitflags 2.13.1",
   "libredox 0.2.0",
@@ -380,7 +390,7 @@ index 641aaaf..5bf827e 100644
   "zerocopy",
  ]
  
-@@ -2015,7 +2013,7 @@ version = "0.13.0"
+@@ -2015,7 +2014,7 @@ version = "0.13.0"
  source = "git+https://gitlab.redox-os.org/redox-os/redox-scheme.git#3514d5696fb8cbbe7d517d37d3074d7cd5cfdded"
  dependencies = [
   "libredox 0.2.0",
@@ -389,7 +399,7 @@ index 641aaaf..5bf827e 100644
  ]
  
  [[package]]
-@@ -2039,9 +2037,7 @@ dependencies = [
+@@ -2039,9 +2038,7 @@ dependencies = [
  
  [[package]]
  name = "redox_syscall"
@@ -400,7 +410,7 @@ index 641aaaf..5bf827e 100644
  dependencies = [
   "bitflags 2.13.1",
  ]
-@@ -2063,7 +2059,7 @@ dependencies = [
+@@ -2063,7 +2060,7 @@ dependencies = [
   "libredox 0.2.0",
   "qemu-exit",
   "redox_event",
@@ -409,7 +419,7 @@ index 641aaaf..5bf827e 100644
   "redox_termios",
  ]
  
-@@ -2139,7 +2135,7 @@ dependencies = [
+@@ -2139,7 +2136,7 @@ dependencies = [
   "log",
   "pcid",
   "redox_event",
@@ -418,7 +428,7 @@ index 641aaaf..5bf827e 100644
  ]
  
  [[package]]
-@@ -2154,7 +2150,7 @@ dependencies = [
+@@ -2154,7 +2151,7 @@ dependencies = [
   "log",
   "pcid",
   "redox_event",
@@ -427,7 +437,7 @@ index 641aaaf..5bf827e 100644
  ]
  
  [[package]]
-@@ -2204,7 +2200,7 @@ dependencies = [
+@@ -2204,7 +2201,7 @@ dependencies = [
   "log",
   "redox-scheme",
   "redox_event",
@@ -436,7 +446,7 @@ index 641aaaf..5bf827e 100644
   "scheme-utils",
   "spin",
  ]
-@@ -2215,7 +2211,7 @@ version = "0.0.0"
+@@ -2215,7 +2212,7 @@ version = "0.0.0"
  dependencies = [
   "libredox 0.2.0",
   "redox-scheme",
@@ -445,27 +455,7 @@ index 641aaaf..5bf827e 100644
  ]
  
  [[package]]
-@@ -2267,6 +2263,19 @@ dependencies = [
-  "version-compare",
- ]
- 
-+[[package]]
-+name = "seeqd"
-+version = "0.1.0"
-+dependencies = [
-+ "common",
-+ "daemon",
-+ "driver-network",
-+ "libredox 0.2.0",
-+ "log",
-+ "redox_event",
-+ "redox_syscall 0.9.6",
-+]
-+
- [[package]]
- name = "serde"
- version = "1.0.229"
-@@ -2568,7 +2577,7 @@ dependencies = [
+@@ -2568,7 +2565,7 @@ dependencies = [
   "libredox 0.2.0",
   "redox-scheme",
   "redox_event",
@@ -474,7 +464,7 @@ index 641aaaf..5bf827e 100644
   "scheme-utils",
  ]
  
-@@ -2604,7 +2613,7 @@ dependencies = [
+@@ -2604,7 +2601,7 @@ dependencies = [
   "log",
   "orbclient",
   "plain",
@@ -483,7 +473,7 @@ index 641aaaf..5bf827e 100644
   "rehid",
   "smallvec",
   "xhcid",
-@@ -2616,7 +2625,7 @@ version = "0.1.0"
+@@ -2616,7 +2613,7 @@ version = "0.1.0"
  dependencies = [
   "common",
   "log",
@@ -492,7 +482,7 @@ index 641aaaf..5bf827e 100644
   "xhcid",
  ]
  
-@@ -2630,7 +2639,7 @@ dependencies = [
+@@ -2630,7 +2627,7 @@ dependencies = [
   "libredox 0.2.0",
   "plain",
   "redox_event",
@@ -501,7 +491,7 @@ index 641aaaf..5bf827e 100644
   "thiserror",
   "xhcid",
  ]
-@@ -2662,7 +2671,7 @@ dependencies = [
+@@ -2662,7 +2659,7 @@ dependencies = [
   "orbclient",
   "pcid",
   "redox_event",
@@ -510,7 +500,7 @@ index 641aaaf..5bf827e 100644
  ]
  
  [[package]]
-@@ -2686,7 +2695,7 @@ dependencies = [
+@@ -2686,7 +2683,7 @@ dependencies = [
   "driver-graphics",
   "libredox 0.2.0",
   "redox_event",
@@ -519,7 +509,7 @@ index 641aaaf..5bf827e 100644
  ]
  
  [[package]]
-@@ -2702,7 +2711,7 @@ dependencies = [
+@@ -2702,7 +2699,7 @@ dependencies = [
   "log",
   "pcid",
   "redox_event",
@@ -528,7 +518,7 @@ index 641aaaf..5bf827e 100644
   "spin",
   "static_assertions",
   "thiserror",
-@@ -2721,7 +2730,7 @@ dependencies = [
+@@ -2721,7 +2718,7 @@ dependencies = [
   "log",
   "pcid",
   "redox_event",
@@ -537,7 +527,7 @@ index 641aaaf..5bf827e 100644
   "static_assertions",
   "thiserror",
  ]
-@@ -2743,7 +2752,7 @@ dependencies = [
+@@ -2743,7 +2740,7 @@ dependencies = [
   "redox-path",
   "redox-scheme",
   "redox_event",
@@ -546,7 +536,7 @@ index 641aaaf..5bf827e 100644
   "scheme-utils",
   "thiserror",
   "virtio-core",
-@@ -2757,7 +2766,7 @@ dependencies = [
+@@ -2757,7 +2754,7 @@ dependencies = [
   "clap",
   "libc",
   "libredox 0.1.25",
@@ -555,7 +545,7 @@ index 641aaaf..5bf827e 100644
  ]
  
  [[package]]
-@@ -2773,7 +2782,7 @@ dependencies = [
+@@ -2773,7 +2770,7 @@ dependencies = [
   "log",
   "pcid",
   "redox_event",
@@ -564,7 +554,7 @@ index 641aaaf..5bf827e 100644
   "static_assertions",
   "virtio-core",
  ]
-@@ -2789,7 +2798,7 @@ dependencies = [
+@@ -2789,7 +2786,7 @@ dependencies = [
   "libredox 0.2.0",
   "log",
   "pcid",
@@ -573,7 +563,7 @@ index 641aaaf..5bf827e 100644
   "static_assertions",
   "virtio-core",
  ]
-@@ -3050,7 +3059,7 @@ dependencies = [
+@@ -3050,7 +3047,7 @@ dependencies = [
   "plain",
   "redox-scheme",
   "redox_event",
@@ -582,7 +572,7 @@ index 641aaaf..5bf827e 100644
   "regex",
   "scheme-utils",
   "serde",
-@@ -3087,7 +3096,7 @@ dependencies = [
+@@ -3087,7 +3084,7 @@ dependencies = [
   "daemon",
   "libredox 0.2.0",
   "redox-scheme",
@@ -592,18 +582,10 @@ index 641aaaf..5bf827e 100644
  ]
  
 diff --git a/Cargo.toml b/Cargo.toml
-index ded5edf..d2a8917 100644
+index ded5edf..f7982d3 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -53,6 +53,7 @@ members = [
-     "drivers/net/ixgbed",
-     "drivers/net/rtl8139d",
-     "drivers/net/rtl8168d",
-+    "drivers/net/seeqd",
-     "drivers/net/virtio-netd",
- 
-     "drivers/redoxerd",
-@@ -133,3 +134,8 @@ unused_io_amount = "warn" #TODO: have an abstraction to irq file read/write, the
+@@ -133,3 +133,8 @@ unused_io_amount = "warn" #TODO: have an abstraction to irq file read/write, the
  
  [patch."https://gitlab.redox-os.org/redox-os/relibc.git"]
  #redox-ioctl = { path = "../../relibc/source/redox-ioctl" }
@@ -943,38 +925,414 @@ index 37e7b1a..d6906d3 100644
      } else {
          panic!("invalid arch")
      }
-diff --git a/drivers/net/seeqd/Cargo.toml b/drivers/net/seeqd/Cargo.toml
+diff --git a/drivers/net/driver-network/src/lib.rs b/drivers/net/driver-network/src/lib.rs
+index 0df36f5..29c553f 100644
+--- a/drivers/net/driver-network/src/lib.rs
++++ b/drivers/net/driver-network/src/lib.rs
+@@ -10,6 +10,15 @@ use scheme_utils::{
+ use syscall::schemev2::NewFdFlags;
+ use syscall::{Error, EventFlags, Result, Stat, EACCES, EAGAIN, EINVAL, EWOULDBLOCK, MODE_FILE};
+ 
++/// The data file carries frames in batches. One read returns every waiting
++/// frame that fits the buffer and one write sends every frame in it; each
++/// frame follows its length as a big-endian `u16`. A scheme call costs two
++/// context switches, so the network stack moves a burst in one call.
++pub const FRAME_HEADER: usize = 2;
++/// Room a read needs for one more frame: the largest Ethernet frame with a
++/// VLAN tag and the checksum.
++pub const FRAME_MAX: usize = 1522;
++
+ pub trait NetworkAdapter {
+     /// The [MAC address](https://en.wikipedia.org/wiki/MAC_address) of this
+     /// network adapter.
+@@ -198,16 +207,27 @@ impl<T: NetworkAdapter> ResourceSync for Data<T> {
+         _offset: u64,
+         fcntl_flags: u32,
+     ) -> Result<usize> {
+-        match scheme_data.adapter.read_packet(buf)? {
+-            Some(count) => Ok(count),
+-            None => {
+-                if fcntl_flags & O_NONBLOCK as u32 != 0 {
+-                    Err(Error::new(EAGAIN))
+-                } else {
+-                    Err(Error::new(EWOULDBLOCK))
++        // Every frame waiting that fits, each behind its length (FRAME_HEADER).
++        let mut used = 0;
++        while buf.len() - used >= FRAME_HEADER + FRAME_MAX {
++            let (header, frame) = buf[used..].split_at_mut(FRAME_HEADER);
++            match scheme_data.adapter.read_packet(frame) {
++                Ok(Some(count)) => {
++                    header.copy_from_slice(&(count as u16).to_be_bytes());
++                    used += FRAME_HEADER + count;
+                 }
++                Ok(None) => break,
++                Err(err) if used == 0 => return Err(err),
++                Err(_) => break,
+             }
+         }
++        if used != 0 {
++            Ok(used)
++        } else if fcntl_flags & O_NONBLOCK as u32 != 0 {
++            Err(Error::new(EAGAIN))
++        } else {
++            Err(Error::new(EWOULDBLOCK))
++        }
+     }
+ 
+     fn write(
+@@ -217,7 +237,16 @@ impl<T: NetworkAdapter> ResourceSync for Data<T> {
+         _offset: u64,
+         _fcntl_flags: u32,
+     ) -> Result<usize> {
+-        Ok(scheme_data.adapter.write_packet(buf)?)
++        let mut rest = buf;
++        while rest.len() >= FRAME_HEADER {
++            let len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
++            let frame = rest
++                .get(FRAME_HEADER..FRAME_HEADER + len)
++                .ok_or(Error::new(EINVAL))?;
++            scheme_data.adapter.write_packet(frame)?;
++            rest = &rest[FRAME_HEADER + len..];
++        }
++        Ok(buf.len())
+     }
+ 
+     fn fevent(
+diff --git a/netstack/Cargo.toml b/netstack/Cargo.toml
+index 9a38199..6cedfe1 100644
+--- a/netstack/Cargo.toml
++++ b/netstack/Cargo.toml
+@@ -34,5 +34,9 @@ features = [
+ ]
+ #For debugging: "log", "verbose"
+ 
++# The Indy's Ethernet controller is driven inside the stack (src/link/seeq.rs).
++[target.'cfg(target_arch = "mips64")'.dependencies]
++common = { path = "../drivers/common" }
++
+ [lints]
+ workspace = true
+diff --git a/netstack/src/link/ethernet.rs b/netstack/src/link/ethernet.rs
+index 477bec6..0b49712 100644
+--- a/netstack/src/link/ethernet.rs
++++ b/netstack/src/link/ethernet.rs
+@@ -33,6 +33,15 @@ type PacketBuffer = smoltcp::storage::PacketBuffer<'static, IpAddress>;
+ 
+ const EMPTY_MAC: EthernetAddress = EthernetAddress([0; 6]);
+ 
++/// Where frames come from and go to.
++enum Port {
++    /// A driver process behind a `network.*` scheme.
++    Scheme(File),
++    /// The Indy's controller, driven in this process.
++    #[cfg(target_arch = "mips64")]
++    Seeq(super::seeq::Seeq),
++}
++
+ pub struct EthernetLink {
+     name: Rc<str>,
+     neighbor_cache: BTreeMap<IpAddress, Neighbor>,
+@@ -40,7 +49,17 @@ pub struct EthernetLink {
+     waiting_packets: PacketBuffer,
+     input_buffer: Vec<u8>,
+     output_buffer: Vec<u8>,
+-    network_file: File,
++    /// Frames read from the driver in one call (`[u16 length][frame]...`)
++    /// and the range of it not handed out yet.
++    rx_batch: Vec<u8>,
++    rx_pos: usize,
++    rx_len: usize,
++    /// The driver may hold frames: set by its event and by the timer,
++    /// cleared when a read comes back short or empty.
++    rx_pending: bool,
++    /// Frames to send with the next `flush`, in the same layout.
++    tx_batch: Vec<u8>,
++    port: Port,
+     hardware_address: Option<EthernetAddress>,
+     ip_address: Option<Ipv4Cidr>,
+ }
+@@ -51,10 +70,29 @@ impl EthernetLink {
+     const MTU: usize = 1500;
+     const WAITING_PACKET_BUFFER_SIZE: usize = Self::MTU * Self::MAX_WAITING_PACKET_COUNT;
+ 
++    /// The driver's batch layout (driver-network): a `u16` length before
++    /// each frame, and the room a read needs to take one more frame.
++    const FRAME_HEADER: usize = 2;
++    const FRAME_ROOM: usize = Self::FRAME_HEADER + 1522;
++    /// Frames one read can return.
++    const BATCH_FRAMES: usize = 16;
++
+     const NEIGHBOR_LIVE_TIME: Duration = Duration::from_secs(60);
+     const ARP_SILENCE_TIME: Duration = Duration::from_secs(1);
+ 
+     pub fn new(name: &str, network_file: File) -> Self {
++        Self::with_port(name, Port::Scheme(network_file))
++    }
++
++    #[cfg(target_arch = "mips64")]
++    pub fn with_seeq(name: &str, seeq: super::seeq::Seeq) -> Self {
++        let mac = seeq.mac();
++        let mut link = Self::with_port(name, Port::Seeq(seeq));
++        link.hardware_address = Some(EthernetAddress(mac));
++        link
++    }
++
++    fn with_port(name: &str, port: Port) -> Self {
+         let waiting_packets = PacketBuffer::new(
+             vec![PacketMetadata::EMPTY; Self::MAX_WAITING_PACKET_COUNT],
+             vec![0u8; Self::WAITING_PACKET_BUFFER_SIZE],
+@@ -62,12 +100,17 @@ impl EthernetLink {
+ 
+         Self {
+             name: name.into(),
+-            network_file,
++            port,
+             waiting_packets,
+             hardware_address: None,
+             ip_address: None,
+-            input_buffer: vec![0u8; Self::MTU],
++            input_buffer: Vec::with_capacity(Self::FRAME_ROOM),
+             output_buffer: Vec::with_capacity(Self::MTU),
++            rx_batch: vec![0u8; Self::BATCH_FRAMES * Self::FRAME_ROOM],
++            rx_pos: 0,
++            rx_len: 0,
++            rx_pending: true,
++            tx_batch: Vec::new(),
+             arp_state: Default::default(),
+             neighbor_cache: Default::default(),
+         }
+@@ -94,12 +137,91 @@ impl EthernetLink {
+ 
+         f(frame.payload_mut());
+ 
+-        if self.network_file.write_all(&self.output_buffer).is_err() {
++        #[cfg(target_arch = "mips64")]
++        if let Port::Seeq(seeq) = &mut self.port {
++            if seeq.write_packet(&self.output_buffer).is_err() {
++                error!("Dropped outboud packet on {}", self.name);
++            }
++            return;
++        }
++        self.tx_batch
++            .extend_from_slice(&(self.output_buffer.len() as u16).to_be_bytes());
++        self.tx_batch.extend_from_slice(&self.output_buffer);
++        if self.tx_batch.len() >= Self::BATCH_FRAMES * Self::FRAME_ROOM {
++            self.flush_tx();
++        }
++    }
++
++    /// Send the queued frames in one call to the driver.
++    fn flush_tx(&mut self) {
++        if self.tx_batch.is_empty() {
++            return;
++        }
++        let network_file = match &mut self.port {
++            Port::Scheme(file) => file,
++            #[cfg(target_arch = "mips64")]
++            Port::Seeq(_) => return,
++        };
++        if network_file.write_all(&self.tx_batch).is_err() {
+             error!(
+-                "Dropped outboud packet on {} (failed to write to network file)",
++                "Dropped outboud packets on {} (failed to write to network file)",
+                 self.name
+             )
+         }
++        self.tx_batch.clear();
++    }
++
++    /// The next frame of the batch in `input_buffer`, reading a new batch
++    /// from the driver when this one is used up. False when none waits.
++    fn next_frame(&mut self) -> bool {
++        #[cfg(target_arch = "mips64")]
++        if let Port::Seeq(seeq) = &mut self.port {
++            // Straight from the receive ring.
++            self.input_buffer.resize(Self::FRAME_ROOM, 0);
++            let count = seeq.read_packet(&mut self.input_buffer).ok().flatten();
++            self.input_buffer.truncate(count.unwrap_or(0));
++            return count.is_some();
++        }
++        let network_file = match &mut self.port {
++            Port::Scheme(file) => file,
++            #[cfg(target_arch = "mips64")]
++            Port::Seeq(_) => return false,
++        };
++        if self.rx_pos >= self.rx_len {
++            if !self.rx_pending {
++                return false;
++            }
++            self.rx_pos = 0;
++            self.rx_len = 0;
++            match network_file.read(&mut self.rx_batch) {
++                Ok(count) => {
++                    self.rx_len = count;
++                    // The driver stops when it runs out of frames or of room.
++                    self.rx_pending = count + Self::FRAME_ROOM > self.rx_batch.len();
++                }
++                Err(e) => {
++                    if e.kind() != ErrorKind::WouldBlock {
++                        error!("Failed to read ethernet device on link {}", self.name);
++                    }
++                    self.rx_pending = false;
++                }
++            }
++        }
++        let Some(header) = self.rx_batch[..self.rx_len].get(self.rx_pos..self.rx_pos + Self::FRAME_HEADER)
++        else {
++            self.rx_pos = self.rx_len;
++            return false;
++        };
++        let len = u16::from_be_bytes([header[0], header[1]]) as usize;
++        let start = self.rx_pos + Self::FRAME_HEADER;
++        let Some(frame) = self.rx_batch[..self.rx_len].get(start..start + len) else {
++            self.rx_pos = self.rx_len;
++            return false;
++        };
++        self.input_buffer.clear();
++        self.input_buffer.extend_from_slice(frame);
++        self.rx_pos = start + len;
++        true
+     }
+ 
+     fn process_arp(&mut self, packet: &[u8], now: Instant) {
+@@ -345,41 +467,55 @@ impl LinkDevice for EthernetLink {
+     fn recv(&mut self, now: Instant) -> Option<&[u8]> {
+         let hardware_address = self.hardware_address?;
+ 
+-        let mut input_buffer = std::mem::take(&mut self.input_buffer);
+         loop {
+-            if let Err(e) = self.network_file.read(&mut input_buffer) {
+-                if e.kind() != ErrorKind::WouldBlock {
+-                    error!("Failed to read ethernet device on link {}", self.name);
+-                } else {
+-                    // No packet to read but we check if we have arp to send
+-                    self.send_arp(now);
+-                }
+-                self.input_buffer = input_buffer;
++            if !self.next_frame() {
++                // No packet to read but we check if we have arp to send
++                self.send_arp(now);
+                 return None;
+             }
++            let input_buffer = std::mem::take(&mut self.input_buffer);
+             let packet = EthernetFrame::new_unchecked(&input_buffer[..]);
+-            let Ok(repr) = EthernetRepr::parse(&packet) else {
+-                debug!("Dropped incomming frame on {} (Malformed)", self.name);
+-                continue;
+-            };
+-
++            let repr = EthernetRepr::parse(&packet);
+             // We let EMPTY_MAC pass because somehow this is the mac used when net=redir is used
+-            if !repr.dst_addr.is_broadcast()
+-                && repr.dst_addr != EMPTY_MAC
+-                && repr.dst_addr != hardware_address
+-            {
+-                // Drop packets which are not for us
+-                continue;
+-            }
+-
+-            match repr.ethertype {
+-                EthernetProtocol::Ipv4 => {
++            let for_us = repr.as_ref().is_ok_and(|repr| {
++                repr.dst_addr.is_broadcast()
++                    || repr.dst_addr == EMPTY_MAC
++                    || repr.dst_addr == hardware_address
++            });
++            match repr {
++                Err(_) => debug!("Dropped incomming frame on {} (Malformed)", self.name),
++                Ok(repr) if for_us && repr.ethertype == EthernetProtocol::Ipv4 => {
+                     self.input_buffer = input_buffer;
+                     return Some(EthernetFrame::new_unchecked(&self.input_buffer[..]).payload());
+                 }
+-                EthernetProtocol::Arp => self.process_arp(packet.payload(), now),
+-                _ => continue,
++                Ok(repr) if for_us && repr.ethertype == EthernetProtocol::Arp => {
++                    self.process_arp(packet.payload(), now)
++                }
++                // Not for us, or a protocol we do not speak.
++                Ok(_) => {}
+             }
++            self.input_buffer = input_buffer;
++        }
++    }
++
++    fn flush(&mut self) {
++        self.flush_tx();
++    }
++
++    fn readable(&mut self) {
++        self.rx_pending = true;
++        // The receive engine stops at the end of the ring when it catches
++        // up with the reader: start it again if slots are free.
++        #[cfg(target_arch = "mips64")]
++        if let Port::Seeq(seeq) = &mut self.port {
++            seeq.poll();
++        }
++    }
++
++    fn interrupt(&mut self) {
++        #[cfg(target_arch = "mips64")]
++        if let Port::Seeq(seeq) = &mut self.port {
++            seeq.clear_interrupt();
+         }
+     }
+ 
+@@ -388,8 +524,11 @@ impl LinkDevice for EthernetLink {
+     }
+ 
+     fn can_recv(&self) -> bool {
+-        // We don't buffer any packets so we can't receive immediatly
+-        false
++        #[cfg(target_arch = "mips64")]
++        if let Port::Seeq(seeq) = &self.port {
++            return seeq.frame_waiting();
++        }
++        self.rx_pos < self.rx_len || self.rx_pending
+     }
+ 
+     fn mac_address(&self) -> Option<EthernetAddress> {
+diff --git a/netstack/src/link/mod.rs b/netstack/src/link/mod.rs
+index e36e331..cfb2338 100644
+--- a/netstack/src/link/mod.rs
++++ b/netstack/src/link/mod.rs
+@@ -1,5 +1,7 @@
+ pub mod ethernet;
+ pub mod loopback;
++#[cfg(target_arch = "mips64")]
++pub mod seeq;
+ 
+ use std::rc::Rc;
+ 
+@@ -18,6 +20,16 @@ pub trait LinkDevice {
+     /// Returns an Ip packet otherwise
+     fn recv(&mut self, now: Instant) -> Option<&[u8]>;
+ 
++    /// Send what `send` queued. Called once after a round of sends.
++    fn flush(&mut self) {}
++
++    /// The device may hold received frames: its event fired, or the timer
++    /// asks for a look.
++    fn readable(&mut self) {}
++
++    /// The device's interrupt fired: clear its cause.
++    fn interrupt(&mut self) {}
++
+     /// Returns the LinkDevice display name used to refer to it and for lookups
+     fn name(&self) -> &Rc<str>;
+ 
+diff --git a/netstack/src/link/seeq.rs b/netstack/src/link/seeq.rs
 new file mode 100644
-index 0000000..a06c2f2
+index 0000000..46c46db
 --- /dev/null
-+++ b/drivers/net/seeqd/Cargo.toml
-@@ -0,0 +1,19 @@
-+[package]
-+name = "seeqd"
-+description = "Seeq 8003 Ethernet driver for the SGI Indy (HPC3 DMA)"
-+version = "0.1.0"
-+edition = "2021"
-+license = "MIT"
-+
-+[dependencies]
-+libredox.workspace = true
-+log.workspace = true
-+redox_event.workspace = true
-+redox_syscall.workspace = true
-+
-+common = { path = "../../common" }
-+daemon = { path = "../../../daemon" }
-+driver-network = { path = "../driver-network" }
-+
-+[lints]
-+workspace = true
-diff --git a/drivers/net/seeqd/src/device.rs b/drivers/net/seeqd/src/device.rs
-new file mode 100644
-index 0000000..9725c53
---- /dev/null
-+++ b/drivers/net/seeqd/src/device.rs
-@@ -0,0 +1,318 @@
-+//! Seeq 8003 and the HPC3 Ethernet DMA engines.
++++ b/netstack/src/link/seeq.rs
+@@ -0,0 +1,355 @@
++//! Seeq 8003 Ethernet on the SGI Indy, driven from inside the network stack.
++//!
++//! The controller sits behind the HPC3, which moves frames with two DMA
++//! engines walking descriptor chains in memory. A separate driver process
++//! cost two context switches and a page mapping for every call between it
++//! and the stack; on the R4600 that was a third of the time of a transfer.
++//! Frames arrive on INT3 local 0 bit 3 (`irq:3`).
 +//!
 +//! Register facts (checked against the iris emulator's `hpc3.rs` and
 +//! `seeq8003.rs`; to be confirmed on real hardware):
@@ -998,7 +1356,6 @@ index 0000000..9725c53
 +
 +use common::dma::Dma;
 +use common::{MemoryType, Prot};
-+use driver_network::NetworkAdapter;
 +use syscall::error::{Error, Result, EIO, EMSGSIZE};
 +
 +pub const HPC3_ENET_PHYS: usize = 0x1FB9_4000;
@@ -1038,7 +1395,9 @@ index 0000000..9725c53
 +const DESC_TXD: u32 = 0x0000_8000;
 +const DESC_COUNT: u32 = 0x0000_3fff;
 +
-+const RX_RING: usize = 16;
++/// Receive slots. The network stack advertises a 32 KiB TCP window, 23 full
++/// frames, so a burst fits with room for other traffic.
++const RX_RING: usize = 32;
 +const BUF_SIZE: usize = 2048;
 +const MIN_FRAME: usize = 60;
 +const MAX_FRAME: usize = 1514;
@@ -1068,6 +1427,20 @@ index 0000000..9725c53
 +
 +// The device is owned by one scheme thread.
 +unsafe impl Send for Seeq {}
++
++/// A frame in ordinary memory, aligned for `copy_words`.
++#[repr(align(8))]
++struct Frame([u8; BUF_SIZE]);
++
++/// Copy `words` 64-bit words between a DMA buffer and ordinary memory. DMA
++/// memory is uncached, so every access is a bus cycle: a word at a time
++/// takes an eighth of the cycles of a byte at a time. Both pointers are
++/// 8-byte aligned (a DMA buffer starts on a page, slots are 2048 bytes).
++unsafe fn copy_words(src: *const u64, dst: *mut u64, words: usize) {
++    for i in 0..words {
++        write_volatile(dst.add(i), read_volatile(src.add(i)));
++    }
++}
 +
 +unsafe fn map(phys: usize, len: usize) -> Result<*mut u8> {
 +    Ok(common::physmap(phys, len, Prot::RW, MemoryType::DeviceMemory)
@@ -1201,12 +1574,14 @@ index 0000000..9725c53
 +    }
 +}
 +
-+impl NetworkAdapter for Seeq {
-+    fn mac_address(&mut self) -> [u8; 6] {
-+        self.mac
++impl Seeq {
++    /// Whether the next slot of the ring holds a frame.
++    pub fn frame_waiting(&self) -> bool {
++        self.rx_cntinfo(self.rx_i) & DESC_OWN == 0
 +    }
 +
-+    fn available_for_read(&mut self) -> usize {
++    /// Frames waiting in the ring.
++    pub fn available_for_read(&mut self) -> usize {
 +        let mut count = 0;
 +        for n in 0..RX_RING {
 +            if self.rx_cntinfo((self.rx_i + n) % RX_RING) & DESC_OWN != 0 {
@@ -1217,7 +1592,8 @@ index 0000000..9725c53
 +        count
 +    }
 +
-+    fn read_packet(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
++    /// Copy the next good frame to `buf`; `None` when the ring is empty.
++    pub fn read_packet(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
 +        loop {
 +            let index = self.rx_i;
 +            let cntinfo = self.rx_cntinfo(index);
@@ -1231,17 +1607,23 @@ index 0000000..9725c53
 +            let base = index * BUF_SIZE;
 +            let result = if written >= 3 + 14 {
 +                let len = written - 3;
-+                let status = unsafe { read_volatile(&raw const self.rx_bufs[base + 2 + len]) };
-+                if status & RX_STATUS_GOOD == 0 {
++                // One pass over the uncached buffer, in 64-bit words.
++                let mut frame = Frame([0u8; BUF_SIZE]);
++                unsafe {
++                    copy_words(
++                        (&raw const self.rx_bufs[base]).cast(),
++                        frame.0.as_mut_ptr().cast(),
++                        written.div_ceil(8),
++                    );
++                }
++                if frame.0[2 + len] & RX_STATUS_GOOD == 0 {
 +                    None
 +                } else if len > buf.len() {
 +                    self.rearm(index);
 +                    self.rx_i = (index + 1) % RX_RING;
 +                    return Err(Error::new(EMSGSIZE));
 +                } else {
-+                    for (i, out) in buf[..len].iter_mut().enumerate() {
-+                        *out = unsafe { read_volatile(&raw const self.rx_bufs[base + 2 + i]) };
-+                    }
++                    buf[..len].copy_from_slice(&frame.0[2..2 + len]);
 +                    Some(len)
 +                }
 +            } else {
@@ -1259,7 +1641,8 @@ index 0000000..9725c53
 +        }
 +    }
 +
-+    fn write_packet(&mut self, buf: &[u8]) -> Result<usize> {
++    /// Send one frame, after the previous one has left.
++    pub fn write_packet(&mut self, buf: &[u8]) -> Result<usize> {
 +        if buf.len() > MAX_FRAME {
 +            return Err(Error::new(EMSGSIZE));
 +        }
@@ -1275,13 +1658,19 @@ index 0000000..9725c53
 +            }
 +
 +            let len = buf.len().max(MIN_FRAME);
-+            for i in 0..len {
-+                let byte = buf.get(i).copied().unwrap_or(0);
-+                write_volatile(&raw mut self.tx_buf[i], byte);
-+            }
++            let mut frame = Frame([0u8; BUF_SIZE]);
++            frame.0[..buf.len()].copy_from_slice(buf);
++            copy_words(
++                frame.0.as_ptr().cast(),
++                (&raw mut self.tx_buf[0]).cast(),
++                len.div_ceil(8),
++            );
 +            self.tx_desc[0] = Desc {
 +                pbuf: self.tx_buf.physical() as u32,
-+                cntinfo: len as u32 | DESC_EOP | DESC_EOX | DESC_XIE,
++                // No interrupt when the frame has left: the next send waits
++                // on the channel's active bit, and an interrupt costs the
++                // stack an event and three system calls.
++                cntinfo: len as u32 | DESC_EOP | DESC_EOX,
 +                pnext: 0,
 +                _pad: 0,
 +            };
@@ -1292,127 +1681,156 @@ index 0000000..9725c53
 +        Ok(buf.len())
 +    }
 +}
-diff --git a/drivers/net/seeqd/src/main.rs b/drivers/net/seeqd/src/main.rs
-new file mode 100644
-index 0000000..d2467b3
---- /dev/null
-+++ b/drivers/net/seeqd/src/main.rs
-@@ -0,0 +1,113 @@
-+//! Seeq 8003 Ethernet on the SGI Indy.
-+//!
-+//! The controller sits behind the HPC3, which moves frames with two DMA
-+//! engines walking descriptor chains in memory. The device is at fixed
-+//! physical addresses; there is no bus to enumerate. Frames arrive on INT3
-+//! local 0 bit 3 (`irq:3`); a slow timer restarts a stopped receive ring.
+diff --git a/netstack/src/main.rs b/netstack/src/main.rs
+index 8649841..2bc0070 100644
+--- a/netstack/src/main.rs
++++ b/netstack/src/main.rs
+@@ -52,14 +52,50 @@ fn get_network_adapter() -> Result<String> {
+ }
+ 
+ fn run(daemon: daemon::Daemon) -> Result<()> {
+-    let adapter = get_network_adapter()?;
+-    trace!("opening {adapter}:");
+-    let network_fd = Fd::open(&format!("/scheme/{adapter}"), O_RDWR | O_NONBLOCK, 0)
+-        .map_err(|e| anyhow!("failed to open {adapter}: {e}"))?;
+-
+-    let hardware_addr = std::fs::read(format!("/scheme/{adapter}/mac"))
+-        .map(|mac_address| EthernetAddress::from_bytes(&mac_address))
+-        .context("failed to get mac address from network adapter")?;
++    // The Indy's Ethernet controller is driven in this process
++    // (link/seeq.rs); its interrupt takes the place of a driver's event.
++    #[cfg(target_arch = "mips64")]
++    let (network_fd, eth0) = {
++        common::init();
++        let seeq = unsafe { link::seeq::Seeq::new() }
++            .map_err(|e| anyhow!("failed to set up the Seeq 8003: {e}"))?;
++        let mac = seeq.mac();
++        println!(
++            "netstack: Seeq 8003 at {:#x}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
++            link::seeq::SEEQ_PHYS,
++            mac[0],
++            mac[1],
++            mac[2],
++            mac[3],
++            mac[4],
++            mac[5]
++        );
++        let irq = Fd::open("/scheme/irq/3", O_RDWR, 0)
++            .map_err(|e| anyhow!("failed to open the Ethernet interrupt: {e}"))?;
++        (irq, link::ethernet::EthernetLink::with_seeq("eth0", seeq))
++    };
++    #[cfg(not(target_arch = "mips64"))]
++    let (network_fd, eth0) = {
++        use std::os::fd::{FromRawFd, RawFd};
 +
-+use std::mem::size_of;
++        use crate::link::LinkDevice;
 +
-+use driver_network::NetworkScheme;
-+use event::{user_data, EventQueue};
-+use libredox::flag::O_RDWR;
-+use libredox::Fd;
-+use syscall::data::TimeSpec;
-+
-+pub mod device;
-+
-+/// Period of the fallback poll that restarts a stopped receive ring.
-+const POLL_NS: i32 = 250_000_000;
-+
-+/// INT3 local 0 bit 3: the Seeq and its HPC3 DMA engines.
-+const ETHERNET_IRQ: u32 = 3;
-+
-+fn arm_timer(time: &Fd) {
-+    let mut now = TimeSpec::default();
-+    if time.read(&mut now).map(|n| n >= size_of::<TimeSpec>()).unwrap_or(false) {
-+        now.tv_nsec += POLL_NS;
-+        if now.tv_nsec >= 1_000_000_000 {
-+            now.tv_nsec -= 1_000_000_000;
-+            now.tv_sec += 1;
-+        }
-+        let _ = time.write(&now);
-+    }
-+}
-+
-+fn main() {
-+    daemon::Daemon::new(daemon);
-+}
-+
-+fn daemon(daemon: daemon::Daemon) -> ! {
-+    common::init();
-+
-+    let device = unsafe { device::Seeq::new().expect("seeqd: failed to set up the device") };
-+    let mac = device.mac();
-+    println!(
-+        "seeqd: Seeq 8003 at {:#x}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-+        device::SEEQ_PHYS,
-+        mac[0],
-+        mac[1],
-+        mac[2],
-+        mac[3],
-+        mac[4],
-+        mac[5]
-+    );
-+
-+    let mut scheme = NetworkScheme::new(move || device, daemon, "network.seeq".to_string());
-+
-+    user_data! {
-+        enum Source {
-+            Irq,
-+            Time,
-+            Scheme,
-+        }
-+    }
-+
-+    let irq = Fd::open(&format!("/scheme/irq/{ETHERNET_IRQ}"), O_RDWR, 0)
-+        .expect("seeqd: failed to open the Ethernet interrupt");
-+
-+    let time_path = format!("/scheme/time/{}", syscall::CLOCK_MONOTONIC);
-+    let time = Fd::open(&time_path, O_RDWR, 0).expect("seeqd: failed to open the time scheme");
-+
-+    let event_queue = EventQueue::<Source>::new().expect("seeqd: could not create event queue");
-+    event_queue
-+        .subscribe(irq.raw(), Source::Irq, event::EventFlags::READ)
-+        .expect("seeqd: failed to subscribe to the interrupt");
-+    event_queue
-+        .subscribe(time.raw(), Source::Time, event::EventFlags::READ)
-+        .expect("seeqd: failed to subscribe to the timer");
-+    event_queue
-+        .subscribe(
-+            scheme.event_handle().raw(),
-+            Source::Scheme,
-+            event::EventFlags::READ,
-+        )
-+        .expect("seeqd: failed to subscribe to the scheme");
-+
-+    arm_timer(&time);
-+    scheme.tick().unwrap();
-+
-+    for event in event_queue.map(|e| e.expect("seeqd: failed to get next event")) {
-+        match event.user_data {
-+            Source::Irq => {
-+                // The kernel masked the line; clear the cause, serve the
-+                // rings, then acknowledge to unmask it.
++        let adapter = get_network_adapter()?;
++        trace!("opening {adapter}:");
++        let network_fd = Fd::open(&format!("/scheme/{adapter}"), O_RDWR | O_NONBLOCK, 0)
++            .map_err(|e| anyhow!("failed to open {adapter}: {e}"))?;
++        let hardware_addr = std::fs::read(format!("/scheme/{adapter}/mac"))
++            .map(|mac_address| EthernetAddress::from_bytes(&mac_address))
++            .context("failed to get mac address from network adapter")?;
++        // The link reads and writes through its own handle.
++        let file = Fd::open(&format!("/scheme/{adapter}"), O_RDWR | O_NONBLOCK, 0)
++            .map_err(|e| anyhow!("failed to open {adapter}: {e}"))?;
++        let mut eth0 = link::ethernet::EthernetLink::new("eth0", unsafe {
++            std::fs::File::from_raw_fd(file.into_raw() as RawFd)
++        });
++        eth0.set_mac_address(hardware_addr);
++        (network_fd, eth0)
++    };
+ 
+     trace!("opening ip scheme socket");
+     let ip_fd = Socket::nonblock()
+@@ -146,8 +182,7 @@ fn run(daemon: daemon::Daemon) -> Result<()> {
+         .context("failed to listen to netcfg scheme events")?;
+ 
+     let mut smolnetd = Smolnetd::new(
+-        network_fd,
+-        hardware_addr,
++        eth0,
+         ip_fd,
+         udp_fd,
+         tcp_fd,
+@@ -159,16 +194,35 @@ fn run(daemon: daemon::Daemon) -> Result<()> {
+ 
+     libredox::call::setrens(0, 0).context("smolnetd: failed to enter null namespace")?;
+ 
++    // Each source once before the first wait, then as events arrive.
+     let all = {
+         use EventSource::*;
+-        [Network, Time, IpScheme, UdpScheme, IcmpScheme, NetcfgScheme].map(Ok)
++        [Network, Time, IpScheme, UdpScheme, IcmpScheme, NetcfgScheme].map(|source| Ok((source, false)))
+     };
+ 
+     for event_res in all
+         .into_iter()
+-        .chain(event_queue.map(|r| r.map(|e| e.user_data)))
++        .chain(event_queue.map(|r| r.map(|e| (e.user_data, true))))
+     {
+-        let _ = match event_res.map_err(|e| anyhow!("event result is error: {:?}", e))? {
++        let (source, _fired) = event_res.map_err(|e| anyhow!("event result is error: {:?}", e))?;
++        let _ = match source {
++            #[cfg(target_arch = "mips64")]
++            EventSource::Network => {
++                // The kernel masked the line: read the count, serve the
++                // rings, then write the count back to unmask it.
 +                let mut count = [0u8; 8];
-+                let len = irq.read(&mut count).unwrap_or(0);
-+                scheme.adapter_mut().clear_interrupt();
-+                scheme.adapter_mut().poll();
-+                scheme.tick().unwrap();
-+                let _ = irq.write(&count[..len]);
++                let len = if _fired {
++                    network_fd.read(&mut count).unwrap_or(0)
++                } else {
++                    0
++                };
++                let result = smolnetd.on_network_scheme_event();
++                if len != 0 {
++                    let _ = network_fd.write(&count[..len]);
++                }
++                result
 +            }
-+            Source::Time => {
-+                scheme.adapter_mut().poll();
-+                scheme.tick().unwrap();
-+                arm_timer(&time);
-+            }
-+            Source::Scheme => {
-+                scheme.tick().unwrap();
-+            }
++            #[cfg(not(target_arch = "mips64"))]
+             EventSource::Network => smolnetd.on_network_scheme_event(),
+             EventSource::Time => smolnetd.on_time_event(),
+             EventSource::IpScheme => smolnetd.on_ip_scheme_event(),
+diff --git a/netstack/src/router/mod.rs b/netstack/src/router/mod.rs
+index 3cfd0a2..8b25496 100644
+--- a/netstack/src/router/mod.rs
++++ b/netstack/src/router/mod.rs
+@@ -49,6 +49,20 @@ impl Router {
+         can_recv
+     }
+ 
++    /// Tell every device that it may hold received frames.
++    pub fn readable(&mut self) {
++        for dev in self.devices.borrow_mut().iter_mut() {
++            dev.readable();
 +        }
 +    }
-+    unreachable!()
-+}
++
++    /// A device interrupt fired: let every device clear its cause.
++    pub fn interrupt(&mut self) {
++        for dev in self.devices.borrow_mut().iter_mut() {
++            dev.interrupt();
++        }
++    }
++
+     pub fn poll(&mut self, now: Instant) {
+         for dev in self.devices.borrow_mut().iter_mut() {
+             if self.rx_buffer.is_full() {
+@@ -110,6 +124,10 @@ impl Router {
+                 }
+             }
+         }
++        // Replies queued while receiving (ARP) leave with these.
++        for dev in self.devices.borrow_mut().iter_mut() {
++            dev.flush();
++        }
+     }
+ }
+ 
 diff --git a/netstack/src/scheme/mod.rs b/netstack/src/scheme/mod.rs
-index ce7e3db..4c159a7 100644
+index ce7e3db..dd1b17a 100644
 --- a/netstack/src/scheme/mod.rs
 +++ b/netstack/src/scheme/mod.rs
 @@ -49,11 +49,26 @@ const MIN_DURATION: Duration = Duration::from_micros(0);
@@ -1443,10 +1861,24 @@ index ce7e3db..4c159a7 100644
  pub struct Smolnetd {
      router_device: Tracer<Router>,
      iface: Interface,
-@@ -125,6 +140,22 @@ impl Smolnetd {
-         });
-         eth0.set_mac_address(hardware_addr);
+@@ -76,8 +91,7 @@ impl Smolnetd {
  
+     #[expect(clippy::too_many_arguments, reason = "all needed")]
+     pub fn new(
+-        network_file: Fd,
+-        hardware_addr: EthernetAddress,
++        mut eth0: EthernetLink,
+         ip_file: Socket,
+         udp_file: Socket,
+         tcp_file: Socket,
+@@ -120,10 +134,21 @@ impl Smolnetd {
+             "127.0.0.1".parse().unwrap(),
+         ));
+ 
+-        let mut eth0 = EthernetLink::new("eth0", unsafe {
+-            File::from_raw_fd(network_file.into_raw() as RawFd)
+-        });
+-        eth0.set_mac_address(hardware_addr);
 +        // A netbooted machine: the firmware already holds an address for
 +        // this interface. Start with it; a DHCP lease replaces it later.
 +        if let Some(cidr) = boot_address() {
@@ -1462,10 +1894,72 @@ index ce7e3db..4c159a7 100644
 +                cidr.address(),
 +            ));
 +        }
-+
+ 
          devices.borrow_mut().push(loopback);
          devices.borrow_mut().push(eth0);
+@@ -172,6 +197,8 @@ impl Smolnetd {
+     }
  
+     pub fn on_network_scheme_event(&mut self) -> Result<()> {
++        self.router_device.get_mut().interrupt();
++        self.router_device.get_mut().readable();
+         self.poll()?;
+         Ok(())
+     }
+@@ -201,10 +228,10 @@ impl Smolnetd {
+     }
+ 
+     pub fn on_time_event(&mut self) -> Result<()> {
++        // One look at the driver per timer event covers a missed event.
++        self.router_device.get_mut().readable();
+         let timeout = self.poll()?;
+-        self.schedule_time_event(timeout)?;
+-        //TODO: Fix network scheme to ensure events are not missed
+-        self.on_network_scheme_event()
++        self.schedule_time_event(timeout)
+     }
+ 
+     pub fn on_netcfg_scheme_event(&mut self) -> Result<()> {
+diff --git a/netstack/src/scheme/tcp.rs b/netstack/src/scheme/tcp.rs
+index 8949b6d..a92f199 100644
+--- a/netstack/src/scheme/tcp.rs
++++ b/netstack/src/scheme/tcp.rs
+@@ -79,11 +79,19 @@ impl<'a> SchemeSocket for TcpSocket<'a> {
+             return Err(SyscallError::new(syscall::EACCES));
+         }
+ 
+-        let rx_packets = vec![0; 0xffff];
++        // The receive buffer is the TCP window: the sender may put that
++        // much on the wire in one burst, and the Ethernet driver must hold
++        // the burst until this process runs.
++        let rx_packets = vec![0; 0x8000];
+         let tx_packets = vec![0; 0xffff];
+         let rx_buffer = TcpSocketBuffer::new(rx_packets);
+         let tx_buffer = TcpSocketBuffer::new(tx_packets);
+-        let socket = TcpSocket::new(rx_buffer, tx_buffer);
++        let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
++        // Acknowledge at once. A delayed acknowledgement is sent by the
++        // stack's timer, which is armed only by the timer event and up to
++        // half a second ahead: a sender waiting for it (the last, partial
++        // segment of a response) stalled for that long.
++        socket.set_ack_delay(None);
+ 
+         // TODO: claim port with ethernet ip address
+         if local_endpoint.port == 0 {
+@@ -232,7 +240,12 @@ impl<'a> SchemeSocket for TcpSocket<'a> {
+                     let tx_packets = vec![0; 0xffff];
+                     let rx_buffer = TcpSocketBuffer::new(rx_packets);
+                     let tx_buffer = TcpSocketBuffer::new(tx_packets);
+-                    let socket = TcpSocket::new(rx_buffer, tx_buffer);
++                    let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
++        // Acknowledge at once. A delayed acknowledgement is sent by the
++        // stack's timer, which is armed only by the timer event and up to
++        // half a second ahead: a sender waiting for it (the last, partial
++        // segment of a response) stalled for that long.
++        socket.set_ack_delay(None);
+                     let new_socket_handle = socket_set.add(socket);
+                     {
+                         let tcp_socket = socket_set.get_mut::<TcpSocket>(new_socket_handle);
 -- 
 2.56.0
 

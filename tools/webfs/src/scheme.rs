@@ -10,13 +10,13 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use redox_scheme::scheme::{SchemeState, SchemeSync};
-use redox_scheme::{CallRequest, CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
+use redox_scheme::scheme::{Op, SchemeResponse, SchemeState, SchemeSync};
+use redox_scheme::{CallerCtx, OpenResult, RequestKind, Response, SignalBehavior, Socket};
 use scheme_utils::FpathWriter;
 use syscall::data::{Stat, StatVfs};
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{
-    EBADF, EIO, EISDIR, ELOOP, ENOENT, ENOTDIR, EOPNOTSUPP, EROFS, EXDEV, Error, Result,
+    EAGAIN, EBADF, EIO, EISDIR, ELOOP, ENOENT, ENOSYS, ENOTDIR, EOPNOTSUPP, EROFS, EXDEV, Error, Result,
 };
 use syscall::flag::{
     MODE_DIR, MODE_FILE, MODE_SYMLINK, O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_STAT,
@@ -54,6 +54,9 @@ struct Shared {
 #[derive(Clone)]
 pub struct WebScheme {
     shared: Arc<Shared>,
+    /// False on the dispatch thread: it answers what the cache holds and
+    /// hands the rest to a worker (`run`).
+    fetch: bool,
 }
 
 fn errno(err: store::Error) -> Error {
@@ -63,6 +66,8 @@ fn errno(err: store::Error) -> Error {
         store::Error::IsDir => EISDIR,
         store::Error::Loop => ELOOP,
         store::Error::CrossScheme(_) => EXDEV,
+        // Never reaches a caller: `run` passes the request to a worker.
+        store::Error::WouldFetch => EAGAIN,
         store::Error::Io(text) => {
             eprintln!("webfs: {text}");
             EIO
@@ -79,6 +84,7 @@ impl WebScheme {
                 handles: Mutex::new(BTreeMap::new()),
                 next_id: AtomicUsize::new(ROOT_ID + 1),
             }),
+            fetch: true,
         }
     }
 
@@ -97,15 +103,20 @@ impl WebScheme {
     /// exists before the store has been reached.
     fn entry(&self, id: usize) -> Result<Entry> {
         if id == ROOT_ID {
-            return self.shared.store.resolve("", true).map_err(errno);
+            return self.shared.store.resolve("", true, self.fetch).map_err(errno);
         }
         Ok(self.handles().get(&id).ok_or(Error::new(EBADF))?.entry.clone())
     }
 
     /// Serve the scheme on `socket` with `threads` workers. Does not return.
+    ///
+    /// This thread reads the requests. It answers a request itself when the
+    /// cache holds everything the answer needs, which costs the caller two
+    /// context switches. A request that needs the server goes to a worker,
+    /// so a read that waits for the network does not hold up other callers.
     pub fn run(self, socket: Socket, threads: usize) -> ! {
         let socket = Arc::new(socket);
-        let (sender, receiver) = mpsc::channel::<CallRequest>();
+        let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
         for index in 0..threads.max(1) {
             let (mut scheme, socket, receiver) = (self.clone(), socket.clone(), receiver.clone());
@@ -116,6 +127,8 @@ impl WebScheme {
                 .expect("webfs: failed to start a worker thread");
         }
         let mut scheme = self;
+        scheme.fetch = false;
+        let mut state = SchemeState::new();
         loop {
             let request = match socket.next_request(SignalBehavior::Restart) {
                 Ok(Some(request)) => request,
@@ -124,8 +137,24 @@ impl WebScheme {
             };
             let response = match request.kind() {
                 RequestKind::Call(call) => {
-                    sender.send(call).expect("webfs: the workers are gone");
-                    continue;
+                    let caller = call.caller();
+                    match call.op() {
+                        Ok(mut op) => {
+                            let outcome = op.handle_sync_dont_consume(&caller, &mut scheme, &mut state);
+                            if needs_fetch(&outcome) {
+                                sender.send(Job(caller, op)).expect("webfs: the workers are gone");
+                                continue;
+                            }
+                            match outcome {
+                                SchemeResponse::Opened(open) => Response::open_dup_like(open, op),
+                                SchemeResponse::RegularAndNotifyOnDetach(status) => {
+                                    Response::new_notify_on_detach(status, op)
+                                }
+                                SchemeResponse::Regular(status) => Response::new(status, op),
+                            }
+                        }
+                        Err(call) => Response::new(Err(Error::new(ENOSYS)), call),
+                    }
                 }
                 RequestKind::OnClose { id } => {
                     scheme.on_close(id);
@@ -142,13 +171,30 @@ impl WebScheme {
     }
 }
 
-fn worker(scheme: &mut WebScheme, socket: &Socket, receiver: &Mutex<Receiver<CallRequest>>) {
+/// A request the dispatch thread could not answer from the cache.
+struct Job(CallerCtx, Op);
+
+// The request points into the caller's buffers, which the kernel keeps
+// mapped until the response is written; one thread at a time holds it.
+unsafe impl Send for Job {}
+
+/// True when the handler stopped at a blob the cache does not hold.
+fn needs_fetch(outcome: &SchemeResponse) -> bool {
+    let errno = match outcome {
+        SchemeResponse::Regular(Err(err)) | SchemeResponse::RegularAndNotifyOnDetach(Err(err)) => err.errno,
+        SchemeResponse::Opened(Err(err)) => err.errno,
+        _ => return false,
+    };
+    errno == EAGAIN
+}
+
+fn worker(scheme: &mut WebScheme, socket: &Socket, receiver: &Mutex<Receiver<Job>>) {
     // File locks are not offered, so each worker can keep its own state.
     let mut state = SchemeState::new();
     loop {
-        let call = receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).recv();
-        let Ok(call) = call else { return };
-        let response = call.handle_sync(scheme, &mut state);
+        let job = receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).recv();
+        let Ok(Job(caller, op)) = job else { return };
+        let response = op.handle_sync(caller, scheme, &mut state);
         if let Err(err) = socket.write_response(response, SignalBehavior::Restart) {
             eprintln!("webfs: failed to write a scheme response: {err}");
         }
@@ -179,7 +225,7 @@ impl SchemeSync for WebScheme {
         // (`/dev/null`) must answer EXDEV so the caller opens the target,
         // which may well be writable.
         let mut outside = None;
-        let entry = match self.shared.store.resolve(&full, follow) {
+        let entry = match self.shared.store.resolve(&full, follow, self.fetch) {
             Ok(entry) => entry,
             // relibc reads a link by opening it with O_SYMLINK and asking for
             // its path. Answer for a link in the middle of the path as well.
@@ -228,7 +274,7 @@ impl SchemeSync for WebScheme {
         _ctx: &CallerCtx,
     ) -> Result<usize> {
         let entry = self.entry(id)?;
-        self.shared.store.read(&entry, offset, buf).map_err(errno)
+        self.shared.store.read(&entry, offset, buf, self.fetch).map_err(errno)
     }
 
     fn write(
@@ -262,7 +308,7 @@ impl SchemeSync for WebScheme {
             return Ok(n);
         }
         if entry.kind == Kind::Link {
-            let target = self.shared.store.target(&entry).map_err(errno)?;
+            let target = self.shared.store.target(&entry, self.fetch).map_err(errno)?;
             if target.starts_with("/scheme/") {
                 let bytes = target.as_bytes();
                 let n = bytes.len().min(buf.len());
@@ -279,7 +325,7 @@ impl SchemeSync for WebScheme {
 
     fn fstat(&mut self, id: usize, stat: &mut Stat, _ctx: &CallerCtx) -> Result<()> {
         let entry = self.entry(id)?;
-        let time = self.shared.store.root().map_err(errno)?.time;
+        let time = self.shared.store.root(self.fetch).map_err(errno)?.time;
         let kind = match entry.kind {
             Kind::Dir => MODE_DIR,
             Kind::File => MODE_FILE,
@@ -317,7 +363,7 @@ impl SchemeSync for WebScheme {
         opaque_offset: u64,
     ) -> Result<DirentBuf<&'buf mut [u8]>> {
         let dir = self.entry(id)?;
-        let entries = self.shared.store.list(&dir).map_err(errno)?;
+        let entries = self.shared.store.list(&dir, self.fetch).map_err(errno)?;
         let start = usize::try_from(opaque_offset).unwrap_or(usize::MAX);
         for (index, entry) in entries.iter().enumerate().skip(start) {
             let full = buf.entry(DirEntry {

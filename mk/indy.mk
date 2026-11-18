@@ -85,7 +85,7 @@ $(INIT_ELF): $(SYSROOT)/lib/libc.a $(wildcard tools/indy-sh/src/*.rs) tools/indy
 # Base programs for the target (tools/base-indy.sh): init, the Seeq driver and
 # the network stack go in the initfs; the others go in the root store.
 ROOT_BINS=dhcpd zerod ipcd ptyd ramfs getty
-BASE_BINS=init randd seeqd netstack $(ROOT_BINS)
+BASE_BINS=init randd netstack $(ROOT_BINS)
 BASE_OUT=$(BASE_SOURCE)/target/mips64-sgi-redox/release
 
 $(BASE_OUT)/init: $(SYSROOT)/lib/libc.a FORCE

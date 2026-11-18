@@ -1,6 +1,6 @@
 [unit]
 description = "Network stack"
-requires_weak = ["10_seeqd.service"]
+requires_weak = ["00_randd.service"]
 
 [service]
 cmd = "netstack"

@@ -52,15 +52,20 @@ fn respond(
         "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nCache-Control: {cache}\r\n\r\n",
         body.len()
     );
-    stream.write_all(head.as_bytes())?;
+    // One write: a header sent alone makes the body's last, partial segment
+    // wait for the client's acknowledgement, which a client that delays
+    // acknowledgements sends late.
+    let mut response = head.into_bytes();
     if send_body {
-        stream.write_all(body)?;
+        response.extend_from_slice(body);
     }
+    stream.write_all(&response)?;
     stream.flush()
 }
 
 fn serve_connection(config: &Config, stream: TcpStream) -> io::Result<()> {
     stream.set_read_timeout(Some(IDLE))?;
+    stream.set_nodelay(true)?;
     let peer = stream.peer_addr()?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);

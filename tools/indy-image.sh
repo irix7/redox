@@ -24,7 +24,7 @@ BASE_OUT=$BASE/target/mips64-sgi-redox/release
 
 rm -rf "$DIR"
 mkdir -p "$DIR/bin" "$DIR/lib/init.d" "$DIR/etc/net"
-for bin in init randd seeqd netstack; do install -m 0755 "$BASE_OUT/$bin" "$DIR/bin/$bin"; done
+for bin in init randd netstack; do install -m 0755 "$BASE_OUT/$bin" "$DIR/bin/$bin"; done
 install -m 0755 tools/webfs/target/mips64-sgi-redox/release/webfs "$DIR/bin/webfs"
 install -m 0644 config/indy/init.d/* "$DIR/lib/init.d/"
 install -m 0644 config/indy/net/* "$DIR/etc/net/"
