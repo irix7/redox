@@ -764,7 +764,22 @@ and none of them is on the critical path to "the machine runs our code".
   so nothing can be started from it again). The root mount runs two webfs workers with
   a 256 KiB blob cache (was four and 1 MiB). `ls -l /usr/bin | sort -k5 -n | tail -3`
   (8.5 MB of programs) runs.
-- **T9 — next.** A real-hardware run of T8c and T8d. Then: each process is still a
+- **T8e — the kernel's own console.** 2026-11-18. The kernel no longer calls the PROM
+  for console input or output; ARCS is used for the memory map, environment variables
+  and `Reboot` only. With `ConsoleOut` on the graphics board the kernel draws a 160 by
+  64 text console on the Newport through REX3 (`arch/mips64/device/newport.rs`:
+  characters by Z pattern, fills and screen-to-screen scroll, colour map indices 0 to 7
+  as the PROM left them, a VT100/xterm subset with the cursor position report) and reads
+  the IOC2 keyboard controller in scancode set 2 from the timer tick
+  (`device/kbd.rs`; the mouse port is switched off). With a serial console it drives
+  Serial Port 1 as before. In iris with the board enabled: login, `ls --color`, pipes,
+  history and `kibi` work from the emulated keyboard. On the real Indy the kernel takes
+  the graphics path and the machine boots to the TCP shell; what the screen shows and
+  whether the keyboard acknowledged has not been read back yet.
+  Real hardware, same day: T8c and T8d run. 13.1 MiB of 28.5 MiB is free at the login
+  prompt, and the TCP shell answers 160 s after `reboot`.
+- **T9 — next.** Confirm T8e on the real screen and keyboard; the keyboard interrupt
+  (INT3) instead of the tick; a faster scroll (TOPSCAN). Then: each process is still a
   private static image read whole (no shared or demand-paged text), `zerod` runs twice,
   an entropy source for `randd`, a clock (`date` reads 1970), the serial interrupt
   (INT3 mappable lines) instead of polling.

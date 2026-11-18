@@ -1,4 +1,4 @@
-From c43d952a317211dcfff9d1ef904688e0e22962f3 Mon Sep 17 00:00:00 2001
+From f2d81999aa06f46b1959f9ea2611849e1d108818 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -33,15 +33,17 @@ Signed-off-by: belikh <io@belic.net>
  rmm/src/arch/mips.rs                   | 247 ++++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
- src/arch/mips64/cache.rs               | 469 +++++++++++++++
+ src/arch/mips64/cache.rs               | 461 +++++++++++++++
  src/arch/mips64/consts.rs              |  24 +
  src/arch/mips64/cp0.rs                 | 112 ++++
- src/arch/mips64/debug.rs               |  24 +
- src/arch/mips64/device/arcs.rs         | 238 ++++++++
+ src/arch/mips64/debug.rs               |  22 +
+ src/arch/mips64/device/arcs.rs         | 178 ++++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
- src/arch/mips64/device/mod.rs          |  24 +
+ src/arch/mips64/device/kbd.rs          | 291 ++++++++++
+ src/arch/mips64/device/mod.rs          |  27 +
+ src/arch/mips64/device/newport.rs      | 701 +++++++++++++++++++++++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 765 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 750 +++++++++++++++++++++++++
  src/arch/mips64/interrupt/handler.rs   | 396 +++++++++++++
  src/arch/mips64/interrupt/irq.rs       |  90 +++
  src/arch/mips64/interrupt/mod.rs       |  47 ++
@@ -51,7 +53,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/misc.rs                |  60 ++
  src/arch/mips64/mod.rs                 |  92 +++
  src/arch/mips64/paging.rs              |  26 +
- src/arch/mips64/start.rs               | 360 ++++++++++++
+ src/arch/mips64/start.rs               | 377 +++++++++++++
  src/arch/mips64/stop.rs                |  47 ++
  src/arch/mips64/time.rs                | 169 ++++++
  src/arch/mod.rs                        |   6 +
@@ -75,7 +77,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 +
- 47 files changed, 4341 insertions(+), 19 deletions(-)
+ 49 files changed, 5268 insertions(+), 19 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -84,7 +86,9 @@ Signed-off-by: belikh <io@belic.net>
  create mode 100644 src/arch/mips64/debug.rs
  create mode 100644 src/arch/mips64/device/arcs.rs
  create mode 100644 src/arch/mips64/device/cpu/mod.rs
+ create mode 100644 src/arch/mips64/device/kbd.rs
  create mode 100644 src/arch/mips64/device/mod.rs
+ create mode 100644 src/arch/mips64/device/newport.rs
  create mode 100644 src/arch/mips64/device/serial.rs
  create mode 100644 src/arch/mips64/interrupt/exception.rs
  create mode 100644 src/arch/mips64/interrupt/handler.rs
@@ -485,10 +489,10 @@ index 1f2c1a13..ccbee701 100644
  
 diff --git a/src/arch/mips64/cache.rs b/src/arch/mips64/cache.rs
 new file mode 100644
-index 00000000..f5390a38
+index 00000000..bcbdae77
 --- /dev/null
 +++ b/src/arch/mips64/cache.rs
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,461 @@
 +//! Primary cache coherence.
 +//!
 +//! The R4x00 and R5000 primary caches are indexed by virtual address, and a
@@ -877,11 +881,6 @@ index 00000000..f5390a38
 +        }
 +    }
 +    info!(
-+        "Indy: console: {} firmware polls, {}k Count ticks",
-+        STAT_PROM_POLLS.swap(0, Ordering::Relaxed),
-+        STAT_PROM_TICKS.swap(0, Ordering::Relaxed) / 1000
-+    );
-+    info!(
 +        "Indy: events: {} switches, {} fast refills, {} TLB flushes;{}",
 +        STAT_SWITCHES.swap(0, Ordering::Relaxed),
 +        STAT_FAST_REFILLS.swap(0, Ordering::Relaxed),
@@ -955,9 +954,6 @@ index 00000000..f5390a38
 +pub static STAT_TICKS: [AtomicUsize; 96] = [const { AtomicUsize::new(0) }; 96];
 +pub static STAT_TLB_FLUSHES: AtomicUsize = AtomicUsize::new(0);
 +
-+/// Firmware console polls (keyboard and mouse) and the Count ticks they took.
-+pub static STAT_PROM_POLLS: AtomicUsize = AtomicUsize::new(0);
-+pub static STAT_PROM_TICKS: AtomicUsize = AtomicUsize::new(0);
 diff --git a/src/arch/mips64/consts.rs b/src/arch/mips64/consts.rs
 new file mode 100644
 index 00000000..947305d1
@@ -1108,13 +1104,13 @@ index 00000000..fe08c5ca
 +cp0_access!(read_context, write_context, 4);
 diff --git a/src/arch/mips64/debug.rs b/src/arch/mips64/debug.rs
 new file mode 100644
-index 00000000..5d6cee9e
+index 00000000..b82f61d2
 --- /dev/null
 +++ b/src/arch/mips64/debug.rs
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,22 @@
 +use spin::MutexGuard;
 +
-+use crate::{arch::device::{arcs, serial::COM1}, devices::serial::SerialKind};
++use crate::{arch::device::{newport, serial::COM1}, devices::serial::SerialKind};
 +
 +pub struct Writer<'a> {
 +    serial: MutexGuard<'a, SerialKind>,
@@ -1128,27 +1124,26 @@ index 00000000..5d6cee9e
 +    }
 +
 +    pub fn write(&mut self, buf: &[u8]) {
-+        // The PROM console first: it is the screen on a machine with no
-+        // serial cable. The lock above also serialises the firmware calls.
-+        arcs::write(buf);
-+        if arcs::direct_serial() {
-+            self.serial.write(buf);
-+        }
++        // The screen first: it is the console on a machine with no serial
++        // cable. Serial Port 1 always gets a copy.
++        newport::write(buf);
++        self.serial.write(buf);
 +    }
 +}
 diff --git a/src/arch/mips64/device/arcs.rs b/src/arch/mips64/device/arcs.rs
 new file mode 100644
-index 00000000..df1981f2
+index 00000000..99935733
 --- /dev/null
 +++ b/src/arch/mips64/device/arcs.rs
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,178 @@
 +//! Calls into the ARCS firmware (the Indy PROM).
 +//!
 +//! The PROM leaves a system parameter block at physical 0x1000. Its firmware
 +//! vector is a table of 32-bit entry points: `GetMemoryDescriptor` is entry
-+//! 18, `Write` 27 and `GetEnvironmentVariable` 30. File 1 is the PROM's
-+//! console: the Newport screen, or Serial Port 1 when `ConsoleOut` is
-+//! `serial(0)`.
++//! 18, `Reboot` 6 and `GetEnvironmentVariable` 30. The kernel asks the PROM
++//! for the memory map, environment variables and a reboot. It does not use
++//! the PROM's console: `ConsoleOut` only says which device the kernel's own
++//! console drives, the Newport screen or Serial Port 1 (`serial(0)`).
 +//!
 +//! The PROM is 32-bit o32 code. It needs a 16-byte argument area at the stack
 +//! pointer and it restores callee-saved registers with `lw`, which loses the
@@ -1171,13 +1166,8 @@ index 00000000..df1981f2
 +
 +const FN_REBOOT: usize = 6;
 +const FN_GET_MEMORY_DESCRIPTOR: usize = 18;
-+const FN_READ: usize = 25;
-+const FN_GET_READ_STATUS: usize = 26;
-+const FN_WRITE: usize = 27;
 +const FN_GET_ENVIRONMENT_VARIABLE: usize = 30;
 +
-+const STDIN: usize = 0;
-+const STDOUT: usize = 1;
 +
 +/// Memory descriptor types as SGI's ARCS numbers them.
 +pub const MEM_FREE_CONTIGUOUS: u32 = 2;
@@ -1274,41 +1264,11 @@ index 00000000..df1981f2
 +    PRESENT.load(Ordering::Relaxed)
 +}
 +
-+/// True when the kernel should also drive Serial Port 1 itself.
-+pub fn direct_serial() -> bool {
-+    !present() || !CONSOLE_IS_SERIAL.load(Ordering::Relaxed)
-+}
-+
-+fn write_raw(mut buf: &[u8]) {
-+    while !buf.is_empty() {
-+        let mut count: u32 = 0;
-+        let status = unsafe {
-+            call(
-+                FN_WRITE,
-+                STDOUT,
-+                buf.as_ptr() as usize,
-+                buf.len(),
-+                &raw mut count as usize,
-+            )
-+        };
-+        if status != 0 || count == 0 {
-+            return;
-+        }
-+        buf = &buf[(count as usize).min(buf.len())..];
-+    }
-+}
-+
-+/// Write to the PROM console, sending CR LF for each LF.
-+pub fn write(buf: &[u8]) {
-+    if !present() {
-+        return;
-+    }
-+    for (i, line) in buf.split(|&b| b == b'\n').enumerate() {
-+        if i > 0 {
-+            write_raw(b"\r\n");
-+        }
-+        write_raw(line);
-+    }
++/// True when the PROM's console is the graphics board. The kernel then
++/// draws the screen and reads the keyboard itself (`newport`, `kbd`); the
++/// PROM's `Read` and `Write` are not used.
++pub fn console_is_graphics() -> bool {
++    present() && !CONSOLE_IS_SERIAL.load(Ordering::Relaxed)
 +}
 +
 +/// The descriptor after `previous`, or the first one for `None`.
@@ -1332,32 +1292,6 @@ index 00000000..df1981f2
 +        // The PROM's own vectors, interrupts off and masked.
 +        cp0::write_status(cp0::status::BEV);
 +        call(FN_REBOOT, 0, 0, 0, 0);
-+    }
-+}
-+
-+/// One character from the PROM console's keyboard, if one is waiting.
-+///
-+/// Only when the PROM console is the screen: with a serial console the
-+/// kernel reads Serial Port 1 itself. `GetReadStatus` returns 0 when `Read`
-+/// would not block. The caller holds the console lock.
-+pub fn read_byte() -> Option<u8> {
-+    if !present() || CONSOLE_IS_SERIAL.load(Ordering::Relaxed) {
-+        return None;
-+    }
-+    unsafe {
-+        if call(FN_GET_READ_STATUS, STDIN, 0, 0, 0) != 0 {
-+            return None;
-+        }
-+        let mut byte: u8 = 0;
-+        let mut count: u32 = 0;
-+        let status = call(
-+            FN_READ,
-+            STDIN,
-+            &raw mut byte as usize,
-+            1,
-+            &raw mut count as usize,
-+        );
-+        (status == 0 && count == 1).then_some(byte)
 +    }
 +}
 +
@@ -1397,18 +1331,318 @@ index 00000000..e8c7e2c3
 +    writeln!(w, "Config: 0x{:08x}", cp0::read_config())?;
 +    Ok(())
 +}
+diff --git a/src/arch/mips64/device/kbd.rs b/src/arch/mips64/device/kbd.rs
+new file mode 100644
+index 00000000..f7440380
+--- /dev/null
++++ b/src/arch/mips64/device/kbd.rs
+@@ -0,0 +1,291 @@
++//! The Indy's keyboard, read from the IOC2's 8042-compatible controller.
++//!
++//! The controller is in the IOC2 (0x1FBD_9800): data at offset 0x40, command
++//! and status at 0x44. The IOC2 is an 8-bit device on the low byte lane of a
++//! big-endian word, so the bytes are at kseg1 0xBFBD_9843 and 0xBFBD_9847.
++//!
++//! `init` selects scancode set 2 and turns the mouse port off; the PROM is
++//! not called for input. `poll` runs from the timer tick: it reads what the
++//! controller holds and turns make codes into the bytes a terminal sends
++//! (ASCII, control characters, and xterm sequences for the cursor and editing
++//! keys).
++//!
++//! Sources: the IOC2 description in the IRIX 7 project's
++//! `docs/research/indy-hardware.md` (15.5) and the PS/2 keyboard protocol.
++
++use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
++
++const DATA: *mut u8 = 0xBFBD_9843 as *mut u8;
++const COMMAND: *mut u8 = 0xBFBD_9847 as *mut u8;
++
++const STATUS_OUTPUT_FULL: u8 = 0x01;
++const STATUS_INPUT_FULL: u8 = 0x02;
++const STATUS_AUX: u8 = 0x20;
++
++const CONTROLLER_DISABLE_AUX: u8 = 0xa7;
++const KEYBOARD_SET_SCANCODE_SET: u8 = 0xf0;
++const KEYBOARD_ENABLE: u8 = 0xf4;
++const ACK: u8 = 0xfa;
++
++static ACTIVE: AtomicBool = AtomicBool::new(false);
++
++// Decoder state. Only the timer tick touches it.
++static BREAK: AtomicBool = AtomicBool::new(false);
++static EXTENDED: AtomicBool = AtomicBool::new(false);
++/// Bit 0 shift, bit 1 control, bit 2 alt, bit 3 caps lock.
++static MODIFIERS: AtomicU8 = AtomicU8::new(0);
++const SHIFT: u8 = 1;
++const CONTROL: u8 = 2;
++const ALT: u8 = 4;
++const CAPS: u8 = 8;
++
++fn status() -> u8 {
++    unsafe { COMMAND.read_volatile() }
++}
++
++/// Wait until the controller has taken the last byte written to it.
++fn wait_input_empty() -> bool {
++    for _ in 0..200_000 {
++        if status() & STATUS_INPUT_FULL == 0 {
++            return true;
++        }
++    }
++    false
++}
++
++/// Read the next byte from the keyboard, dropping mouse bytes.
++fn wait_reply() -> Option<u8> {
++    for _ in 0..400_000 {
++        let status = status();
++        if status & STATUS_OUTPUT_FULL != 0 {
++            let byte = unsafe { DATA.read_volatile() };
++            if status & STATUS_AUX == 0 {
++                return Some(byte);
++            }
++        }
++    }
++    None
++}
++
++/// Send one byte to the keyboard and wait for its acknowledgement.
++fn keyboard_command(byte: u8) -> bool {
++    if !wait_input_empty() {
++        return false;
++    }
++    unsafe { DATA.write_volatile(byte) };
++    // Scancodes typed during the exchange may come first.
++    for _ in 0..8 {
++        match wait_reply() {
++            Some(ACK) => return true,
++            Some(_) => {}
++            None => return false,
++        }
++    }
++    false
++}
++
++/// Take the keyboard over from the PROM. Returns whether the keyboard
++/// acknowledged; the poll runs either way.
++pub fn init() -> bool {
++    // Drop what the controller still holds.
++    for _ in 0..64 {
++        if status() & STATUS_OUTPUT_FULL == 0 {
++            break;
++        }
++        unsafe { DATA.read_volatile() };
++    }
++    // The mouse would fill the same output buffer with movement packets.
++    if wait_input_empty() {
++        unsafe { COMMAND.write_volatile(CONTROLLER_DISABLE_AUX) };
++    }
++    let acknowledged = keyboard_command(KEYBOARD_SET_SCANCODE_SET)
++        && keyboard_command(2)
++        && keyboard_command(KEYBOARD_ENABLE);
++    ACTIVE.store(true, Ordering::Relaxed);
++    acknowledged
++}
++
++pub fn active() -> bool {
++    ACTIVE.load(Ordering::Relaxed)
++}
++
++/// Set 2 make code to (plain, shifted) character.
++fn character(code: u8) -> Option<(u8, u8)> {
++    Some(match code {
++        0x1c => (b'a', b'A'),
++        0x32 => (b'b', b'B'),
++        0x21 => (b'c', b'C'),
++        0x23 => (b'd', b'D'),
++        0x24 => (b'e', b'E'),
++        0x2b => (b'f', b'F'),
++        0x34 => (b'g', b'G'),
++        0x33 => (b'h', b'H'),
++        0x43 => (b'i', b'I'),
++        0x3b => (b'j', b'J'),
++        0x42 => (b'k', b'K'),
++        0x4b => (b'l', b'L'),
++        0x3a => (b'm', b'M'),
++        0x31 => (b'n', b'N'),
++        0x44 => (b'o', b'O'),
++        0x4d => (b'p', b'P'),
++        0x15 => (b'q', b'Q'),
++        0x2d => (b'r', b'R'),
++        0x1b => (b's', b'S'),
++        0x2c => (b't', b'T'),
++        0x3c => (b'u', b'U'),
++        0x2a => (b'v', b'V'),
++        0x1d => (b'w', b'W'),
++        0x22 => (b'x', b'X'),
++        0x35 => (b'y', b'Y'),
++        0x1a => (b'z', b'Z'),
++        0x16 => (b'1', b'!'),
++        0x1e => (b'2', b'@'),
++        0x26 => (b'3', b'#'),
++        0x25 => (b'4', b'$'),
++        0x2e => (b'5', b'%'),
++        0x36 => (b'6', b'^'),
++        0x3d => (b'7', b'&'),
++        0x3e => (b'8', b'*'),
++        0x46 => (b'9', b'('),
++        0x45 => (b'0', b')'),
++        0x0e => (b'`', b'~'),
++        0x4e => (b'-', b'_'),
++        0x55 => (b'=', b'+'),
++        0x5d => (b'\\', b'|'),
++        0x54 => (b'[', b'{'),
++        0x5b => (b']', b'}'),
++        0x4c => (b';', b':'),
++        0x52 => (b'\'', b'"'),
++        0x41 => (b',', b'<'),
++        0x49 => (b'.', b'>'),
++        0x4a => (b'/', b'?'),
++        0x29 => (b' ', b' '),
++        0x5a => (b'\r', b'\r'),
++        0x66 => (0x7f, 0x7f),
++        0x0d => (b'\t', b'\t'),
++        0x76 => (0x1b, 0x1b),
++        // Keypad.
++        0x70 => (b'0', b'0'),
++        0x69 => (b'1', b'1'),
++        0x72 => (b'2', b'2'),
++        0x7a => (b'3', b'3'),
++        0x6b => (b'4', b'4'),
++        0x73 => (b'5', b'5'),
++        0x74 => (b'6', b'6'),
++        0x6c => (b'7', b'7'),
++        0x75 => (b'8', b'8'),
++        0x7d => (b'9', b'9'),
++        0x71 => (b'.', b'.'),
++        0x79 => (b'+', b'+'),
++        0x7b => (b'-', b'-'),
++        0x7c => (b'*', b'*'),
++        _ => return None,
++    })
++}
++
++/// Set 2 make code after the 0xE0 prefix to the sequence a terminal sends.
++fn extended(code: u8) -> Option<&'static [u8]> {
++    Some(match code {
++        0x75 => b"\x1b[A",
++        0x72 => b"\x1b[B",
++        0x74 => b"\x1b[C",
++        0x6b => b"\x1b[D",
++        0x6c => b"\x1b[H",
++        0x69 => b"\x1b[F",
++        0x70 => b"\x1b[2~",
++        0x71 => b"\x1b[3~",
++        0x7d => b"\x1b[5~",
++        0x7a => b"\x1b[6~",
++        0x4a => b"/",
++        0x5a => b"\r",
++        _ => return None,
++    })
++}
++
++/// Decode one scancode byte; `emit` receives the bytes of a key press.
++fn decode(byte: u8, emit: &mut dyn FnMut(u8)) {
++    match byte {
++        0xe0 => {
++            EXTENDED.store(true, Ordering::Relaxed);
++            return;
++        }
++        0xf0 => {
++            BREAK.store(true, Ordering::Relaxed);
++            return;
++        }
++        // Acknowledge, resend, self-test and echo replies are not keys.
++        0xfa | 0xfe | 0xaa | 0xee | 0x00 | 0xff => return,
++        _ => {}
++    }
++    let released = BREAK.swap(false, Ordering::Relaxed);
++    let was_extended = EXTENDED.swap(false, Ordering::Relaxed);
++    let modifier = match (was_extended, byte) {
++        (false, 0x12) | (false, 0x59) => SHIFT,
++        (_, 0x14) => CONTROL,
++        (_, 0x11) => ALT,
++        _ => 0,
++    };
++    if modifier != 0 {
++        if released {
++            MODIFIERS.fetch_and(!modifier, Ordering::Relaxed);
++        } else {
++            MODIFIERS.fetch_or(modifier, Ordering::Relaxed);
++        }
++        return;
++    }
++    if released {
++        return;
++    }
++    if !was_extended && byte == 0x58 {
++        MODIFIERS.fetch_xor(CAPS, Ordering::Relaxed);
++        return;
++    }
++    let modifiers = MODIFIERS.load(Ordering::Relaxed);
++    if was_extended {
++        // 0xE0 0x12 is the fake shift some keys send around their code.
++        if let Some(sequence) = extended(byte) {
++            for &b in sequence {
++                emit(b);
++            }
++        }
++        return;
++    }
++    let Some((plain, shifted)) = character(byte) else {
++        return;
++    };
++    let mut ch = if modifiers & SHIFT != 0 { shifted } else { plain };
++    if modifiers & CAPS != 0 && plain.is_ascii_lowercase() {
++        ch = if modifiers & SHIFT != 0 { plain } else { shifted };
++    }
++    if modifiers & CONTROL != 0 {
++        ch = match ch {
++            b'a'..=b'z' => ch - b'a' + 1,
++            b'@'..=b'_' => ch - b'@',
++            b' ' | b'2' => 0,
++            b'/' => 0x1f,
++            b'?' => 0x7f,
++            _ => ch,
++        };
++    }
++    if modifiers & ALT != 0 {
++        emit(0x1b);
++    }
++    emit(ch);
++}
++
++/// Read what the controller holds, up to a bound that keeps the tick short.
++pub fn poll(emit: &mut dyn FnMut(u8)) {
++    if !active() {
++        return;
++    }
++    for _ in 0..16 {
++        let status = status();
++        if status & STATUS_OUTPUT_FULL == 0 {
++            break;
++        }
++        let byte = unsafe { DATA.read_volatile() };
++        if status & STATUS_AUX == 0 {
++            decode(byte, emit);
++        }
++    }
++}
 diff --git a/src/arch/mips64/device/mod.rs b/src/arch/mips64/device/mod.rs
 new file mode 100644
-index 00000000..9d93a4ee
+index 00000000..c26db90c
 --- /dev/null
 +++ b/src/arch/mips64/device/mod.rs
-@@ -0,0 +1,24 @@
-+//! Indy devices the kernel itself drives: the serial console and the CP0
-+//! timer. Everything else (HPC3, SCSI, Seeq Ethernet, Newport) is a userspace
-+//! scheme reached through fixed kseg1 addresses; there is no bus enumeration.
+@@ -0,0 +1,27 @@
++//! Indy devices the kernel itself drives: the console (Serial Port 1, or the
++//! Newport screen with the IOC2 keyboard) and the CP0 timer. Everything else
++//! (HPC3, SCSI, Seeq Ethernet) is a userspace scheme reached through fixed
++//! kseg1 addresses; there is no bus enumeration.
 +
 +pub mod arcs;
 +pub mod cpu;
++pub mod kbd;
++pub mod newport;
 +pub mod serial;
 +
 +pub unsafe fn init() {
@@ -1426,6 +1660,713 @@ index 00000000..9d93a4ee
 +    pub const fn default() -> Self {
 +        Self
 +    }
++}
+diff --git a/src/arch/mips64/device/newport.rs b/src/arch/mips64/device/newport.rs
+new file mode 100644
+index 00000000..186eef1d
+--- /dev/null
++++ b/src/arch/mips64/device/newport.rs
+@@ -0,0 +1,701 @@
++//! Text console on the Indy's Newport (XL) graphics board.
++//!
++//! The kernel draws its console itself: 160 columns by 64 rows of an 8 by 16
++//! font on the 1280 by 1024 screen, through the REX3 drawing engine. The PROM
++//! is not called. It has already brought the board up (video timing, pixel
++//! format, colour map), and that state is kept: the console sets only the
++//! drawing registers it uses.
++//!
++//! REX3 is at physical 0x1F0F_0000. A register written at its offset plus
++//! 0x800 also starts the command ("go"). Three commands are used:
++//!
++//! - a character: block draw with the Z pattern as a one-bit source, opaque,
++//!   one 8-pixel span for each of 16 pattern writes (foreground in COLORI,
++//!   background in COLORBACK);
++//! - a filled rectangle: block draw in COLORI;
++//! - a scroll: screen-to-screen block copy by XYMOVE.
++//!
++//! Colours are indices 0 to 7 of the PROM's colour map, which are black,
++//! red, green, yellow, blue, magenta, cyan and white, the order of the ANSI
++//! colours.
++//!
++//! The terminal understands the VT100/xterm subset that the shell, the line
++//! editor, `less` and `kibi` send: cursor movement, erase, insert and delete,
++//! SGR colours, save and restore, cursor visibility and the cursor position
++//! report. Replies to reports are queued for the keyboard poll, which feeds
++//! them to the console input.
++//!
++//! Register facts: SGI's REX3 specification as summarised in the IRIX 7
++//! project's `docs/research/indy-hardware.md`, and the register model of the
++//! iris emulator, which the gate runs against.
++
++use core::sync::atomic::{AtomicBool, Ordering};
++
++use spin::Mutex;
++
++const REX3: usize = 0xBF0F_0000;
++const GO: usize = 0x0800;
++
++const DRAWMODE1: usize = 0x0000;
++const DRAWMODE0: usize = 0x0004;
++const ZPATTERN: usize = 0x0014;
++const COLORBACK: usize = 0x0018;
++const XYMOVE: usize = 0x0114;
++const XYSTARTI: usize = 0x0150;
++const XYENDI: usize = 0x0154;
++const WRMASK: usize = 0x0220;
++const COLORI: usize = 0x0224;
++const TOPSCAN: usize = 0x1320;
++const XYWIN: usize = 0x1324;
++const CLIPMODE: usize = 0x1328;
++const STATUS: usize = 0x1338;
++
++const STATUS_GFXBUSY: u32 = 1 << 3;
++
++// DRAWMODE0
++const OP_DRAW: u32 = 2;
++const OP_SCR2SCR: u32 = 3;
++const ADR_BLOCK: u32 = 1 << 2;
++const DOSETUP: u32 = 1 << 5;
++const STOPONX: u32 = 1 << 8;
++const STOPONY: u32 = 1 << 9;
++const ENZPATTERN: u32 = 1 << 12;
++const LENGTH32: u32 = 1 << 15;
++const ZOPAQUE: u32 = 1 << 16;
++
++// DRAWMODE1: the planes, depth and packing bits (0..11) stay as the PROM
++// left them for its own text; comparison is off and the logic op is "source".
++const DM1_KEEP: u32 = 0x0000_0fff;
++const DM1_COMPARE_OFF: u32 = 7 << 12;
++const DM1_LOGIC_SRC: u32 = 3 << 28;
++/// Colour index planes, 8 bits deep, 8-bit packed host pixels: the value for
++/// a board whose register reads back as zero.
++const DM1_CI8: u32 = 1 | (1 << 3) | (1 << 7) | (1 << 8);
++
++pub const COLS: usize = 160;
++pub const ROWS: usize = 64;
++const CELL_W: usize = 8;
++const CELL_H: usize = 16;
++const WIDTH: usize = COLS * CELL_W;
++const HEIGHT: usize = ROWS * CELL_H;
++
++static FONT: &[u8] = include_bytes!("../../../../res/unifont.font");
++
++static ACTIVE: AtomicBool = AtomicBool::new(false);
++
++fn rd(reg: usize) -> u32 {
++    unsafe { ((REX3 + reg) as *const u32).read_volatile() }
++}
++
++fn wr(reg: usize, value: u32) {
++    unsafe { ((REX3 + reg) as *mut u32).write_volatile(value) }
++}
++
++/// Wait for the drawing engine to finish before its mode registers change.
++/// Bounded: a board that never goes idle must not hang the console.
++fn wait() {
++    for _ in 0..2_000_000 {
++        if rd(STATUS) & STATUS_GFXBUSY == 0 {
++            return;
++        }
++    }
++}
++
++fn xy(x: usize, y: usize) -> u32 {
++    ((x as u32) << 16) | (y as u32 & 0xffff)
++}
++
++fn fill(x0: usize, y0: usize, x1: usize, y1: usize, colour: u8) {
++    wait();
++    wr(DRAWMODE0, OP_DRAW | ADR_BLOCK | DOSETUP | STOPONX | STOPONY);
++    wr(COLORI, colour as u32);
++    wr(XYSTARTI, xy(x0, y0));
++    wr(GO + XYENDI, xy(x1, y1));
++}
++
++/// Copy the rectangle by `dy` pixel rows (negative: up).
++fn copy_rows(y0: usize, y1: usize, dy: i32) {
++    wait();
++    wr(DRAWMODE0, OP_SCR2SCR | ADR_BLOCK | DOSETUP | STOPONX | STOPONY);
++    wr(XYSTARTI, xy(0, y0));
++    wr(XYENDI, xy(WIDTH - 1, y1));
++    wr(GO + XYMOVE, dy as u32 & 0xffff);
++}
++
++fn glyph(col: usize, row: usize, ch: u8, fg: u8, bg: u8) {
++    let x = col * CELL_W;
++    let y = row * CELL_H;
++    wait();
++    wr(
++        DRAWMODE0,
++        OP_DRAW | ADR_BLOCK | STOPONX | ENZPATTERN | LENGTH32 | ZOPAQUE,
++    );
++    wr(COLORI, fg as u32);
++    wr(COLORBACK, bg as u32);
++    wr(XYSTARTI, xy(x, y));
++    wr(XYENDI, xy(x + CELL_W - 1, y + CELL_H - 1));
++    let base = ch as usize * CELL_H;
++    for line in 0..CELL_H {
++        let bits = FONT.get(base + line).copied().unwrap_or(0);
++        wr(GO + ZPATTERN, (bits as u32) << 24);
++    }
++}
++
++#[derive(Clone, Copy)]
++struct Cell {
++    ch: u8,
++    /// Foreground in the low nibble, background in the high one.
++    colours: u8,
++}
++
++const DEFAULT_FG: u8 = 7;
++const DEFAULT_BG: u8 = 0;
++const BLANK: Cell = Cell {
++    ch: b' ',
++    colours: DEFAULT_FG | (DEFAULT_BG << 4),
++};
++
++#[derive(Clone, Copy, PartialEq)]
++enum State {
++    Ground,
++    Escape,
++    Csi,
++    /// An operating system command or other string: skipped up to BEL or ST.
++    String,
++    StringEscape,
++    /// ESC followed by an intermediate such as `(`: one more byte to skip.
++    Skip,
++}
++
++struct Console {
++    cells: [[Cell; COLS]; ROWS],
++    col: usize,
++    row: usize,
++    /// The cursor is past the last column: the next character wraps first.
++    wrap: bool,
++    fg: u8,
++    bg: u8,
++    reverse: bool,
++    saved: (usize, usize),
++    cursor_on: bool,
++    cursor_drawn: bool,
++    state: State,
++    params: [u16; 8],
++    nparams: usize,
++    private: bool,
++    /// UTF-8 decoding: code point so far and continuation bytes to come.
++    utf8: u32,
++    utf8_left: u8,
++    reply: [u8; 32],
++    reply_len: usize,
++}
++
++static CONSOLE: Mutex<Console> = Mutex::new(Console {
++    cells: [[BLANK; COLS]; ROWS],
++    col: 0,
++    row: 0,
++    wrap: false,
++    fg: DEFAULT_FG,
++    bg: DEFAULT_BG,
++    reverse: false,
++    saved: (0, 0),
++    cursor_on: true,
++    cursor_drawn: false,
++    state: State::Ground,
++    params: [0; 8],
++    nparams: 0,
++    private: false,
++    utf8: 0,
++    utf8_left: 0,
++    reply: [0; 32],
++    reply_len: 0,
++});
++
++impl Console {
++    fn colours(&self) -> u8 {
++        if self.reverse {
++            self.bg | (self.fg << 4)
++        } else {
++            self.fg | (self.bg << 4)
++        }
++    }
++
++    fn blank(&self) -> Cell {
++        Cell {
++            ch: b' ',
++            colours: self.fg | (self.bg << 4),
++        }
++    }
++
++    fn draw(&self, col: usize, row: usize) {
++        let cell = self.cells[row][col];
++        glyph(col, row, cell.ch, cell.colours & 0xf, cell.colours >> 4);
++    }
++
++    fn draw_row(&self, row: usize, from: usize) {
++        for col in from..COLS {
++            self.draw(col, row);
++        }
++    }
++
++    fn hide_cursor(&mut self) {
++        if self.cursor_drawn {
++            self.cursor_drawn = false;
++            self.draw(self.col.min(COLS - 1), self.row);
++        }
++    }
++
++    fn show_cursor(&mut self) {
++        if self.cursor_on && !self.cursor_drawn {
++            let col = self.col.min(COLS - 1);
++            let cell = self.cells[self.row][col];
++            glyph(col, self.row, cell.ch, cell.colours >> 4, cell.colours & 0xf);
++            self.cursor_drawn = true;
++        }
++    }
++
++    fn clear_rows(&mut self, from: usize, to: usize) {
++        if from >= to {
++            return;
++        }
++        let blank = self.blank();
++        for row in from..to {
++            self.cells[row] = [blank; COLS];
++        }
++        fill(0, from * CELL_H, WIDTH - 1, to * CELL_H - 1, self.bg);
++    }
++
++    fn clear_cols(&mut self, row: usize, from: usize, to: usize) {
++        if from >= to {
++            return;
++        }
++        let blank = self.blank();
++        for cell in &mut self.cells[row][from..to] {
++            *cell = blank;
++        }
++        fill(
++            from * CELL_W,
++            row * CELL_H,
++            to * CELL_W - 1,
++            (row + 1) * CELL_H - 1,
++            self.bg,
++        );
++    }
++
++    /// Move rows `top + n..ROWS` up by `n` and blank the rows at the bottom.
++    fn scroll_up(&mut self, top: usize, n: usize) {
++        let n = n.min(ROWS - top);
++        if n == 0 {
++            return;
++        }
++        if top + n < ROWS {
++            self.cells.copy_within(top + n..ROWS, top);
++            copy_rows((top + n) * CELL_H, HEIGHT - 1, -((n * CELL_H) as i32));
++        }
++        self.clear_rows(ROWS - n, ROWS);
++    }
++
++    /// Move rows `top..ROWS - n` down by `n` and blank `n` rows at `top`.
++    /// The engine copies top to bottom, which would smear an overlapping
++    /// downward copy, so the rows are redrawn from the cell buffer.
++    fn scroll_down(&mut self, top: usize, n: usize) {
++        let n = n.min(ROWS - top);
++        if n == 0 {
++            return;
++        }
++        self.cells.copy_within(top..ROWS - n, top + n);
++        let blank = self.blank();
++        for row in top..top + n {
++            self.cells[row] = [blank; COLS];
++        }
++        for row in top..ROWS {
++            self.draw_row(row, 0);
++        }
++    }
++
++    fn newline(&mut self) {
++        self.wrap = false;
++        if self.row + 1 < ROWS {
++            self.row += 1;
++        } else {
++            self.scroll_up(0, 1);
++        }
++    }
++
++    fn put(&mut self, ch: u8) {
++        if self.wrap {
++            self.col = 0;
++            self.newline();
++        }
++        self.cells[self.row][self.col] = Cell {
++            ch,
++            colours: self.colours(),
++        };
++        self.draw(self.col, self.row);
++        if self.col + 1 < COLS {
++            self.col += 1;
++        } else {
++            self.wrap = true;
++        }
++    }
++
++    fn param(&self, index: usize, default: usize) -> usize {
++        match self.params.get(index) {
++            Some(&value) if index < self.nparams && value != 0 => value as usize,
++            _ => default,
++        }
++    }
++
++    fn reply(&mut self, bytes: &[u8]) {
++        for &byte in bytes {
++            if self.reply_len < self.reply.len() {
++                self.reply[self.reply_len] = byte;
++                self.reply_len += 1;
++            }
++        }
++    }
++
++    fn reply_number(&mut self, mut value: usize) {
++        let mut digits = [0u8; 5];
++        let mut count = 0;
++        loop {
++            digits[count] = b'0' + (value % 10) as u8;
++            count += 1;
++            value /= 10;
++            if value == 0 || count == digits.len() {
++                break;
++            }
++        }
++        while count > 0 {
++            count -= 1;
++            self.reply(&[digits[count]]);
++        }
++    }
++
++    fn sgr(&mut self) {
++        if self.nparams == 0 {
++            self.nparams = 1;
++            self.params[0] = 0;
++        }
++        for index in 0..self.nparams {
++            match self.params[index] {
++                0 => {
++                    self.fg = DEFAULT_FG;
++                    self.bg = DEFAULT_BG;
++                    self.reverse = false;
++                }
++                7 => self.reverse = true,
++                27 => self.reverse = false,
++                value @ 30..=37 => self.fg = (value - 30) as u8,
++                39 => self.fg = DEFAULT_FG,
++                value @ 40..=47 => self.bg = (value - 40) as u8,
++                49 => self.bg = DEFAULT_BG,
++                // Bright colours: the colour map past index 7 is not known,
++                // so they take the plain ones.
++                value @ 90..=97 => self.fg = (value - 90) as u8,
++                value @ 100..=107 => self.bg = (value - 100) as u8,
++                // 256-colour and direct colour: skip their arguments.
++                38 | 48 => return,
++                _ => {}
++            }
++        }
++    }
++
++    fn csi(&mut self, last: u8) {
++        if self.private {
++            // DEC private modes: only cursor visibility matters here.
++            if self.param(0, 0) == 25 {
++                match last {
++                    b'h' => self.cursor_on = true,
++                    b'l' => self.cursor_on = false,
++                    _ => {}
++                }
++            }
++            return;
++        }
++        let n = self.param(0, 1);
++        match last {
++            b'A' => self.row = self.row.saturating_sub(n),
++            b'B' | b'e' => self.row = (self.row + n).min(ROWS - 1),
++            b'C' | b'a' => self.col = (self.col + n).min(COLS - 1),
++            b'D' => self.col = self.col.min(COLS - 1).saturating_sub(n),
++            b'E' => {
++                self.row = (self.row + n).min(ROWS - 1);
++                self.col = 0;
++            }
++            b'F' => {
++                self.row = self.row.saturating_sub(n);
++                self.col = 0;
++            }
++            b'G' | b'`' => self.col = (n - 1).min(COLS - 1),
++            b'd' => self.row = (n - 1).min(ROWS - 1),
++            b'H' | b'f' => {
++                self.row = (n - 1).min(ROWS - 1);
++                self.col = (self.param(1, 1) - 1).min(COLS - 1);
++            }
++            b'J' => match self.param(0, 0) {
++                0 => {
++                    self.clear_cols(self.row, self.col.min(COLS - 1), COLS);
++                    self.clear_rows(self.row + 1, ROWS);
++                }
++                1 => {
++                    self.clear_rows(0, self.row);
++                    self.clear_cols(self.row, 0, self.col.min(COLS - 1) + 1);
++                }
++                _ => self.clear_rows(0, ROWS),
++            },
++            b'K' => match self.param(0, 0) {
++                0 => self.clear_cols(self.row, self.col.min(COLS - 1), COLS),
++                1 => self.clear_cols(self.row, 0, self.col.min(COLS - 1) + 1),
++                _ => self.clear_cols(self.row, 0, COLS),
++            },
++            b'L' => self.scroll_down(self.row, n),
++            b'M' => self.scroll_up(self.row, n),
++            b'S' => self.scroll_up(0, n),
++            b'T' => self.scroll_down(0, n),
++            b'P' => {
++                let col = self.col.min(COLS - 1);
++                let n = n.min(COLS - col);
++                let blank = self.blank();
++                self.cells[self.row].copy_within(col + n..COLS, col);
++                for cell in &mut self.cells[self.row][COLS - n..] {
++                    *cell = blank;
++                }
++                self.draw_row(self.row, col);
++            }
++            b'@' => {
++                let col = self.col.min(COLS - 1);
++                let n = n.min(COLS - col);
++                let blank = self.blank();
++                self.cells[self.row].copy_within(col..COLS - n, col + n);
++                for cell in &mut self.cells[self.row][col..col + n] {
++                    *cell = blank;
++                }
++                self.draw_row(self.row, col);
++            }
++            b'X' => {
++                let col = self.col.min(COLS - 1);
++                self.clear_cols(self.row, col, (col + n).min(COLS));
++            }
++            b'm' => self.sgr(),
++            b's' => self.saved = (self.col, self.row),
++            b'u' => (self.col, self.row) = self.saved,
++            b'n' => match self.param(0, 0) {
++                5 => self.reply(b"\x1b[0n"),
++                6 => {
++                    self.reply(b"\x1b[");
++                    self.reply_number(self.row + 1);
++                    self.reply(b";");
++                    self.reply_number(self.col.min(COLS - 1) + 1);
++                    self.reply(b"R");
++                }
++                _ => {}
++            },
++            _ => {}
++        }
++        if !matches!(last, b'm' | b'n' | b's') {
++            self.wrap = false;
++        }
++    }
++
++    fn reset(&mut self) {
++        self.fg = DEFAULT_FG;
++        self.bg = DEFAULT_BG;
++        self.reverse = false;
++        self.cursor_on = true;
++        self.col = 0;
++        self.row = 0;
++        self.wrap = false;
++        self.clear_rows(0, ROWS);
++    }
++
++    fn ground(&mut self, byte: u8) {
++        // UTF-8: code points up to 0xFF index the font; others show as `?`.
++        if self.utf8_left > 0 {
++            if byte & 0xc0 == 0x80 {
++                self.utf8 = (self.utf8 << 6) | (byte & 0x3f) as u32;
++                self.utf8_left -= 1;
++                if self.utf8_left == 0 {
++                    let ch = match self.utf8 {
++                        code @ 0..=0xff => code as u8,
++                        // Box drawing, as programs use it for rules and
++                        // separators, and common punctuation.
++                        0x2500 | 0x2501 | 0x2013 | 0x2014 => b'-',
++                        0x2502 | 0x2503 => b'|',
++                        0x2504..=0x257f => b'+',
++                        0x2018 | 0x2019 => b'\'',
++                        0x201c | 0x201d => b'"',
++                        0x2026 => b'.',
++                        // ion marks a missing final newline with U+23CE.
++                        0x23ce => b' ',
++                        _ => b'?',
++                    };
++                    self.put(ch);
++                }
++                return;
++            }
++            self.utf8_left = 0;
++        }
++        match byte {
++            0x1b => self.state = State::Escape,
++            b'\n' => {
++                // The kernel log ends lines with LF alone, and a terminal's
++                // output has CR LF: LF returns the carriage in both.
++                self.col = 0;
++                self.newline();
++            }
++            b'\r' => {
++                self.col = 0;
++                self.wrap = false;
++            }
++            0x08 => {
++                self.col = self.col.min(COLS - 1).saturating_sub(1);
++                self.wrap = false;
++            }
++            b'\t' => {
++                self.col = ((self.col / 8 + 1) * 8).min(COLS - 1);
++                self.wrap = false;
++            }
++            0x00..=0x1f | 0x7f => {}
++            0xc0..=0xdf => {
++                self.utf8 = (byte & 0x1f) as u32;
++                self.utf8_left = 1;
++            }
++            0xe0..=0xef => {
++                self.utf8 = (byte & 0x0f) as u32;
++                self.utf8_left = 2;
++            }
++            0xf0..=0xf7 => {
++                self.utf8 = (byte & 0x07) as u32;
++                self.utf8_left = 3;
++            }
++            0x80..=0xbf | 0xf8..=0xff => self.put(b'?'),
++            _ => self.put(byte),
++        }
++    }
++
++    fn byte(&mut self, byte: u8) {
++        match self.state {
++            State::Ground => self.ground(byte),
++            State::Escape => {
++                self.state = State::Ground;
++                match byte {
++                    b'[' => {
++                        self.params = [0; 8];
++                        self.nparams = 0;
++                        self.private = false;
++                        self.state = State::Csi;
++                    }
++                    b']' | b'P' | b'^' | b'_' => self.state = State::String,
++                    b'(' | b')' | b'#' | b'%' => self.state = State::Skip,
++                    b'7' => self.saved = (self.col, self.row),
++                    b'8' => {
++                        (self.col, self.row) = self.saved;
++                        self.wrap = false;
++                    }
++                    b'c' => self.reset(),
++                    b'D' => self.newline(),
++                    b'E' => {
++                        self.col = 0;
++                        self.newline();
++                    }
++                    b'M' => {
++                        if self.row > 0 {
++                            self.row -= 1;
++                        } else {
++                            self.scroll_down(0, 1);
++                        }
++                    }
++                    _ => {}
++                }
++            }
++            State::Csi => match byte {
++                b'0'..=b'9' => {
++                    if self.nparams == 0 {
++                        self.nparams = 1;
++                    }
++                    if let Some(param) = self.params.get_mut(self.nparams - 1) {
++                        *param = param.saturating_mul(10).saturating_add((byte - b'0') as u16);
++                    }
++                }
++                b';' | b':' => {
++                    if self.nparams == 0 {
++                        self.nparams = 1;
++                    }
++                    if self.nparams < self.params.len() {
++                        self.nparams += 1;
++                    }
++                }
++                b'?' | b'>' | b'<' | b'=' => self.private = true,
++                0x20..=0x2f => {}
++                0x40..=0x7e => {
++                    self.state = State::Ground;
++                    self.csi(byte);
++                }
++                _ => self.state = State::Ground,
++            },
++            State::String => match byte {
++                0x07 => self.state = State::Ground,
++                0x1b => self.state = State::StringEscape,
++                _ => {}
++            },
++            State::StringEscape => {
++                self.state = if byte == b'\\' { State::Ground } else { State::String };
++            }
++            State::Skip => self.state = State::Ground,
++        }
++    }
++}
++
++/// Take over the screen. Call when the PROM's console is the graphics board.
++pub fn init() {
++    wait();
++    // Screen coordinates start at (0, 0) at the top left.
++    wr(XYWIN, (4096 << 16) | 4096);
++    wr(TOPSCAN, 0x3ff);
++    // No screen masks; the window ID comparison stays as the PROM set it.
++    wr(CLIPMODE, rd(CLIPMODE) & !0x1f);
++    wr(WRMASK, 0xffff_ffff);
++    let prom = rd(DRAWMODE1) & DM1_KEEP;
++    let planes = if prom & 7 == 0 { DM1_CI8 } else { prom };
++    wr(DRAWMODE1, planes | DM1_COMPARE_OFF | DM1_LOGIC_SRC);
++    let mut console = CONSOLE.lock();
++    console.clear_rows(0, ROWS);
++    console.show_cursor();
++    drop(console);
++    ACTIVE.store(true, Ordering::Relaxed);
++}
++
++pub fn active() -> bool {
++    ACTIVE.load(Ordering::Relaxed)
++}
++
++/// Write console output. Skipped when the console is already being written
++/// (a fault inside the console must not deadlock its own report).
++pub fn write(buf: &[u8]) {
++    if !active() {
++        return;
++    }
++    let Some(mut console) = CONSOLE.try_lock() else {
++        return;
++    };
++    console.hide_cursor();
++    for &byte in buf {
++        console.byte(byte);
++    }
++    console.show_cursor();
++}
++
++/// Take the queued replies to terminal reports (cursor position, status).
++pub fn take_reply(out: &mut [u8; 32]) -> usize {
++    if !active() {
++        return 0;
++    }
++    let Some(mut console) = CONSOLE.try_lock() else {
++        return 0;
++    };
++    let len = console.reply_len;
++    out[..len].copy_from_slice(&console.reply[..len]);
++    console.reply_len = 0;
++    len
 +}
 diff --git a/src/arch/mips64/device/serial.rs b/src/arch/mips64/device/serial.rs
 new file mode 100644
@@ -1449,10 +2390,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..a88c653b
+index 00000000..5228fccb
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,765 @@
+@@ -0,0 +1,750 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -1959,43 +2900,28 @@ index 00000000..a88c653b
 +        // The console's receive side is polled from the tick: the serial
 +        // interrupt arrives through INT3's mappable lines, not routed yet.
 +        crate::arch::device::serial::COM1.lock().receive(&mut token);
-+        // Keyboard and mouse, through the PROM console. The firmware reads
-+        // the IOC2 controller and moves its own pointer, one byte per call,
-+        // so it is called on every tick for as long as the controller has
-+        // data (status at 0xBFBD9847, bit 0: output buffer full), up to a
-+        // dozen times; that keeps the pointer moving at the rate the mouse
-+        // reports. Once a second it is called regardless, in case the status
-+        // test is wrong for some PROM.
-+        static KEYBOARD_TICK: core::sync::atomic::AtomicU32 =
-+            core::sync::atomic::AtomicU32::new(0);
-+        const KEYBOARD_STATUS: *const u8 = 0xBFBD_9847 as *const u8;
-+        let tick = KEYBOARD_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-+        let waiting = || unsafe { KEYBOARD_STATUS.read_volatile() } & 1 != 0;
-+        if waiting() || tick % 100 == 0 {
-+            let started = cp0::read_count();
-+            let console = crate::arch::device::serial::COM1.lock();
-+            let mut any = false;
-+            let mut polls = 0;
-+            loop {
-+                polls += 1;
-+                if let Some(byte) = crate::arch::device::arcs::read_byte() {
-+                    crate::scheme::debug::debug_input(byte, &mut token);
-+                    any = true;
++        // The keyboard controller is polled from the tick as well, along
++        // with the screen's replies to terminal reports.
++        if crate::arch::device::kbd::active() {
++            let mut bytes = [0u8; 96];
++            let mut len = {
++                let mut reply = [0u8; 32];
++                let n = crate::arch::device::newport::take_reply(&mut reply);
++                bytes[..n].copy_from_slice(&reply[..n]);
++                n
++            };
++            crate::arch::device::kbd::poll(&mut |byte| {
++                if len < bytes.len() {
++                    bytes[len] = byte;
++                    len += 1;
 +                }
-+                if polls >= 12 || !waiting() {
-+                    break;
-+                }
++            });
++            for &byte in &bytes[..len] {
++                crate::scheme::debug::debug_input(byte, &mut token);
 +            }
-+            drop(console);
-+            if any {
++            if len != 0 {
 +                crate::scheme::debug::debug_notify(&mut token);
 +            }
-+            crate::arch::cache::STAT_PROM_POLLS
-+                .fetch_add(polls, core::sync::atomic::Ordering::Relaxed);
-+            crate::arch::cache::STAT_PROM_TICKS.fetch_add(
-+                cp0::read_count().wrapping_sub(started) as usize,
-+                core::sync::atomic::Ordering::Relaxed,
-+            );
 +        }
 +        crate::context::timeout::trigger(&mut token);
 +        crate::context::switch::tick(&mut token);
@@ -3032,10 +3958,10 @@ index 00000000..599f5488
 +}
 diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
 new file mode 100644
-index 00000000..3401f7b6
+index 00000000..72848cf5
 --- /dev/null
 +++ b/src/arch/mips64/start.rs
-@@ -0,0 +1,360 @@
+@@ -0,0 +1,377 @@
 +//! Kernel entry from the SGI PROM.
 +//!
 +//! `boot -f bootp()redox` loads the ECOFF image at kseg0 0x8804_0000 and
@@ -3220,8 +4146,25 @@ index 00000000..3401f7b6
 +        // driver for Serial Port 1.
 +        device::arcs::init();
 +        device::serial::init();
++        // With a graphics console the kernel draws the screen and reads the
++        // keyboard itself from here on.
++        let keyboard = device::arcs::console_is_graphics().then(|| {
++            device::newport::init();
++            device::kbd::init()
++        });
 +
 +        info!("Redox OS starting...");
++        match keyboard {
++            Some(true) => {
++                info!("Indy: console on the Newport screen and the IOC2 keyboard");
++            }
++            Some(false) => {
++                info!("Indy: console on the Newport screen; the keyboard did not answer");
++            }
++            None => {
++                info!("Indy: console on Serial Port 1");
++            }
++        }
 +        if rmm::mips::FORCE_UNCACHED {
 +            info!("Indy: EXPERIMENT: kseg0 and all mappings uncached; this boot is slow");
 +        }
