@@ -1,4 +1,4 @@
-From 0b6ad33333303d7c4d56825696ad8780dc69a4d9 Mon Sep 17 00:00:00 2001
+From c43d952a317211dcfff9d1ef904688e0e22962f3 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -51,7 +51,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/misc.rs                |  60 ++
  src/arch/mips64/mod.rs                 |  92 +++
  src/arch/mips64/paging.rs              |  26 +
- src/arch/mips64/start.rs               | 355 ++++++++++++
+ src/arch/mips64/start.rs               | 360 ++++++++++++
  src/arch/mips64/stop.rs                |  47 ++
  src/arch/mips64/time.rs                | 169 ++++++
  src/arch/mod.rs                        |   6 +
@@ -62,7 +62,7 @@ Signed-off-by: belikh <io@belic.net>
  src/devices/serial.rs                  |  19 +
  src/devices/uart_z85c30.rs             | 120 ++++
  src/main.rs                            |   1 +
- src/memory/mod.rs                      |  15 +-
+ src/memory/mod.rs                      |  78 ++-
  src/panic.rs                           |  15 +
  src/scheme/irq.rs                      |   2 +
  src/scheme/proc.rs                     |   8 +-
@@ -70,11 +70,12 @@ Signed-off-by: belikh <io@belic.net>
  src/scheme/sys/mod.rs                  |  25 +
  src/scheme/user.rs                     |   4 +-
  src/startup/mod.rs                     |  20 +-
+ src/syscall/process.rs                 |   4 +
  syscall/src/arch/mips64.rs             | 232 ++++++++
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 +
- 46 files changed, 4270 insertions(+), 18 deletions(-)
+ 47 files changed, 4341 insertions(+), 19 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -3031,10 +3032,10 @@ index 00000000..599f5488
 +}
 diff --git a/src/arch/mips64/start.rs b/src/arch/mips64/start.rs
 new file mode 100644
-index 00000000..3f5b5044
+index 00000000..3401f7b6
 --- /dev/null
 +++ b/src/arch/mips64/start.rs
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,360 @@
 +//! Kernel entry from the SGI PROM.
 +//!
 +//! `boot -f bootp()redox` loads the ECOFF image at kseg0 0x8804_0000 and
@@ -3334,6 +3335,11 @@ index 00000000..3f5b5044
 +        let mut bump_allocator = crate::startup::memory::init(args, None, None);
 +        info!("Indy: frame allocator ready");
 +
++        // The initfs in the boot image is copied into the first process and
++        // then freed (memory::release_late_area).
++        crate::memory::LATE_AREA
++            .get()
++            .write((bootstrap_base, bootstrap_size));
 +        crate::memory::init_mm(&mut bump_allocator);
 +
 +        crate::arch::misc::init(crate::cpu_set::LogicalCpuId::new(0));
@@ -4166,10 +4172,57 @@ index a29621fa..3f05f23d 100644
  #![feature(sync_unsafe_cell)]
  #![feature(btree_cursors)]
 diff --git a/src/memory/mod.rs b/src/memory/mod.rs
-index eddfa494..87898dd4 100644
+index eddfa494..e9d39153 100644
 --- a/src/memory/mod.rs
 +++ b/src/memory/mod.rs
-@@ -142,7 +142,12 @@ pub fn allocate_p2frame(order: u32, must_be_zero: bool) -> Option<Frame> {
+@@ -54,6 +54,46 @@ pub(crate) fn areas() -> &'static [rmm::MemoryArea] {
+     unsafe { &(&*AREAS.get())[..AREA_COUNT.get().read().into()] }
+ }
+ 
++/// A reserved range that the allocator gets later: the boot image's copy of
++/// the initfs, which is dead once `usermode_bootstrap` has copied it into
++/// the first process. `init_sections` gives the range PageInfos, marked
++/// used and kept off the free lists; `release_late_area` frees it.
++/// Set before `init_mm`; (base, size), page aligned, size 0 for none.
++pub(crate) static LATE_AREA: SyncUnsafeCell<(usize, usize)> = SyncUnsafeCell::new((0, 0));
++
++fn late_area() -> Option<rmm::MemoryArea> {
++    let (base, size) = unsafe { LATE_AREA.get().read() };
++    (size != 0).then_some(rmm::MemoryArea {
++        base: PhysicalAddress::new(base),
++        size,
++    })
++}
++
++fn in_late_area(frame: Frame) -> bool {
++    late_area().is_some_and(|area| {
++        frame.base().data() >= area.base.data()
++            && frame.base().data() < area.base.data() + area.size
++    })
++}
++
++/// Hand the late area to the allocator. Call once, when nothing reads the
++/// range any more.
++pub unsafe fn release_late_area() {
++    let Some(area) = late_area() else { return };
++    let count = area.size / PAGE_SIZE;
++    // The frames were never allocated from a list: count them as used first,
++    // so that freeing them balances.
++    FREE_LISTS.get().unwrap()[0]
++        .free_list_inner
++        .lock()
++        .used_frames += count;
++    unsafe {
++        LATE_AREA.get().write((0, 0));
++        deallocate_contiguous(Frame::containing(area.base), count);
++    }
++    info!("Released {} KiB of boot image to the allocator", area.size / 1024);
++}
++
+ /// Get the number of frames available
+ pub fn free_frames() -> usize {
+     total_frames() - used_frames()
+@@ -142,7 +182,12 @@ pub fn allocate_p2frame(order: u32, must_be_zero: bool) -> Option<Frame> {
      None
  }
  pub fn allocate_frame(must_be_zero: bool) -> Option<Frame> {
@@ -4183,7 +4236,55 @@ index eddfa494..87898dd4 100644
  }
  
  // TODO: Flags, strategy
-@@ -1412,7 +1417,13 @@ pub fn page_fault_handler(
+@@ -785,7 +830,12 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
+ 
+                 (aligned_end - aligned_start) / MAX_SECTION_SIZE
+             })
+-            .sum();
++            .sum::<usize>()
++            + late_area().map_or(0, |area| {
++                (area.base.add(area.size).data().next_multiple_of(MAX_SECTION_SIZE)
++                    - area.base.data() / MAX_SECTION_SIZE * MAX_SECTION_SIZE)
++                    / MAX_SECTION_SIZE
++            });
+         let section_array_page_count =
+             (max_section_count * size_of::<Section>()).div_ceil(PAGE_SIZE);
+ 
+@@ -902,10 +952,23 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
+         None
+     };
+ 
++    if let Some(area) = late_area() {
++        sections_fill(&mut i, &[area]);
++    }
++
+     let sections = &mut sections[..i];
+ 
+     sections.sort_unstable_by_key(|s| s.base);
+ 
++    for section in sections.iter().filter(|s| in_late_area(s.base)) {
++        for page_info in section.frames.iter() {
++            page_info
++                .refcount
++                .store(RC_USED_NOT_FREE, Ordering::Relaxed);
++            page_info.next.store(0, Ordering::Relaxed);
++        }
++    }
++
+     // The bump allocator has been used during the section array and page info array allocation
+     // phases, which means some of the PageInfos will be pointing to those arrays themselves.
+     // Mark those pages as used!
+@@ -978,6 +1041,9 @@ fn init_sections(allocator: &mut BumpAllocator<RmmA>) -> Option<numa::RegionMask
+             {
+                 continue;
+             }
++            if in_late_area(section.base) {
++                continue;
++            }
+ 
+             let mut base = section.base;
+             let mut frames = section.frames;
+@@ -1412,7 +1478,13 @@ pub fn page_fault_handler(
          let mut token = unsafe { CleanLockToken::new() };
          match context::memory::try_correcting_page_tables(faulting_page, mode, &mut token) {
              Ok(()) => return Ok(()),
@@ -4546,6 +4647,21 @@ index b599f546..e8bfd177 100644
  }
  
  impl KernelArgs {
+diff --git a/src/syscall/process.rs b/src/syscall/process.rs
+index 1db548eb..a6b39427 100644
+--- a/src/syscall/process.rs
++++ b/src/syscall/process.rs
+@@ -238,6 +238,10 @@ pub unsafe fn usermode_bootstrap(bootstrap: &Bootstrap, token: &mut CleanLockTok
+         .copy_from_slice(bootstrap_slice)
+         .expect("failed to copy memory to bootstrap");
+ 
++    // The original is dead now. Where the port registered it as a late area
++    // (mips64), its frames go to the allocator.
++    unsafe { crate::memory::release_late_area() };
++
+     let bootstrap_entry = u64::from_le_bytes(bootstrap_slice[0x1a..0x22].try_into().unwrap());
+     debug!("Bootstrap entry point: {:X}", bootstrap_entry);
+     assert_ne!(bootstrap_entry, 0);
 diff --git a/syscall/src/arch/mips64.rs b/syscall/src/arch/mips64.rs
 new file mode 100644
 index 00000000..052b03cb

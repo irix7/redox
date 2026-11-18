@@ -79,7 +79,7 @@ tools/webfs/target/release/webfs serve build/indy/store --listen 0.0.0.0:8734
 | Variable | Default | Meaning |
 |---|---|---|
 | `INDY_ROOT_URL` | `http://10.1.1.3:8734/` | where the machine finds the store |
-| `INDY_ROOT_ARGS` | `--connect 10.1.1.3` | `webfs mount` options |
+| `INDY_ROOT_ARGS` | `--connect 10.1.1.3 --threads 2 --cache 256` | `webfs mount` options |
 | `INDY_STORE` | `build/indy/store` | where `make indy-root` packs the tree |
 
 The root tree is `config/indy/root` plus the programs: the base daemons (`dhcpd`,

@@ -753,14 +753,21 @@ and none of them is on the critical path to "the machine runs our code".
   12 bytes against 24 in the `libc` crate, which broke every `mio` user; the kernel woke
   console readers on every tick; an out-of-frames page fault panicked the kernel
   (`todo!("oom")`) and now fails the faulting process.
-  Memory is the limit. After login 3.1 MiB of 24.3 MiB is free: the initfs image
-  (4.2 MiB) stays resident beside the loaded copies of its five programs, and each of
-  the 15 processes is a private static image of 0.5 to 2.3 MB. One uutils program fits
-  (`ls` is 3.1 MB); two large ones in a pipeline can run out, and the second is killed.
-- **T9 — next.** Memory before more programs: map initfs programs from the image
-  and stop keeping a second copy, fold `zerod` and the other small daemons together,
-  smaller `ls`/`sort`; an entropy source for `randd`; a clock (`date` reads 1970); the
-  serial interrupt (INT3 mappable lines) instead of polling.
+  Memory, first build: after login 3.1 MiB of 24.3 MiB was free and `ls` could exhaust it.
+- **T8d — memory.** 2026-11-18, in the emulator: 12.3 MiB of 28.6 MiB is free after
+  login (was 3.1 of 24.3). The initfs existed three times: the image's copy, reserved
+  for ever; the copy the kernel makes for the first process; and the loaded programs.
+  The kernel now gives the image's copy PageInfos and frees it after the copy
+  (`memory::release_late_area`, 4.2 MiB). The initfs daemon unmaps its archive when
+  `/scheme/initfs/image` is unlinked, which the root unit `20_initfs-release.service`
+  does once the root is mounted (4.2 MiB; `/scheme/initfs` answers ENOENT afterwards,
+  so nothing can be started from it again). The root mount runs two webfs workers with
+  a 256 KiB blob cache (was four and 1 MiB). `ls -l /usr/bin | sort -k5 -n | tail -3`
+  (8.5 MB of programs) runs.
+- **T9 — next.** A real-hardware run of T8c and T8d. Then: each process is still a
+  private static image read whole (no shared or demand-paged text), `zerod` runs twice,
+  an entropy source for `randd`, a clock (`date` reads 1970), the serial interrupt
+  (INT3 mappable lines) instead of polling.
 - **T2** stays worth doing: it tells which userspace cut matters most before T6 pulls in
   packages.
 

@@ -1,0 +1,8 @@
+[unit]
+description = "Return the initfs archive's memory to the kernel"
+requires_weak = ["05_dirs.service"]
+
+[service]
+cmd = "indy-sh"
+args = ["release-initfs"]
+type = "oneshot"

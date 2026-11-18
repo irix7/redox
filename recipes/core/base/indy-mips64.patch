@@ -1,4 +1,4 @@
-From 75b7287e9392151b250750c9c699fda81df8bd4e Mon Sep 17 00:00:00 2001
+From e8baebaebf676103839aa0daa6db843c355b1bb9 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:40 +1000
 Subject: [PATCH] Indy (mips64 n32): bootstrap entry, Seeq 8003 driver,
@@ -24,6 +24,7 @@ Signed-off-by: belikh <io@belic.net>
  Cargo.toml                      |   6 +
  bootstrap/Cargo.lock            |   7 +-
  bootstrap/Cargo.toml            |  11 +-
+ bootstrap/src/initfs.rs         |  53 +++++-
  bootstrap/src/initnsmgr.rs      |   4 +-
  bootstrap/src/main.rs           |   5 +
  bootstrap/src/mips64.ld         |  59 ++++++
@@ -33,7 +34,7 @@ Signed-off-by: belikh <io@belic.net>
  drivers/net/seeqd/src/device.rs | 318 ++++++++++++++++++++++++++++++++
  drivers/net/seeqd/src/main.rs   | 113 ++++++++++++
  netstack/src/scheme/mod.rs      |  33 +++-
- 13 files changed, 695 insertions(+), 74 deletions(-)
+ 14 files changed, 747 insertions(+), 75 deletions(-)
  create mode 100644 bootstrap/src/mips64.ld
  create mode 100644 bootstrap/src/mips64.rs
  create mode 100644 drivers/net/seeqd/Cargo.toml
@@ -676,6 +677,91 @@ index ba46940..ab8f91a 100644
 +# mips64 definitions (bootstrap.md, Provenance).
 +redox_syscall = { path = "../../../../../vendor/redox_syscall-0.9.6" }
 +libc = { path = "../../../../../vendor/libc-0.2.190" }
+diff --git a/bootstrap/src/initfs.rs b/bootstrap/src/initfs.rs
+index 45528dc..bcc7aad 100644
+--- a/bootstrap/src/initfs.rs
++++ b/bootstrap/src/initfs.rs
+@@ -46,6 +46,9 @@ pub struct InitFsScheme {
+     handles: HashMap<usize, Handle, BuildHasherDefault<SipHasher>>,
+     next_id: usize,
+     fs: InitFs<'static>,
++    /// The archive's pages were returned to the kernel (`unlinkat` of
++    /// `image`): `fs` points at unmapped memory and no request may reach it.
++    dropped: bool,
+ }
+ impl InitFsScheme {
+     pub fn new(bytes: &'static [u8]) -> Self {
+@@ -54,6 +57,7 @@ impl InitFsScheme {
+             next_id: 0,
+             fs: InitFs::new(bytes, Some(PAGE_SIZE.try_into().unwrap()))
+                 .expect("failed to parse initfs"),
++            dropped: false,
+         }
+     }
+ 
+@@ -329,6 +333,49 @@ impl SchemeSync for InitFsScheme {
+         Ok(())
+     }
+ 
++    /// `unlinkat` of `image` gives the whole archive back to the kernel.
++    ///
++    /// The archive is resident memory, and on a 32 MiB machine it is larger
++    /// than anything else. Once the root filesystem is mounted and the
++    /// programs of the initfs are running, nothing reads it again. After
++    /// this call every request fails with ENOENT.
++    fn unlinkat(&mut self, fd: usize, path: &str, _flags: usize, ctx: &CallerCtx) -> Result<()> {
++        if !matches!(
++            self.handles.get(&fd).ok_or(Error::new(EBADF))?,
++            Handle::SchemeRoot
++        ) {
++            return Err(Error::new(EACCES));
++        }
++        if path.trim_matches('/') != "image" {
++            return Err(Error::new(ENOENT));
++        }
++        if ctx.uid != 0 {
++            return Err(Error::new(EPERM));
++        }
++        unsafe extern "C" {
++            static __initfs_header: u8;
++            static __bss_end: u8;
++        }
++        // The same range bootstrap unmaps in its own address space after
++        // it has forked this daemon.
++        unsafe {
++            let initfs_start = core::ptr::addr_of!(__initfs_header);
++            let initfs_length = (*(initfs_start as *const redox_initfs::types::Header))
++                .initfs_size
++                .get() as usize;
++            let executable_end = core::ptr::addr_of!(__bss_end)
++                .add(core::ptr::addr_of!(__bss_end).align_offset(PAGE_SIZE));
++            self.dropped = true;
++            syscall::funmap(
++                executable_end as usize,
++                initfs_length.next_multiple_of(PAGE_SIZE)
++                    - (executable_end.offset_from(initfs_start) as usize),
++            )?;
++        }
++        log::info!("bootstrap: initfs archive released");
++        Ok(())
++    }
++
+     fn fsync(&mut self, id: usize, _ctx: &CallerCtx) -> Result<()> {
+         if !self.handles.contains_key(&id) {
+             return Err(Error::new(EBADF));
+@@ -397,7 +444,11 @@ pub fn run(bytes: &'static [u8], sync_pipe: FdGuard, socket: Socket) -> ! {
+     {
+         match req.kind() {
+             RequestKind::Call(req) => {
+-                let resp = req.handle_sync(&mut scheme, &mut state);
++                let resp = if scheme.dropped {
++                    Response::err(ENOENT, req)
++                } else {
++                    req.handle_sync(&mut scheme, &mut state)
++                };
+ 
+                 if !socket
+                     .write_response(resp, SignalBehavior::Restart)
 diff --git a/bootstrap/src/initnsmgr.rs b/bootstrap/src/initnsmgr.rs
 index 707b896..008e3e8 100644
 --- a/bootstrap/src/initnsmgr.rs

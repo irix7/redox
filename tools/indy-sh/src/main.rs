@@ -119,7 +119,7 @@ fn run(line: &str, out: &mut dyn Write) -> bool {
         }
         "ipcbench" => {
             use std::os::unix::fs::FileExt;
-            if let Ok(file) = fs::File::open("/scheme/initfs/lib/init.d/00_randd.service") {
+            if let Ok(file) = fs::File::open("/etc/passwd") {
                 let mut byte = [0u8; 1];
                 let start = std::time::Instant::now();
                 for _ in 0..4000 {
@@ -283,6 +283,16 @@ fn main() {
         }
         return;
     }
+    // `indy-sh release-initfs`: the root is mounted and every initfs program
+    // is running, so the initfs daemon can return the archive (about 4 MiB)
+    // to the kernel. /scheme/initfs is empty afterwards.
+    if args.first().map(String::as_str) == Some("release-initfs") {
+        match fs::remove_file("/scheme/initfs/image") {
+            Ok(()) => println!("REDOX-INDY-SH: initfs released\r"),
+            Err(err) => println!("indy-sh: release-initfs: {err}\r"),
+        }
+        return;
+    }
     println!("REDOX-INDY-SH: hello from std on the Indy\r");
     thread::spawn(reporter);
     // `indy-sh --tcp`: serve port 23 only. The console belongs to getty.
@@ -392,7 +402,7 @@ fn bench(out: &mut dyn Write) {
 
     // One read of an open file: a kernel scheme (no context switch), a
     // scheme served by the bootstrap process, and the network filesystem.
-    for path in ["/scheme/sys/uname", "/scheme/initfs/lib/init.d/00_randd.service", "/usr/lib/init.d/40_sh.service"] {
+    for path in ["/scheme/sys/uname", "/etc/passwd", "/usr/lib/init.d/40_indy-sh.service"] {
         use std::os::unix::fs::FileExt;
         let Ok(file) = fs::File::open(path) else { continue };
         let mut byte = [0u8; 1];

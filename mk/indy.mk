@@ -112,7 +112,10 @@ webfs: $(WEBFS_HOST)
 #   INDY_STORE        where `make indy-root` packs it; serve it with
 #                     `webfs serve $(INDY_STORE) --listen 0.0.0.0:8734`
 INDY_ROOT_URL?=http://10.1.1.3:8734/
-INDY_ROOT_ARGS?=--connect 10.1.1.3
+# Two workers and a 256 KiB blob cache: programs are read once, front to
+# back, so a larger cache only holds memory the programs need.
+ROOT_MOUNT_SIZE=--threads 2 --cache 256
+INDY_ROOT_ARGS?=--connect 10.1.1.3 $(ROOT_MOUNT_SIZE)
 INDY_STORE?=$(INDY_BUILD)/store
 ROOT_DIR=$(INDY_BUILD)/root
 # The emulator's NAT gateway reaches this host's loopback.
@@ -127,7 +130,7 @@ $(INDY_BUILD)/redox: $(IMAGE_DEPS)
 	llvm-size $(INDY_KERNEL_ALL)
 
 $(INDY_BUILD)/redox-gate: $(IMAGE_DEPS)
-	tools/indy-image.sh $@ $(INITFS_DIR)-gate "$(GATE_ROOT_URL)" --connect 192.168.0.1
+	tools/indy-image.sh $@ $(INITFS_DIR)-gate "$(GATE_ROOT_URL)" --connect 192.168.0.1 $(ROOT_MOUNT_SIZE)
 
 indy: $(INDY_BUILD)/redox
 
