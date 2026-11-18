@@ -88,8 +88,10 @@ ROOT_BINS=dhcpd zerod ipcd ptyd ramfs getty
 BASE_BINS=init randd netstack $(ROOT_BINS)
 BASE_OUT=$(BASE_SOURCE)/target/mips64-sgi-redox/release
 
+# netstack handles every frame: it is built for speed, the rest for size.
 $(BASE_OUT)/init: $(SYSROOT)/lib/libc.a FORCE
-	tools/base-indy.sh $(BASE_BINS)
+	tools/base-indy.sh $(filter-out netstack,$(BASE_BINS))
+	INDY_OPT_LEVEL=3 tools/base-indy.sh netstack
 
 # webfs: the read-only filesystem served over HTTP or HTTPS (tools/webfs).
 # The same crate builds for the host (pack, serve) and for the target (mount).

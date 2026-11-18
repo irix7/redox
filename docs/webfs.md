@@ -101,7 +101,7 @@ rest of the path appended (`/scheme/tmp/tmp/x`).
 
 Status 2026-11-18 on the real Indy (R4600, 32 MiB): the store mounts as the root, files
 of 46 bytes to 2 MiB read back with the right CRC-32, and programs run from `/usr/bin`.
-Reading runs at about 355 KiB/s (2026-11-19: 1.2 MB in 3.4 s, CRC included; 77 KiB/s the
+Reading runs at about 395 KiB/s (2026-11-19: 1.2 MB in 3.05 s, CRC included; 77 KiB/s the
 day before; bootstrap.md T8i lists what changed). The machine is CPU-bound for the whole
 read.
 

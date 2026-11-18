@@ -732,7 +732,7 @@ and none of them is on the critical path to "the machine runs our code".
   (`arch/mips64/cache.rs`): frames are allocated on the colour of the page they back,
   borrowed mappings keep their source's colour, off-colour pages are written back at traps,
   and an assembly handler serves the refills that need no cache work. A kernel-scheme
-  syscall takes about 12 to 20 microseconds and webfs read about 90 KiB/s (355 KiB/s since T8i). A call to a
+  syscall takes about 12 to 20 microseconds and webfs read about 90 KiB/s (395 KiB/s since T8i). A call to a
   user scheme still takes about 1.8 ms, nearly all of it in the kernel's scheme path.
   A debugger exists since 2026-11-18: `tools/indy-gdb.sh` attaches GDB to the running
   machine through `kdbg` on TCP port 2159 (read-only: every context is a thread, kernel
@@ -798,7 +798,7 @@ and none of them is on the critical path to "the machine runs our code".
   there, 160 by 64 in iris. The table adds up to exactly 1024 by 768 on the real VC2
   (video entry 0x400) and to 1282 by 1024 in iris.
 - **T8i — read speed.** 2026-11-18 and 19, on the real Indy: a 1.2 MB file through webfs
-  reads in 3.4 s (about 355 KiB/s, CRC included), down from 15.8 s (77 KiB/s). The steps,
+  reads in 3.05 s (about 395 KiB/s, CRC included), down from 15.8 s (77 KiB/s). The steps,
   with the read time after each:
   - Cache colour: uncached (device and DMA) mappings no longer take the colour path, and
     the scheme call's head and tail frames and every colour-matched allocation get a
@@ -834,21 +834,31 @@ and none of them is on the critical path to "the machine runs our code".
     switches per request went to the hand-off).
   - `netstack` acknowledges TCP segments at once. A delayed acknowledgement waited for
     the stack's timer, which only the timer event arms, up to 500 ms ahead. A request on
-    an open connection takes 6 ms. Bulk reads cost about 3% more for the extra
-    acknowledgements: 3.4 s, about 355 KiB/s. The transmit-done interrupt is off (no
-    measurable change).
+    an open connection takes 6 ms. (Taken back two steps later.) The transmit-done
+    interrupt is off (no measurable change). 3.4 s.
+  - `netstack` and `webfs` are built with `opt-level=3` (the other base programs stay
+    at `z`): 116 KB and 161 KB larger, reads about 6% faster.
+  - The Seeq transmit side is an eight-slot ring HPC3 chains through, and TCP
+    acknowledgements are delayed again (one per two segments). The kernel profiler now
+    samples `netstack`'s user-mode PC (`profile` in `indy-sh`); it showed 45% of the
+    stack's time in the transmit function waiting for a free slot: on half-duplex
+    Ethernet an acknowledgement waits for a gap in the incoming burst, and one per
+    segment kept every slot taken. A full ring now drops the frame after a short wait.
+    3.05 s, about 395 KiB/s; a small file reads in 63 ms.
   Measured and dropped: a size-optimised kernel (no change); re-arming the stack's timer
-  from every event (two more system calls per frame, reads 25% slower). A probe of the MC EEPROM
+  from every event (two more system calls per frame, reads 25% slower); acknowledging
+  every segment (the transmit contention above). A probe of the MC EEPROM
   port for the cache size hung the machine in the PROM (it ran before the kernel owns
   the exception vectors); the ARCS inventory replaced it.
-  Open, with what was measured: `netstack` still spends about 2 ms of CPU per received
-  frame (1.7 s of a 3.4 s read; `webfs` 1.1 s, the test's CRC loop 0.8 s). TLS access
-  traps (`rdhwr`) cost about 3 microseconds each, ten per scheme call, 3% of it. The
-  cache code's index-type operations now run a few thousand times per boot, since
-  off-colour mappings are rare. The `Flusher` drops all of an address space's TLB
-  entries when any of its mappings change (it has no page addresses), so a scheme server
-  refills after every request. Tools: `TRAP_TIMING` in `arch/mips64/cache.rs`, the named
-  off-colour list and the PROM inventory in `cachestat`.
+  Open, with what was measured: of a 3.05 s read `netstack` takes about 1.2 s (about 40%
+  of it kernel time in its system calls and wake-ups, the rest spread over smoltcp and
+  copies), `webfs` about 1.0 s and the test's CRC loop 0.8 s. TLS access traps (`rdhwr`)
+  cost about 3 microseconds each, ten per scheme call. The cache code's index-type
+  operations now run a few thousand times per boot. The `Flusher` drops all of an
+  address space's TLB entries when any of its mappings change. smoltcp's CUBIC uses
+  floating point, which is soft float here. Tools: `TRAP_TIMING` in
+  `arch/mips64/cache.rs` (per program, syscall and descriptor), the user-PC profile, the
+  named off-colour list and the PROM inventory in `cachestat`.
 - **T8h — Doom.** 2026-11-18, in the emulator. `doom-rs` (github.com/bejiihiu/doom-rs,
   GPL-2.0-or-later, a Rust rewrite of linuxdoom-1.10 with fixed-point maths and UDP net
   play) runs as `/usr/bin/doom` with the shareware `doom1.wad`. The engine library builds

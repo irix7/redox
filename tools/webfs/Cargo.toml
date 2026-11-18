@@ -27,14 +27,12 @@ libredox = "0.2.0"
 redox_syscall = { path = "../../vendor/redox_syscall-0.9.6" }
 libc = { path = "../../vendor/libc-0.2.191" }
 
+# Built for speed: webfs verifies and copies every byte the machine reads,
+# and opt-level "z" (no inlining) cost it several times its speed.
 [profile.release]
-opt-level = "z"
+opt-level = 3
 panic = "abort"
 lto = true
 codegen-units = 1
 debug = false
 strip = "symbols"
-
-# SHA-256 runs over every byte read; the rest of the program stays small.
-[profile.release.package.sha2]
-opt-level = 3

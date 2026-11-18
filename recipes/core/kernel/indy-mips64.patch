@@ -1,4 +1,4 @@
-From 47805720787984d3e78ea3b2d0d2123f3eb8070b Mon Sep 17 00:00:00 2001
+From 9b64738c7516c2a001c0e9b46108f81e17fed476 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -33,7 +33,7 @@ Signed-off-by: belikh <io@belic.net>
  rmm/src/arch/mips.rs                   | 332 +++++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
- src/arch/mips64/cache.rs               | 622 +++++++++++++++++
+ src/arch/mips64/cache.rs               | 649 +++++++++++++++++
  src/arch/mips64/consts.rs              |  24 +
  src/arch/mips64/cp0.rs                 | 112 +++
  src/arch/mips64/debug.rs               |  22 +
@@ -43,7 +43,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/device/mod.rs          |  69 ++
  src/arch/mips64/device/newport.rs      | 933 +++++++++++++++++++++++++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 750 ++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 757 ++++++++++++++++++++
  src/arch/mips64/interrupt/handler.rs   | 396 +++++++++++
  src/arch/mips64/interrupt/irq.rs       | 135 ++++
  src/arch/mips64/interrupt/mod.rs       |  47 ++
@@ -55,7 +55,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/paging.rs              |  75 ++
  src/arch/mips64/start.rs               | 392 +++++++++++
  src/arch/mips64/stop.rs                |  47 ++
- src/arch/mips64/time.rs                | 172 +++++
+ src/arch/mips64/time.rs                | 205 ++++++
  src/arch/mod.rs                        |   6 +
  src/context/arch/mips64.rs             | 235 +++++++
  src/context/context.rs                 |  93 ++-
@@ -79,7 +79,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 +
- 51 files changed, 6382 insertions(+), 44 deletions(-)
+ 51 files changed, 6449 insertions(+), 44 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -576,10 +576,10 @@ index 1f2c1a13..ccbee701 100644
  
 diff --git a/src/arch/mips64/cache.rs b/src/arch/mips64/cache.rs
 new file mode 100644
-index 00000000..692b0096
+index 00000000..4c304102
 --- /dev/null
 +++ b/src/arch/mips64/cache.rs
-@@ -0,0 +1,622 @@
+@@ -0,0 +1,649 @@
 +//! Primary cache coherence.
 +//!
 +//! The R4x00 and R5000 primary caches are indexed by virtual address, and a
@@ -1076,19 +1076,44 @@ index 00000000..692b0096
 +pub fn log_stats() {
 +    log_notes();
 +    let mut line = alloc::string::String::new();
-+    for code in 0..96 {
++    for code in 0..32 {
 +        let count = STAT_BY_CODE[code].swap(0, Ordering::Relaxed);
 +        let ticks = STAT_TICKS[code].swap(0, Ordering::Relaxed);
 +        if count != 0 || ticks != 0 {
 +            use core::fmt::Write;
-+            if code < 32 {
-+                let _ = write!(line, " code{}:{}x{}k", code, count, ticks / 1000);
-+            } else {
-+                let number = STAT_SYSCALL[code - 32].load(Ordering::Relaxed);
-+                let _ = write!(line, " sys{:#x}:{}x{}k", number, count, ticks / 1000);
-+            }
++            let _ = write!(line, " code{}:{}x{}k", code, count, ticks / 1000);
 +        }
 +    }
++    // Syscalls: the 28 buckets with the most time, as
++    // program:number/first argument, calls x thousands of Count ticks.
++    let mut top = [(0usize, 0usize, 0usize); 28];
++    for bucket in 0..256 {
++        let count = STAT_BY_CODE[32 + bucket].swap(0, Ordering::Relaxed);
++        let ticks = STAT_TICKS[32 + bucket].swap(0, Ordering::Relaxed);
++        if ticks > top[27].0 {
++            top[27] = (ticks, count, bucket);
++            top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
++        }
++    }
++    let mut calls = alloc::string::String::new();
++    for (ticks, count, bucket) in top {
++        if ticks == 0 {
++            continue;
++        }
++        use core::fmt::Write;
++        let who = STAT_WHO[bucket].load(Ordering::Relaxed);
++        let tag = ((who >> 8) as u32).to_be_bytes();
++        let _ = write!(
++            calls,
++            " {}:{:#x}/{}:{}x{}k",
++            core::str::from_utf8(&tag).unwrap_or("?").trim(),
++            STAT_SYSCALL[bucket].load(Ordering::Relaxed),
++            who & 0xff,
++            count,
++            ticks / 1000
++        );
++    }
++    info!("Indy: syscalls:{}", calls);
 +    info!(
 +        "Indy: secondary cache {}, PRId {:#x}, Config {:#x}, PROM inventory (class/type/key):{}",
 +        if SCACHE_ON.load(Ordering::Relaxed) { "on" } else { "off" },
@@ -1134,7 +1159,7 @@ index 00000000..692b0096
 +
 +/// The end of the running context's name, read without its lock: one CPU,
 +/// interrupts off, and the result is only printed.
-+fn current_tag() -> u32 {
++pub fn current_tag() -> u32 {
 +    let mut tag = [b' '; 4];
 +    let current = crate::context::try_current();
 +    if let Some(context) = current.as_ref() {
@@ -1194,12 +1219,14 @@ index 00000000..692b0096
 +/// Event counts for tuning, logged with the cache counters.
 +pub static STAT_SWITCHES: AtomicUsize = AtomicUsize::new(0);
 +pub static STAT_FAST_REFILLS: AtomicUsize = AtomicUsize::new(0);
-+pub static STAT_BY_CODE: [AtomicUsize; 96] = [const { AtomicUsize::new(0) }; 96];
++pub static STAT_BY_CODE: [AtomicUsize; 288] = [const { AtomicUsize::new(0) }; 288];
 +/// The syscall number behind each of buckets 32..96.
-+pub static STAT_SYSCALL: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
++pub static STAT_SYSCALL: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
++/// The calling program's tag (high bits) and first argument (low byte).
++pub static STAT_WHO: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
 +/// CP0 Count ticks spent between a trap's entry and its return, by code.
 +/// A trap that blocks counts the time until its context runs again.
-+pub static STAT_TICKS: [AtomicUsize; 96] = [const { AtomicUsize::new(0) }; 96];
++pub static STAT_TICKS: [AtomicUsize; 288] = [const { AtomicUsize::new(0) }; 288];
 +pub static STAT_TLB_FLUSHES: AtomicUsize = AtomicUsize::new(0);
 +
 diff --git a/src/arch/mips64/consts.rs b/src/arch/mips64/consts.rs
@@ -3093,10 +3120,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..eb34fa50
+index 00000000..0d832f1f
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,750 @@
+@@ -0,0 +1,757 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -3546,7 +3573,7 @@ index 00000000..eb34fa50
 +    }
 +    let now = cp0::read_count();
 +    let ticks = now.wrapping_sub(TIMING_STAMP.swap(now, Ordering::Relaxed)) as usize;
-+    let code = TIMING_CODE.load(Ordering::Relaxed) % 96;
++    let code = TIMING_CODE.load(Ordering::Relaxed) % 288;
 +    crate::arch::cache::STAT_TICKS[code].fetch_add(ticks, Ordering::Relaxed);
 +}
 +
@@ -3665,13 +3692,20 @@ index 00000000..eb34fa50
 +            // Skip the syscall instruction. LLVM never places it in a branch delay slot.
 +            regs.iret.epc += 4;
 +            // Kernel time per syscall number (buckets 32..96 of the stats).
++            // One bucket per calling program, syscall number and first
++            // argument (the file descriptor of a read or a write).
 +            let number = r.v0 as usize;
-+            let bucket = 32 + ((number ^ (number >> 8) ^ (number >> 16) ^ (number >> 24)) & 63);
 +            if crate::arch::cache::TRAP_TIMING {
++                let fd = r.a0 as usize & 0xff;
++                let tag = crate::arch::cache::current_tag() as usize;
++                let key = number ^ fd.wrapping_mul(0x9e37) ^ tag.wrapping_mul(0x01000193);
++                let bucket = 32 + ((key ^ (key >> 8) ^ (key >> 16) ^ (key >> 24)) & 255);
 +                timing_charge();
 +                TIMING_CODE.store(bucket, core::sync::atomic::Ordering::Relaxed);
 +                crate::arch::cache::STAT_SYSCALL[bucket - 32]
 +                    .store(number, core::sync::atomic::Ordering::Relaxed);
++                crate::arch::cache::STAT_WHO[bucket - 32]
++                    .store((tag << 8) | fd, core::sync::atomic::Ordering::Relaxed);
 +                crate::arch::cache::STAT_BY_CODE[bucket]
 +                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 +            }
@@ -5260,10 +5294,10 @@ index 00000000..49d7eee0
 +}
 diff --git a/src/arch/mips64/time.rs b/src/arch/mips64/time.rs
 new file mode 100644
-index 00000000..2462ac5e
+index 00000000..983e3c92
 --- /dev/null
 +++ b/src/arch/mips64/time.rs
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,205 @@
 +//! Monotonic time from CP0 Count.
 +//!
 +//! Count runs at half the pipeline clock. The PROM measures the CPU clock
@@ -5400,9 +5434,20 @@ index 00000000..2462ac5e
 +static PROFILE_OTHER: AtomicU32 = AtomicU32::new(0);
 +const PROFILE_BASE: usize = 0x8804_0000;
 +
++/// User-mode samples of one program, chosen by the last four characters
++/// of its name: 256-byte buckets of its first 2 MiB.
++const PROFILE_USER_TAG: u32 = u32::from_be_bytes(*b"tack");
++static PROFILE_USER_PC: [core::sync::atomic::AtomicU16; PROFILE_BUCKETS] =
++    [const { core::sync::atomic::AtomicU16::new(0) }; PROFILE_BUCKETS];
++
 +pub fn profile_sample(epc: usize, user: bool) {
 +    if user {
 +        PROFILE_USER.fetch_add(1, Ordering::Relaxed);
++        if crate::arch::cache::current_tag() == PROFILE_USER_TAG
++            && let Some(bucket) = PROFILE_USER_PC.get(epc >> 8)
++        {
++            bucket.fetch_add(1, Ordering::Relaxed);
++        }
 +    } else if let Some(bucket) = epc.checked_sub(PROFILE_BASE).and_then(|o| PROFILE.get(o >> 8)) {
 +        bucket.fetch_add(1, Ordering::Relaxed);
 +    } else {
@@ -5434,6 +5479,28 @@ index 00000000..2462ac5e
 +            let _ = write!(line, " {:#x}:{}", PROFILE_BASE + (bucket << 8), count);
 +        }
 +        info!("Indy: profile:{}", line);
++    }
++    // The chosen program's busiest buckets.
++    let mut top = [(0u16, 0usize); 48];
++    let mut total = 0u32;
++    for (i, bucket) in PROFILE_USER_PC.iter().enumerate() {
++        let count = bucket.swap(0, Ordering::Relaxed);
++        total += count as u32;
++        if count > top[47].0 {
++            top[47] = (count, i);
++            top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
++        }
++    }
++    info!("Indy: profile: {} samples in netstack", total);
++    for chunk in top.chunks(12) {
++        let mut line = alloc::string::String::new();
++        for (count, bucket) in chunk {
++            use core::fmt::Write;
++            if *count != 0 {
++                let _ = write!(line, " {:#x}:{}", bucket << 8, count);
++            }
++        }
++        info!("Indy: profile: user{}", line);
 +    }
 +}
 diff --git a/src/arch/mod.rs b/src/arch/mod.rs

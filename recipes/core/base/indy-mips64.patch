@@ -1,4 +1,4 @@
-From fb7a346d777a849bc8333794b4580ab702274d94 Mon Sep 17 00:00:00 2001
+From a3279820535e8a80efe6b629e34918fd85b14aee Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:40 +1000
 Subject: [PATCH] Indy (mips64 n32): bootstrap entry, Seeq 8003 driver,
@@ -20,26 +20,26 @@ Subject: [PATCH] Indy (mips64 n32): bootstrap entry, Seeq 8003 driver,
 Signed-off-by: belikh <io@jupiter.au>
 Signed-off-by: belikh <io@belic.net>
 ---
- Cargo.lock                            | 121 +++++----
+ Cargo.lock                            | 121 ++++----
  Cargo.toml                            |   5 +
  bootstrap/Cargo.lock                  |   7 +-
  bootstrap/Cargo.toml                  |  11 +-
  bootstrap/src/initfs.rs               |  53 +++-
  bootstrap/src/initnsmgr.rs            |   4 +-
  bootstrap/src/main.rs                 |   5 +
- bootstrap/src/mips64.ld               |  59 +++++
- bootstrap/src/mips64.rs               |  58 +++++
+ bootstrap/src/mips64.ld               |  59 ++++
+ bootstrap/src/mips64.rs               |  58 ++++
  drivers/common/src/dma.rs             |   3 +
- drivers/net/driver-network/src/lib.rs |  45 +++-
+ drivers/net/driver-network/src/lib.rs |  45 ++-
  netstack/Cargo.toml                   |   4 +
- netstack/src/link/ethernet.rs         | 205 ++++++++++++---
+ netstack/src/link/ethernet.rs         | 205 +++++++++++--
  netstack/src/link/mod.rs              |  12 +
- netstack/src/link/seeq.rs             | 355 ++++++++++++++++++++++++++
- netstack/src/main.rs                  |  80 +++++-
+ netstack/src/link/seeq.rs             | 415 ++++++++++++++++++++++++++
+ netstack/src/main.rs                  |  80 ++++-
  netstack/src/router/mod.rs            |  18 ++
- netstack/src/scheme/mod.rs            |  47 +++-
- netstack/src/scheme/tcp.rs            |  19 +-
- 19 files changed, 970 insertions(+), 141 deletions(-)
+ netstack/src/scheme/mod.rs            |  47 ++-
+ netstack/src/scheme/tcp.rs            |   5 +-
+ 19 files changed, 1018 insertions(+), 139 deletions(-)
  create mode 100644 bootstrap/src/mips64.ld
  create mode 100644 bootstrap/src/mips64.rs
  create mode 100644 netstack/src/link/seeq.rs
@@ -1322,10 +1322,10 @@ index e36e331..cfb2338 100644
  
 diff --git a/netstack/src/link/seeq.rs b/netstack/src/link/seeq.rs
 new file mode 100644
-index 0000000..46c46db
+index 0000000..7ee3164
 --- /dev/null
 +++ b/netstack/src/link/seeq.rs
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,415 @@
 +//! Seeq 8003 Ethernet on the SGI Indy, driven from inside the network stack.
 +//!
 +//! The controller sits behind the HPC3, which moves frames with two DMA
@@ -1398,6 +1398,11 @@ index 0000000..46c46db
 +/// Receive slots. The network stack advertises a 32 KiB TCP window, 23 full
 +/// frames, so a burst fits with room for other traffic.
 +const RX_RING: usize = 32;
++/// Transmit slots. A frame is queued behind the ones still leaving: on
++/// half-duplex Ethernet an acknowledgement waits for a gap in the incoming
++/// stream, about a frame time, and waiting for it in a loop was most of the
++/// stack's CPU time during a transfer.
++const TX_RING: usize = 8;
 +const BUF_SIZE: usize = 2048;
 +const MIN_FRAME: usize = 60;
 +const MAX_FRAME: usize = 1514;
@@ -1420,8 +1425,14 @@ index 0000000..46c46db
 +    rx_i: usize,
 +    /// Descriptor that currently carries the end-of-ring mark.
 +    rx_eox: usize,
-+    tx_desc: Dma<[Desc; 1]>,
-+    tx_buf: Dma<[u8; BUF_SIZE]>,
++    tx_ring: Dma<[Desc; TX_RING]>,
++    tx_bufs: Dma<[u8; TX_RING * BUF_SIZE]>,
++    /// Next transmit slot to fill.
++    tx_head: usize,
++    /// Oldest slot HPC3 has not marked as sent.
++    tx_tail: usize,
++    /// Frames dropped because every transmit slot was taken.
++    pub tx_dropped: u64,
 +    mac: [u8; 6],
 +}
 +
@@ -1492,8 +1503,11 @@ index 0000000..46c46db
 +            rx_bufs: Dma::zeroed().map_err(map_err)?.assume_init(),
 +            rx_i: 0,
 +            rx_eox: RX_RING - 1,
-+            tx_desc: Dma::zeroed().map_err(map_err)?.assume_init(),
-+            tx_buf: Dma::zeroed().map_err(map_err)?.assume_init(),
++            tx_ring: Dma::zeroed().map_err(map_err)?.assume_init(),
++            tx_bufs: Dma::zeroed().map_err(map_err)?.assume_init(),
++            tx_head: 0,
++            tx_tail: 0,
++            tx_dropped: 0,
 +            mac,
 +        };
 +        device.init();
@@ -1550,6 +1564,7 @@ index 0000000..46c46db
 +    /// Timer tick: restart the receive channel if it stopped at the end of
 +    /// the ring while descriptors are free again.
 +    pub fn poll(&mut self) {
++        self.tx_kick();
 +        unsafe {
 +            if self.enet_read(RX_CTRL) & CTRL_ACTIVE == 0
 +                && self.rx_cntinfo(self.rx_i) & DESC_OWN != 0
@@ -1558,6 +1573,33 @@ index 0000000..46c46db
 +                    self.rx_ring.physical() as u32 + (self.rx_i * size_of::<Desc>()) as u32;
 +                self.enet_write(RX_NDPTR, phys);
 +                self.enet_write(RX_CTRL, CTRL_ACTIVE);
++            }
++        }
++    }
++
++    /// Step past the transmit slots HPC3 has marked as sent.
++    fn tx_reclaim(&mut self) {
++        while self.tx_tail != self.tx_head {
++            let cntinfo = unsafe { read_volatile(&raw const self.tx_ring[self.tx_tail].cntinfo) };
++            if cntinfo & DESC_TXD == 0 {
++                break;
++            }
++            self.tx_tail = (self.tx_tail + 1) % TX_RING;
++        }
++    }
++
++    /// Start the transmit channel at the oldest unsent frame if it stopped.
++    fn tx_kick(&mut self) {
++        unsafe {
++            if self.enet_read(TX_CTRL) & CTRL_ACTIVE != 0 {
++                return;
++            }
++            self.tx_reclaim();
++            if self.tx_tail != self.tx_head {
++                let phys = self.tx_ring.physical() as u32
++                    + (self.tx_tail * size_of::<Desc>()) as u32;
++                self.enet_write(TX_NDPTR, phys);
++                self.enet_write(TX_CTRL, CTRL_ACTIVE);
 +            }
 +        }
 +    }
@@ -1647,36 +1689,54 @@ index 0000000..46c46db
 +            return Err(Error::new(EMSGSIZE));
 +        }
 +        unsafe {
-+            // One packet at a time: wait for the previous one to leave.
++            self.tx_reclaim();
++            // Every slot holds a frame that has not left. The wire is busy
++            // (half duplex: an incoming burst keeps our frames waiting), and
++            // waiting here stops the stack from reading that burst. Give the
++            // oldest frame a moment, then drop this one: TCP sends it again,
++            // and a dropped acknowledgement is covered by the next.
 +            let mut spins = 0u32;
-+            while self.enet_read(TX_CTRL) & CTRL_ACTIVE != 0 {
++            while (self.tx_head + 1) % TX_RING == self.tx_tail {
++                self.tx_kick();
 +                std::hint::spin_loop();
++                self.tx_reclaim();
 +                spins += 1;
-+                if spins > 5_000_000 {
-+                    return Err(Error::new(EIO));
++                if spins > 2_000 {
++                    self.tx_dropped += 1;
++                    return Ok(buf.len());
 +                }
 +            }
 +
++            let slot = self.tx_head;
 +            let len = buf.len().max(MIN_FRAME);
 +            let mut frame = Frame([0u8; BUF_SIZE]);
 +            frame.0[..buf.len()].copy_from_slice(buf);
 +            copy_words(
 +                frame.0.as_ptr().cast(),
-+                (&raw mut self.tx_buf[0]).cast(),
++                (&raw mut self.tx_bufs[slot * BUF_SIZE]).cast(),
 +                len.div_ceil(8),
 +            );
-+            self.tx_desc[0] = Desc {
-+                pbuf: self.tx_buf.physical() as u32,
-+                // No interrupt when the frame has left: the next send waits
-+                // on the channel's active bit, and an interrupt costs the
-+                // stack an event and three system calls.
++            // The new last frame of the chain. No interrupt when it has
++            // left: an interrupt costs the stack an event and three system
++            // calls, and nothing waits for it.
++            let next = (slot + 1) % TX_RING;
++            let ring_phys = self.tx_ring.physical() as u32;
++            self.tx_ring[slot] = Desc {
++                pbuf: self.tx_bufs.physical() as u32 + (slot * BUF_SIZE) as u32,
 +                cntinfo: len as u32 | DESC_EOP | DESC_EOX,
-+                pnext: 0,
++                pnext: ring_phys + (next * size_of::<Desc>()) as u32,
 +                _pad: 0,
 +            };
-+            let _ = DESC_TXD;
-+            self.enet_write(TX_NDPTR, self.tx_desc.physical() as u32);
-+            self.enet_write(TX_CTRL, CTRL_ACTIVE);
++            // Let HPC3 run on from the frame before, if that one is still
++            // queued. If HPC3 had already stopped there, the kick below
++            // starts it at the first frame it has not sent.
++            if slot != self.tx_tail {
++                let previous = (slot + TX_RING - 1) % TX_RING;
++                let value = read_volatile(&raw const self.tx_ring[previous].cntinfo);
++                write_volatile(&raw mut self.tx_ring[previous].cntinfo, value & !DESC_EOX);
++            }
++            self.tx_head = next;
++            self.tx_kick();
 +        }
 +        Ok(buf.len())
 +    }
@@ -1921,10 +1981,10 @@ index ce7e3db..dd1b17a 100644
  
      pub fn on_netcfg_scheme_event(&mut self) -> Result<()> {
 diff --git a/netstack/src/scheme/tcp.rs b/netstack/src/scheme/tcp.rs
-index 8949b6d..a92f199 100644
+index 8949b6d..0ed2765 100644
 --- a/netstack/src/scheme/tcp.rs
 +++ b/netstack/src/scheme/tcp.rs
-@@ -79,11 +79,19 @@ impl<'a> SchemeSocket for TcpSocket<'a> {
+@@ -79,7 +79,10 @@ impl<'a> SchemeSocket for TcpSocket<'a> {
              return Err(SyscallError::new(syscall::EACCES));
          }
  
@@ -1936,30 +1996,6 @@ index 8949b6d..a92f199 100644
          let tx_packets = vec![0; 0xffff];
          let rx_buffer = TcpSocketBuffer::new(rx_packets);
          let tx_buffer = TcpSocketBuffer::new(tx_packets);
--        let socket = TcpSocket::new(rx_buffer, tx_buffer);
-+        let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
-+        // Acknowledge at once. A delayed acknowledgement is sent by the
-+        // stack's timer, which is armed only by the timer event and up to
-+        // half a second ahead: a sender waiting for it (the last, partial
-+        // segment of a response) stalled for that long.
-+        socket.set_ack_delay(None);
- 
-         // TODO: claim port with ethernet ip address
-         if local_endpoint.port == 0 {
-@@ -232,7 +240,12 @@ impl<'a> SchemeSocket for TcpSocket<'a> {
-                     let tx_packets = vec![0; 0xffff];
-                     let rx_buffer = TcpSocketBuffer::new(rx_packets);
-                     let tx_buffer = TcpSocketBuffer::new(tx_packets);
--                    let socket = TcpSocket::new(rx_buffer, tx_buffer);
-+                    let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
-+        // Acknowledge at once. A delayed acknowledgement is sent by the
-+        // stack's timer, which is armed only by the timer event and up to
-+        // half a second ahead: a sender waiting for it (the last, partial
-+        // segment of a response) stalled for that long.
-+        socket.set_ack_delay(None);
-                     let new_socket_handle = socket_set.add(socket);
-                     {
-                         let tcp_socket = socket_set.get_mut::<TcpSocket>(new_socket_handle);
 -- 
 2.56.0
 
