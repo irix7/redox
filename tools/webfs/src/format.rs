@@ -1,10 +1,10 @@
-//! The store format, version 1.
+//! The store format, version 2 (version 1 named blobs by SHA-256).
 //!
 //! A store is a directory of static files under one base URL:
 //!
 //! ```text
-//! root                 "webfs1 <hex sha256 of the root directory blob> <unix time>\n"
-//! blob/ab/abcd...      one blob, named by the SHA-256 of its content
+//! root                 "webfs2 <hex hash of the root directory blob> <unix time>\n"
+//! blob/ab/abcd...      one blob, named by the BLAKE3 hash of its content
 //! ```
 //!
 //! A directory blob is text, one entry per line, sorted by name:
@@ -21,9 +21,7 @@
 //! Every blob is immutable, so a cache may keep it for ever. Only `root`
 //! changes when the tree is published again.
 
-use sha2::{Digest, Sha256};
-
-pub const MAGIC: &str = "webfs1";
+pub const MAGIC: &str = "webfs2";
 /// Piece size of a large file.
 pub const CHUNK: usize = 64 * 1024;
 /// Largest blob a client accepts: directory and list blobs are read whole.
@@ -32,8 +30,9 @@ pub const HASH_LEN: usize = 32;
 
 pub type Hash = [u8; HASH_LEN];
 
-pub fn sha256(data: &[u8]) -> Hash {
-    Sha256::digest(data).into()
+/// The name of a blob: the BLAKE3 hash of its content.
+pub fn hash(data: &[u8]) -> Hash {
+    *blake3::hash(data).as_bytes()
 }
 
 pub fn hex(hash: &Hash) -> String {
@@ -180,10 +179,10 @@ mod tests {
 
     #[test]
     fn hex_round_trip() {
-        let hash = sha256(b"abc");
+        let hash = hash(b"abc");
         assert_eq!(
             hex(&hash),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
         );
         assert_eq!(parse_hex(&hex(&hash)), Some(hash));
         assert_eq!(parse_hex("zz"), None);
@@ -195,7 +194,7 @@ mod tests {
             kind,
             mode: 0o644,
             size: 3,
-            hash: sha256(name.as_bytes()),
+            hash: hash(name.as_bytes()),
             name: name.to_string(),
         };
         let blob = encode_dir(&[entry("b c", Kind::File), entry("a", Kind::Dir)]);
@@ -215,7 +214,7 @@ mod tests {
     #[test]
     fn root_round_trip() {
         let root = Root {
-            hash: sha256(b""),
+            hash: hash(b""),
             time: 1_800_000_000,
         };
         assert_eq!(parse_root(&encode_root(&root)), Some(root));

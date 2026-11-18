@@ -7,14 +7,14 @@ iris. On the real Indy the root is mounted over plain HTTP from the build host. 
 client reaches Cloudflare from the real machine (see TLS), but no store is published
 through the tunnel yet, so the root has not been mounted over HTTPS.
 
-## Store format (version 1)
+## Store format (version 2)
 
 A store is a directory of static files under one base URL.
 
 | Path | Content |
 |---|---|
-| `root` | `webfs1 <hex SHA-256 of the root directory blob> <unix time>` |
-| `blob/ab/abcd…` | one blob, named by the SHA-256 of its content |
+| `root` | `webfs2 <hex BLAKE3 hash of the root directory blob> <unix time>` |
+| `blob/ab/abcd…` | one blob, named by the BLAKE3 hash of its content (32 bytes) |
 
 A directory blob is text, one line per entry, sorted by name:
 `<d|f|l> <mode, octal> <size> <hex hash> <name>`. A file of at most 64 KiB is one blob. A
@@ -22,6 +22,10 @@ larger file is cut into 64 KiB pieces and its hash names a list blob holding the
 piece hashes. A symbolic link's blob holds its target. Modes are normalised to 644, 755
 (executables and directories) and 777 (links); owner is 0. Every file reports the pack
 time as its modification time.
+
+Version 1 named blobs by SHA-256, which the Indy's R4600 computes at about 2 MB/s: half of
+the client's time in a read. A client refuses a root of another version, and a store
+packed again holds the old version's blobs until it is pruned.
 
 Blobs never change, so a cache can keep them for a year. Only `root` changes when a tree
 is published again. The client checks each blob against its name, so a wrong or stale

@@ -6,6 +6,10 @@ description = "Read-only filesystem served as content-addressed blobs over HTTP 
 license = "MIT"
 
 [dependencies]
+# Blob names. BLAKE3 in portable Rust: the Indy's R4600 hashes about 2 MB/s
+# with SHA-256, which was half of the client's time in a read.
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+# TLS and certificate checks.
 sha2 = { version = "0.10", default-features = false }
 embedded-tls = { version = "0.19", default-features = false, features = ["std", "alloc"] }
 embedded-io = { version = "0.7", features = ["std"] }

@@ -54,7 +54,7 @@ fn read_full(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
 
 impl Packer<'_> {
     fn put(&mut self, data: &[u8]) -> io::Result<Hash> {
-        let hash = format::sha256(data);
+        let hash = format::hash(data);
         let path = self.out.join(format::blob_path(&hash));
         if path.exists() {
             self.stats.blobs_present += 1;

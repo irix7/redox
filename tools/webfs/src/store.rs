@@ -157,7 +157,7 @@ impl Store {
     fn fetch_root(&self) -> Result<Root> {
         let data = self.get("root", 256)?;
         let root = format::parse_root(&data)
-            .ok_or_else(|| Error::Io("the root file is not a webfs1 root".into()))?;
+            .ok_or_else(|| Error::Io("the root file is not a webfs2 root".into()))?;
         if self.pinned.is_some_and(|pinned| pinned != root.hash) {
             return Err(Error::Io("the root hash differs from the pinned one".into()));
         }
@@ -202,7 +202,7 @@ impl Store {
         // Two threads that miss on the same blob both fetch it; the second
         // insert replaces the first.
         let data = self.get(&format::blob_path(hash), MAX_BLOB)?;
-        if format::sha256(&data) != *hash {
+        if format::hash(&data) != *hash {
             return Err(Error::Io(format!("blob {} does not match its name", format::hex(hash))));
         }
         let blob: Arc<[u8]> = data.into();

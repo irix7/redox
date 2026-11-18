@@ -146,7 +146,7 @@ mod tests {
             root_max_age: 60,
             log: false,
         };
-        let name = format::hex(&format::sha256(b"x"));
+        let name = format::hex(&format::hash(b"x"));
         let good = format!("/blob/{}/{name}", &name[..2]);
         assert!(route(&config, &good).unwrap().1.contains("immutable"));
         assert_eq!(route(&config, "/root?x=1").unwrap().1, "public, max-age=60");
