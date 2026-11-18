@@ -1,0 +1,8 @@
+[unit]
+description = "Login on the console"
+requires_weak = ["00_ptyd.service", "05_dirs.service"]
+
+[service]
+cmd = "getty"
+args = ["/scheme/debug/no-preserve", "-J"]
+type = "oneshot_async"

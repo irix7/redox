@@ -24,7 +24,9 @@ pub enum Error {
     NotDir,
     IsDir,
     Loop,
-    CrossScheme,
+    /// A link into another scheme; holds the target with the rest of the
+    /// path appended.
+    CrossScheme(String),
     /// The store or the network failed; the text says how.
     Io(String),
 }
@@ -42,7 +44,7 @@ impl std::fmt::Display for Error {
             Error::NotDir => f.write_str("not a directory"),
             Error::IsDir => f.write_str("is a directory"),
             Error::Loop => f.write_str("too many symbolic links"),
-            Error::CrossScheme => f.write_str("symbolic link into another scheme"),
+            Error::CrossScheme(_) => f.write_str("symbolic link into another scheme"),
             Error::Io(text) => f.write_str(text),
         }
     }
@@ -253,7 +255,12 @@ impl Store {
                 // is not ours to follow: the caller reads the link and opens
                 // the target itself.
                 if target.starts_with("/scheme/") {
-                    return Err(Error::CrossScheme);
+                    let mut outside = target.trim_end_matches('/').to_string();
+                    for rest in todo.iter().filter(|p| !p.is_empty() && *p != ".") {
+                        outside.push('/');
+                        outside.push_str(rest);
+                    }
+                    return Err(Error::CrossScheme(outside));
                 }
                 if target.starts_with('/') {
                     stack.truncate(1);

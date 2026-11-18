@@ -1,0 +1,54 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index e3f8241..93dc604 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -169,9 +169,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "libc"
+-version = "0.2.190"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
++version = "0.2.191"
+ 
+ [[package]]
+ name = "libredox"
+@@ -253,8 +251,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "redox_syscall"
+-version = "0.9.4"
+-source = "git+https://gitlab.redox-os.org/redox-os/kernel.git#260f55f076d2fe62c03ec30c1378ca7546336c73"
++version = "0.9.6"
+ dependencies = [
+  "bitflags 2.13.2",
+ ]
+@@ -535,3 +532,7 @@ dependencies = [
+  "quote",
+  "syn 2.0.119",
+ ]
++
++[[patch.unused]]
++name = "redox_syscall"
++version = "0.5.11"
+diff --git a/src/lib.rs b/src/lib.rs
+index c49b6e5..8475583 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -73,6 +73,16 @@ impl AllGroupsExt for AllGroups {
+ pub fn spawn_shell<T: Default>(user: &User<T>) -> IoResult<i32> {
+     let mut command = user.shell_cmd();
+ 
++    // Indy port: replace this process with the shell. A program is a private
++    // static image of a megabyte or more, and the machine has 32 MiB: a
++    // login waiting behind every shell is memory the shell needs.
++    #[cfg(target_arch = "mips64")]
++    {
++        use std::os::unix::process::CommandExt;
++        return Err(command.exec());
++    }
++
++    #[allow(unreachable_code)]
+     let mut child = command.spawn()?;
+     match child.wait()?.code() {
+         Some(code) => Ok(code),

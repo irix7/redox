@@ -1,0 +1,1 @@
+The root filesystem is read-only. /tmp, /root, /home and /var are in RAM.

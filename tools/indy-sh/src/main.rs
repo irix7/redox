@@ -134,7 +134,7 @@ fn run(line: &str, out: &mut dyn Write) -> bool {
             let text = String::from_utf8_lossy(&log);
             let lines: Vec<&str> = text.lines().collect();
             let start = lines.iter().rposition(|l| l.contains("Indy: cache:")).unwrap_or(0);
-            for line in &lines[start.saturating_sub(9)..=start.min(lines.len().saturating_sub(1))] {
+            for line in &lines[start.saturating_sub(10)..=start.min(lines.len().saturating_sub(1))] {
                 if line.contains("Indy: ") {
                     let _ = writeln!(out, "{line}\r");
                 }
@@ -272,8 +272,24 @@ fn reporter() {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `indy-sh mkdir DIR...`: make the directories of the RAM filesystem at
+    // boot, before a login needs a home directory.
+    if args.first().map(String::as_str) == Some("mkdir") {
+        for dir in &args[1..] {
+            if let Err(err) = fs::create_dir_all(dir) {
+                println!("indy-sh: mkdir {dir}: {err}\r");
+            }
+        }
+        return;
+    }
     println!("REDOX-INDY-SH: hello from std on the Indy\r");
     thread::spawn(reporter);
+    // `indy-sh --tcp`: serve port 23 only. The console belongs to getty.
+    if args.first().map(String::as_str) == Some("--tcp") {
+        tcp_server();
+        return;
+    }
     thread::spawn(tcp_server);
     let mut stdin = std::io::stdin();
     let mut stdout = std::io::stdout();

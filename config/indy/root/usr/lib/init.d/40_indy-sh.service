@@ -1,0 +1,8 @@
+[unit]
+description = "Bring-up shell on TCP port 23: maintenance and reboot"
+requires_weak = ["00_nulld.service"]
+
+[service]
+cmd = "indy-sh"
+args = ["--tcp"]
+type = "oneshot_async"

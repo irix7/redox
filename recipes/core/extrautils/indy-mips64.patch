@@ -1,0 +1,102 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index d150f40..979ad48 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -240,9 +240,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+ 
+ [[package]]
+ name = "libc"
+-version = "0.2.174"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1171693293099992e19cddea4e8b849964e9846f4acee11b3948bcc337be8776"
++version = "0.2.191"
+ 
+ [[package]]
+ name = "libflate"
+@@ -412,9 +410,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "redox_syscall"
+-version = "0.5.15"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7e8af0dde094006011e6a740d4879319439489813bd0bcdc7d821beaeeff48ec"
++version = "0.5.11"
+ dependencies = [
+  "bitflags 2.9.1",
+ ]
+@@ -783,3 +779,7 @@ dependencies = [
+  "podio",
+  "time",
+ ]
++
++[[patch.unused]]
++name = "redox_syscall"
++version = "0.9.6"
+diff --git a/Cargo.toml b/Cargo.toml
+index 4eb3a88..d76b386 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -76,12 +76,15 @@ libredox = "0.1"
+ tar = { version = "0.4.27", default-features = false }
+ filetime = { git = "https://github.com/jackpot51/filetime.git" }
+ termion = "4"
+-rust-lzma = {version = "0.6", features = []}
+-bzip2 = "0.3"
++rust-lzma = {version = "0.6", features = [], optional = true}
++bzip2 = { version = "0.3", optional = true }
+ zip = "0.3"
+ 
+ [features]
+-default = []
++# xz and bz2 need C libraries; a build without them reads plain and gzip tar.
++default = ["xz", "bz2"]
++xz = ["rust-lzma"]
++bz2 = ["bzip2"]
+ static = [ "rust-lzma/static" ]
+ 
+ [dev-dependencies]
+diff --git a/src/bin/tar.rs b/src/bin/tar.rs
+index bafd9ff..f8fc1b3 100644
+--- a/src/bin/tar.rs
++++ b/src/bin/tar.rs
+@@ -1,6 +1,8 @@
++#[cfg(feature = "bz2")]
+ extern crate bzip2;
+ extern crate filetime;
+ extern crate libflate;
++#[cfg(feature = "xz")]
+ extern crate lzma;
+ extern crate tar;
+ 
+@@ -11,9 +13,11 @@ use std::path::{Path, PathBuf};
+ use std::str::FromStr;
+ use std::{env, process};
+ 
++#[cfg(feature = "bz2")]
+ use bzip2::read::BzDecoder;
+ use filetime::FileTime;
+ use libflate::gzip::Decoder as GzipDecoder;
++#[cfg(feature = "xz")]
+ use lzma::LzmaReader;
+ use tar::{Archive, Builder, EntryType};
+ 
+@@ -142,6 +146,9 @@ fn extract(tar: &Path, verbose: bool, strip: usize) -> Result<()> {
+         file.read_exact(&mut magic)?;
+         file.rewind()?;
+         if magic == [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00] {
++            #[cfg(not(feature = "xz"))]
++            return Err(Error::new(ErrorKind::Other, "built without xz support"));
++            #[cfg(feature = "xz")]
+             extract_inner(
+                 &mut Archive::new(
+                     LzmaReader::new_decompressor(file)
+@@ -159,6 +166,9 @@ fn extract(tar: &Path, verbose: bool, strip: usize) -> Result<()> {
+                 strip,
+             )
+         } else if &magic[..2] == b"BZ" {
++            #[cfg(not(feature = "bz2"))]
++            return Err(Error::new(ErrorKind::Other, "built without bzip2 support"));
++            #[cfg(feature = "bz2")]
+             extract_inner(&mut Archive::new(BzDecoder::new(file)), verbose, strip)
+         } else {
+             extract_inner(&mut Archive::new(file), verbose, strip)

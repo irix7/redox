@@ -33,6 +33,10 @@ struct Handle {
     /// Path from the root of the tree, without a leading slash.
     path: String,
     entry: Entry,
+    /// Set when the path crosses a link into another scheme before its last
+    /// component (`/tmp/x` with `/tmp` -> `/scheme/tmp`): the path outside,
+    /// which `fpath` reports.
+    outside: Option<String>,
 }
 
 /// Worker stack: the TLS handshake and RSA-4096 checks keep their buffers
@@ -58,7 +62,7 @@ fn errno(err: store::Error) -> Error {
         store::Error::NotDir => ENOTDIR,
         store::Error::IsDir => EISDIR,
         store::Error::Loop => ELOOP,
-        store::Error::CrossScheme => EXDEV,
+        store::Error::CrossScheme(_) => EXDEV,
         store::Error::Io(text) => {
             eprintln!("webfs: {text}");
             EIO
@@ -174,12 +178,26 @@ impl SchemeSync for WebScheme {
         // Resolve before refusing a write: a link into another scheme
         // (`/dev/null`) must answer EXDEV so the caller opens the target,
         // which may well be writable.
+        let mut outside = None;
         let entry = match self.shared.store.resolve(&full, follow) {
             Ok(entry) => entry,
+            // relibc reads a link by opening it with O_SYMLINK and asking for
+            // its path. Answer for a link in the middle of the path as well.
+            Err(store::Error::CrossScheme(target)) if flags & O_SYMLINK != 0 => {
+                let entry = Entry {
+                    kind: Kind::Link,
+                    mode: 0o777,
+                    size: target.len() as u64,
+                    hash: Default::default(),
+                    name: String::new(),
+                };
+                outside = Some(target);
+                entry
+            }
             Err(store::Error::NotFound) if write => return Err(Error::new(EROFS)),
             Err(err) => return Err(errno(err)),
         };
-        if write {
+        if write && outside.is_none() {
             return Err(Error::new(EROFS));
         }
         if flags & O_DIRECTORY != 0 && entry.kind != Kind::Dir {
@@ -192,6 +210,7 @@ impl SchemeSync for WebScheme {
             Handle {
                 path: path.join("/"),
                 entry,
+                outside,
             },
         );
         Ok(OpenResult::ThisScheme {
@@ -235,6 +254,13 @@ impl SchemeSync for WebScheme {
         // relibc follows a link into another scheme by opening the link
         // itself and asking for its path: answer with the target.
         let entry = self.entry(id)?;
+        let outside = self.handles().get(&id).and_then(|handle| handle.outside.clone());
+        if let Some(target) = outside {
+            let bytes = target.as_bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            return Ok(n);
+        }
         if entry.kind == Kind::Link {
             let target = self.shared.store.target(&entry).map_err(errno)?;
             if target.starts_with("/scheme/") {

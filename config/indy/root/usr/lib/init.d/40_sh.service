@@ -1,7 +1,0 @@
-[unit]
-description = "Bring-up shell on the console and TCP port 23"
-requires_weak = ["00_nulld.service"]
-
-[service]
-cmd = "sh"
-type = "oneshot_async"

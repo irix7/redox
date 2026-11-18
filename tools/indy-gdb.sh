@@ -13,6 +13,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GDB="${GDB:-/mnt/europa/toolchains/mips64-n32--uclibc--stable-2026.08-1/bin/mips64-linux-gdb}"
 HOST="${INDY_HOST:-10.1.1.112}"
+# kdbg is not started at boot (it would hold about 1.5 MiB): ask the
+# maintenance shell on port 23 to run it. A second copy fails to bind and exits.
+if exec 3<>"/dev/tcp/$HOST/23"; then
+  printf 'kdbg\r\n' >&3
+  sleep "${KDBG_WAIT:-10}"
+  exec 3>&-
+fi
 # -readnow: without it this GDB finds no line for most kernel addresses.
 exec "$GDB" -q -readnow "$ROOT/build/indy/kernel/kernel.all" \
   -ex 'set confirm off' -ex 'set pagination off' \

@@ -2,6 +2,7 @@
 # with `boot -f bootp()redox`. Independent of ARCH and of the disk image path.
 #
 #   make indy            build build/indy/redox (ECOFF): kernel and initfs
+#   make indy-userland   build the userland programs (tools/indy-userland.sh)
 #   make indy-root       build the root tree and pack it into the webfs store
 #   make indy-gate       boot it on a 32 MiB emulated Indy and assert the marker
 #   make indy-netboot    copy it to INDY_TFTP_DIR (default /var/lib/sgi-netboot)
@@ -82,9 +83,9 @@ $(INIT_ELF): $(SYSROOT)/lib/libc.a $(wildcard tools/indy-sh/src/*.rs) tools/indy
 	cd tools/indy-sh && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) __CARGO_TESTS_ONLY_SRC_ROOT=$(RUST_SRC) cargo build --release
 
 # Base programs for the target (tools/base-indy.sh): init, the Seeq driver and
-# the network stack go in the initfs; dhcpd and zerod go in the root store.
-BASE_BINS=init randd seeqd netstack dhcpd zerod
-ROOT_BINS=dhcpd zerod
+# the network stack go in the initfs; the others go in the root store.
+ROOT_BINS=dhcpd zerod ipcd ptyd ramfs getty
+BASE_BINS=init randd seeqd netstack $(ROOT_BINS)
 BASE_OUT=$(BASE_SOURCE)/target/mips64-sgi-redox/release
 
 $(BASE_OUT)/init: $(SYSROOT)/lib/libc.a FORCE
@@ -130,14 +131,32 @@ $(INDY_BUILD)/redox-gate: $(IMAGE_DEPS)
 
 indy: $(INDY_BUILD)/redox
 
+# The userland programs (tools/indy-userland.sh): ion, the core utilities,
+# login, network tools, an editor. The build takes about an hour from
+# nothing and 25 minutes to relink, so it runs once; `make indy-userland`
+# runs it again.
+USERLAND_DIR=$(INDY_BUILD)/userland
+USERLAND_STAMP=$(USERLAND_DIR)/.built
+
+# libc.a is order-only here: its rule runs every time, and a relink of every
+# program takes 25 minutes. After a relibc change run `make indy-userland`.
+$(USERLAND_STAMP): | $(SYSROOT)/lib/libc.a
+	tools/indy-userland.sh
+	touch $@
+
+indy-userland: $(SYSROOT)/lib/libc.a
+	tools/indy-userland.sh
+	touch $(USERLAND_STAMP)
+
 # The root tree: config/indy/root plus the programs, packed into the store.
 # Packing is incremental and only `root` changes for clients.
-indy-root: $(WEBFS_HOST) $(WEBFS_ELF) $(INIT_ELF) $(KDBG_ELF) $(BASE_OUT)/init
+indy-root: $(WEBFS_HOST) $(WEBFS_ELF) $(INIT_ELF) $(KDBG_ELF) $(BASE_OUT)/init $(USERLAND_STAMP)
 	rm -rf $(ROOT_DIR)
 	mkdir -p $(ROOT_DIR)/usr/bin
 	cp -r config/indy/root/. $(ROOT_DIR)/
+	cp -r $(USERLAND_DIR)/usr $(ROOT_DIR)/
 	for bin in $(ROOT_BINS); do install -m 0755 $(BASE_OUT)/$$bin $(ROOT_DIR)/usr/bin/$$bin; done
-	install -m 0755 $(INIT_ELF) $(ROOT_DIR)/usr/bin/sh
+	install -m 0755 $(INIT_ELF) $(ROOT_DIR)/usr/bin/indy-sh
 	install -m 0755 $(KDBG_ELF) $(ROOT_DIR)/usr/bin/kdbg
 	install -m 0755 $(WEBFS_ELF) $(ROOT_DIR)/usr/bin/webfs
 	ln -s usr/bin $(ROOT_DIR)/bin
@@ -156,4 +175,4 @@ indy-netboot: $(INDY_BUILD)/redox
 indy-webfs-gate: $(WEBFS_HOST) $(INDY_BUILD)/redox-gate indy-root
 	ROOT_STORE=$(CURDIR)/$(INDY_STORE) ROOT_PORT=$(GATE_ROOT_PORT) tools/webfs-gate.sh
 
-.PHONY: webfs indy-webfs-gate indy indy-root indy-gate indy-netboot indy-probe indy-probe-gate
+.PHONY: webfs indy-webfs-gate indy indy-userland indy-root indy-gate indy-netboot indy-probe indy-probe-gate

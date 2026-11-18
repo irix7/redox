@@ -1,0 +1,11 @@
+[user_schemes.root]
+schemes = ["*"]
+[user_schemes.user]
+schemes = [
+  "debug", "event", "memory", "pipe", "time", "sys",
+  "rand", "null", "zero",
+  "ip", "icmp", "tcp", "udp", "netcfg",
+  "shm", "chan",
+  "file", "tmp",
+  "proc", "pty",
+]

@@ -1,4 +1,4 @@
-From 582c11db8645b5428c05f2d8d6c927cd9cf251a1 Mon Sep 17 00:00:00 2001
+From 0b6ad33333303d7c4d56825696ad8780dc69a4d9 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -33,7 +33,7 @@ Signed-off-by: belikh <io@belic.net>
  rmm/src/arch/mips.rs                   | 247 ++++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
- src/arch/mips64/cache.rs               | 460 +++++++++++++++
+ src/arch/mips64/cache.rs               | 469 +++++++++++++++
  src/arch/mips64/consts.rs              |  24 +
  src/arch/mips64/cp0.rs                 | 112 ++++
  src/arch/mips64/debug.rs               |  24 +
@@ -41,7 +41,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/device/cpu/mod.rs      |  11 +
  src/arch/mips64/device/mod.rs          |  24 +
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 753 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 765 +++++++++++++++++++++++++
  src/arch/mips64/interrupt/handler.rs   | 396 +++++++++++++
  src/arch/mips64/interrupt/irq.rs       |  90 +++
  src/arch/mips64/interrupt/mod.rs       |  47 ++
@@ -59,10 +59,10 @@ Signed-off-by: belikh <io@belic.net>
  src/context/memory.rs                  |  44 +-
  src/context/mod.rs                     |   4 +
  src/devices/mod.rs                     |   2 +
- src/devices/serial.rs                  |  13 +
+ src/devices/serial.rs                  |  19 +
  src/devices/uart_z85c30.rs             | 120 ++++
  src/main.rs                            |   1 +
- src/memory/mod.rs                      |   7 +-
+ src/memory/mod.rs                      |  15 +-
  src/panic.rs                           |  15 +
  src/scheme/irq.rs                      |   2 +
  src/scheme/proc.rs                     |   8 +-
@@ -74,7 +74,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 +
- 46 files changed, 4236 insertions(+), 17 deletions(-)
+ 46 files changed, 4270 insertions(+), 18 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -484,10 +484,10 @@ index 1f2c1a13..ccbee701 100644
  
 diff --git a/src/arch/mips64/cache.rs b/src/arch/mips64/cache.rs
 new file mode 100644
-index 00000000..972fd8af
+index 00000000..f5390a38
 --- /dev/null
 +++ b/src/arch/mips64/cache.rs
-@@ -0,0 +1,460 @@
+@@ -0,0 +1,469 @@
 +//! Primary cache coherence.
 +//!
 +//! The R4x00 and R5000 primary caches are indexed by virtual address, and a
@@ -876,6 +876,11 @@ index 00000000..972fd8af
 +        }
 +    }
 +    info!(
++        "Indy: console: {} firmware polls, {}k Count ticks",
++        STAT_PROM_POLLS.swap(0, Ordering::Relaxed),
++        STAT_PROM_TICKS.swap(0, Ordering::Relaxed) / 1000
++    );
++    info!(
 +        "Indy: events: {} switches, {} fast refills, {} TLB flushes;{}",
 +        STAT_SWITCHES.swap(0, Ordering::Relaxed),
 +        STAT_FAST_REFILLS.swap(0, Ordering::Relaxed),
@@ -948,6 +953,10 @@ index 00000000..972fd8af
 +/// A trap that blocks counts the time until its context runs again.
 +pub static STAT_TICKS: [AtomicUsize; 96] = [const { AtomicUsize::new(0) }; 96];
 +pub static STAT_TLB_FLUSHES: AtomicUsize = AtomicUsize::new(0);
++
++/// Firmware console polls (keyboard and mouse) and the Count ticks they took.
++pub static STAT_PROM_POLLS: AtomicUsize = AtomicUsize::new(0);
++pub static STAT_PROM_TICKS: AtomicUsize = AtomicUsize::new(0);
 diff --git a/src/arch/mips64/consts.rs b/src/arch/mips64/consts.rs
 new file mode 100644
 index 00000000..947305d1
@@ -1439,10 +1448,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..f447a113
+index 00000000..a88c653b
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,753 @@
+@@ -0,0 +1,765 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -1949,31 +1958,43 @@ index 00000000..f447a113
 +        // The console's receive side is polled from the tick: the serial
 +        // interrupt arrives through INT3's mappable lines, not routed yet.
 +        crate::arch::device::serial::COM1.lock().receive(&mut token);
-+        // The keyboard, through the PROM console, every fourth tick: the
-+        // firmware call runs with interrupts off and polls the controller.
-+        static KEYBOARD_DIVIDER: core::sync::atomic::AtomicU32 =
++        // Keyboard and mouse, through the PROM console. The firmware reads
++        // the IOC2 controller and moves its own pointer, one byte per call,
++        // so it is called on every tick for as long as the controller has
++        // data (status at 0xBFBD9847, bit 0: output buffer full), up to a
++        // dozen times; that keeps the pointer moving at the rate the mouse
++        // reports. Once a second it is called regardless, in case the status
++        // test is wrong for some PROM.
++        static KEYBOARD_TICK: core::sync::atomic::AtomicU32 =
 +            core::sync::atomic::AtomicU32::new(0);
-+        // A firmware poll costs about 3 ms with interrupts off, so it only
-+        // runs when the keyboard controller (IOC2, status at 0xBFBD9847,
-+        // bit 0: output buffer full) has something, and once a second
-+        // regardless in case that test is wrong for some PROM.
 +        const KEYBOARD_STATUS: *const u8 = 0xBFBD_9847 as *const u8;
-+        let tick = KEYBOARD_DIVIDER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-+        let waiting = unsafe { KEYBOARD_STATUS.read_volatile() } & 1 != 0;
-+        if tick % 4 == 0 && (waiting || tick % 100 == 0) {
++        let tick = KEYBOARD_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++        let waiting = || unsafe { KEYBOARD_STATUS.read_volatile() } & 1 != 0;
++        if waiting() || tick % 100 == 0 {
++            let started = cp0::read_count();
 +            let console = crate::arch::device::serial::COM1.lock();
 +            let mut any = false;
-+            for _ in 0..8 {
-+                let Some(byte) = crate::arch::device::arcs::read_byte() else {
++            let mut polls = 0;
++            loop {
++                polls += 1;
++                if let Some(byte) = crate::arch::device::arcs::read_byte() {
++                    crate::scheme::debug::debug_input(byte, &mut token);
++                    any = true;
++                }
++                if polls >= 12 || !waiting() {
 +                    break;
-+                };
-+                crate::scheme::debug::debug_input(byte, &mut token);
-+                any = true;
++                }
 +            }
 +            drop(console);
 +            if any {
 +                crate::scheme::debug::debug_notify(&mut token);
 +            }
++            crate::arch::cache::STAT_PROM_POLLS
++                .fetch_add(polls, core::sync::atomic::Ordering::Relaxed);
++            crate::arch::cache::STAT_PROM_TICKS.fetch_add(
++                cp0::read_count().wrapping_sub(started) as usize,
++                core::sync::atomic::Ordering::Relaxed,
++            );
 +        }
 +        crate::context::timeout::trigger(&mut token);
 +        crate::context::switch::tick(&mut token);
@@ -3956,7 +3977,7 @@ index dc475689..d1a3104b 100644
 +#[cfg(target_arch = "mips64")]
 +pub mod uart_z85c30;
 diff --git a/src/devices/serial.rs b/src/devices/serial.rs
-index 1b3435dc..8e0ad399 100644
+index 1b3435dc..5b4d026a 100644
 --- a/src/devices/serial.rs
 +++ b/src/devices/serial.rs
 @@ -2,6 +2,8 @@ use syscall::MmioPtr;
@@ -3977,21 +3998,27 @@ index 1b3435dc..8e0ad399 100644
  }
  
  impl SerialKind {
-@@ -68,6 +72,13 @@ impl SerialKind {
+@@ -68,6 +72,19 @@ impl SerialKind {
              }
              Self::Meson(inner) => inner.receive(token),
              Self::Pl011(inner) => inner.receive(token),
 +            #[cfg(target_arch = "mips64")]
 +            Self::Z85c30(inner) => {
++                // Polled from the timer tick: notify readers only when a
++                // byte arrived, or every reader wakes on every tick.
++                let mut any = false;
 +                while let Some(c) = inner.receive() {
 +                    debug_input(c, token);
++                    any = true;
 +                }
-+                debug_notify(token);
++                if any {
++                    debug_notify(token);
++                }
 +            }
          }
      }
  
-@@ -80,6 +91,8 @@ impl SerialKind {
+@@ -80,6 +97,8 @@ impl SerialKind {
              Self::Ns16550u32(inner) => inner.write(buf),
              Self::Meson(inner) => inner.write(buf),
              Self::Pl011(inner) => inner.write(buf),
@@ -4139,7 +4166,7 @@ index a29621fa..3f05f23d 100644
  #![feature(sync_unsafe_cell)]
  #![feature(btree_cursors)]
 diff --git a/src/memory/mod.rs b/src/memory/mod.rs
-index eddfa494..3a5ca425 100644
+index eddfa494..87898dd4 100644
 --- a/src/memory/mod.rs
 +++ b/src/memory/mod.rs
 @@ -142,7 +142,12 @@ pub fn allocate_p2frame(order: u32, must_be_zero: bool) -> Option<Frame> {
@@ -4156,6 +4183,21 @@ index eddfa494..3a5ca425 100644
  }
  
  // TODO: Flags, strategy
+@@ -1412,7 +1417,13 @@ pub fn page_fault_handler(
+         let mut token = unsafe { CleanLockToken::new() };
+         match context::memory::try_correcting_page_tables(faulting_page, mode, &mut token) {
+             Ok(()) => return Ok(()),
+-            Err(PfError::Oom) => todo!("oom"),
++            // Out of frames: fail this fault. A fault from user mode kills
++            // the process, which returns its memory; a usercopy fault makes
++            // the syscall fail with EFAULT. Upstream has `todo!("oom")` here,
++            // a kernel panic.
++            Err(PfError::Oom) => {
++                warn!("out of memory: page fault at {:#x} not served", faulting_address.data());
++            }
+             Err(PfError::Segv | PfError::RecursionLimitExceeded) => (),
+             Err(PfError::NonfatalInternalError) => todo!(),
+         }
 diff --git a/src/panic.rs b/src/panic.rs
 index ded62e62..45143468 100644
 --- a/src/panic.rs

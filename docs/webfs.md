@@ -3,8 +3,9 @@
 `tools/webfs` is one Rust crate with two builds. On the build host it packs a directory
 into a store and serves it. On the Indy it is the scheme daemon that mounts the store as
 the root filesystem (scheme `file`). `make indy-gate` and `make indy-webfs-gate` pass on
-iris, and the plain HTTP path runs on the real Indy. TLS has not run on the real machine
-or against Cloudflare from the guest.
+iris. On the real Indy the root is mounted over plain HTTP from the build host. The TLS
+client reaches Cloudflare from the real machine (see TLS), but no store is published
+through the tunnel yet, so the root has not been mounted over HTTPS.
 
 ## Store format (version 1)
 
@@ -81,15 +82,22 @@ tools/webfs/target/release/webfs serve build/indy/store --listen 0.0.0.0:8734
 | `INDY_ROOT_ARGS` | `--connect 10.1.1.3` | `webfs mount` options |
 | `INDY_STORE` | `build/indy/store` | where `make indy-root` packs the tree |
 
-The root tree is `config/indy/root` plus the programs: `usr/bin/{sh,dhcpd,zerod,webfs}`,
-`usr/lib/init.d` (null and zero devices, dhcpd, the shell) and `dev/{null,zero,random,
-urandom}`, links to `/scheme/null` and so on. A changed program needs `make indy-root`
-and a reboot; the netboot image only changes when the kernel or the five initfs
-programs do.
+The root tree is `config/indy/root` plus the programs: the base daemons (`dhcpd`,
+`zerod`, `ipcd`, `ptyd`, `ramfs`, `getty`), `indy-sh`, `kdbg`, `webfs` and the userland
+staged by `tools/indy-userland.sh` in `build/indy/userland`. `config/indy/root` holds
+`usr/lib/init.d` (null and zero devices, PTYs, the RAM filesystem, dhcpd, the console
+login, the maintenance shell on TCP port 23), `etc` (`passwd`, `group`, `shadow`,
+`login_schemes.toml`, `hostname`) and links that leave the read-only store:
+`dev/{null,zero,random,urandom,ptmx}`, `etc/net/dns`, and `tmp`, `root`, `home` and
+`var`, which point into the RAM filesystem at `/scheme/tmp`. A changed program needs
+`make indy-root` and a reboot; the netboot image only changes when the kernel or the
+five initfs programs do.
 
 A link whose target starts with `/scheme/` leaves the store. `open` answers `EXDEV` and
 `fpath` on the link itself (opened with `O_SYMLINK`) returns the target, which is how
-relibc follows `/dev/null`.
+relibc follows `/dev/null`. The link may be in the middle of a path (`/tmp/x` with
+`/tmp` -> `/scheme/tmp/tmp`): the same `O_SYMLINK` open then reports the target with the
+rest of the path appended (`/scheme/tmp/tmp/x`).
 
 Status 2026-11-18 on the real Indy (R4600, 32 MiB): the store mounts as the root, files
 of 46 bytes to 2 MiB read back with the right CRC-32, and programs run from `/usr/bin`.
@@ -125,6 +133,10 @@ The client is `embedded-tls` 0.19: TLS 1.3, `TLS_AES_128_GCM_SHA256`, P-256 key 
 and RSA-PSS in the handshake, host name against `subjectAltName`, CA flag on
 intermediates. Four roots are compiled in: ISRG Root X1 and X2, GTS Root R1 and R4
 (`tools/webfs/roots/`, taken from the host CA bundle on 2026-11-17).
+
+2026-11-18 on the real Indy (R4600PC 133 MHz): `webfs get
+https://www.cloudflare.com/cdn-cgi/trace` returns status 200. The first request takes
+5.7 s (name lookup, connect and handshake); the second, on the open connection, 65 ms.
 
 Limits:
 

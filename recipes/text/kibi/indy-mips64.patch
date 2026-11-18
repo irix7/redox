@@ -1,0 +1,27 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 2227ccf..bdb98cb 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -677,9 +677,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+ 
+ [[package]]
+ name = "libc"
+-version = "0.2.180"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
++version = "0.2.191"
+ 
+ [[package]]
+ name = "libfuzzer-sys"
+@@ -1626,3 +1624,11 @@ dependencies = [
+  "quote",
+  "syn",
+ ]
++
++[[patch.unused]]
++name = "redox_syscall"
++version = "0.9.6"
++
++[[patch.unused]]
++name = "redox_syscall"
++version = "0.5.11"

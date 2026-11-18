@@ -1,4 +1,4 @@
-From 4bfe1259e80ccee6abe9dbf9adf82d32872c73ce Mon Sep 17 00:00:00 2001
+From a25a8578031c1002ea8946bd31a6db2d91cc57e5 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 10:00:49 +1000
 Subject: [PATCH] redox-rt, generic-rt: add mips64 n32 (SGI Indy)
@@ -38,17 +38,19 @@ Signed-off-by: belikh <io@belic.net>
  src/header/signal/redox.rs                 |  12 +-
  src/header/stdio/printf.rs                 |   5 +
  src/header/stdlib/mod.rs                   |   4 +-
- src/header/sys_epoll/mod.rs                |  14 +-
+ src/header/sys_epoll/mod.rs                |  40 +-
  src/header/sys_procfs/mod.rs               |   2 +
+ src/header/sys_select/mod.rs               |   5 +-
  src/header/time/mod.rs                     |   4 +-
  src/header/unistd/mod.rs                   |   4 +-
  src/ld_so/dso.rs                           |  37 +-
  src/ld_so/linker.rs                        |   6 +-
  src/ld_so/mod.rs                           |   7 +
  src/lib.rs                                 |   1 +
+ src/platform/redox/epoll.rs                |  40 +-
  src/platform/redox/ptrace.rs               |  12 +
  stripcore.sh                               |   5 +-
- 33 files changed, 915 insertions(+), 54 deletions(-)
+ 35 files changed, 932 insertions(+), 108 deletions(-)
  create mode 100644 redox-rt/src/arch/mips64.rs
  create mode 100644 src/header/arch_mips64_user/cbindgen.toml
  create mode 100644 src/header/arch_mips64_user/mod.rs
@@ -1298,30 +1300,95 @@ index 08bbc00..c1c2bd4 100644
  }
  
 diff --git a/src/header/sys_epoll/mod.rs b/src/header/sys_epoll/mod.rs
-index b4180e2..16553b1 100644
+index b4180e2..e1ee62b 100644
 --- a/src/header/sys_epoll/mod.rs
 +++ b/src/header/sys_epoll/mod.rs
-@@ -129,7 +129,19 @@ pub struct epoll_event {
+@@ -75,46 +75,32 @@ impl Default for epoll_data {
+     }
+ }
+ 
+-#[cfg(target_pointer_width = "64")]
++// Through the u64 member on every target: it is the member the libc crate
++// exposes, and on a big-endian 32-bit target the other members overlay its
++// high half. The kernel keeps one usize, so only the low half survives there.
+ impl From<usize> for epoll_data {
+     fn from(value: usize) -> Self {
+         Self { u64: value as u64 }
+     }
+ }
+ 
+-#[cfg(target_pointer_width = "32")]
+-impl From<usize> for epoll_data {
+-    fn from(value: usize) -> Self {
+-        Self { u32: value as u32 }
+-    }
+-}
+-
+-#[cfg(target_pointer_width = "64")]
+ impl From<epoll_data> for usize {
+     fn from(value: epoll_data) -> Self {
+         unsafe { value.u64 as usize }
+     }
+ }
+ 
+-#[cfg(target_pointer_width = "32")]
+-impl From<epoll_data> for usize {
+-    fn from(value: epoll_data) -> Self {
+-        // NOTE: Danger when the value overflows in 32-bit
+-        // systems. If this is needed, use a box or something
+-        unsafe { value.u32 as usize }
+-    }
+-}
+-
+ /// Non-POSIX, see <https://man7.org/linux/man-pages/man3/epoll_event.3type.html>.
  ///
  /// Specifies data that the kernel should save and return when the
  /// corresponding file descriptor becomes ready.
+-#[cfg(all(target_os = "redox", target_pointer_width = "64"))]
++#[cfg(target_os = "redox")]
+ #[repr(C)]
+ #[derive(Clone, Copy, Default)]
+-// This will match in size with syscall::Event (24 bytes on 64-bit
+-// systems) on redox. The `Default` trait is here so we don't need to
+-// worry about the padding when using this type.
++// The layout of the libc crate's epoll_event on Redox, for every pointer
++// width: 24 bytes where u64 is 8-byte aligned. On 64-bit systems that is
++// also the size of syscall::Event. The `Default` trait is here so we don't
++// need to worry about the padding when using this type.
+ pub struct epoll_event {
+     /// Epoll events.
+     pub events: c_uint, // 4 bytes
+@@ -125,11 +111,7 @@ pub struct epoll_event {
+     pub _pad: c_ulonglong, // 8 bytes
+ }
+ 
+-/// Non-POSIX, see <https://man7.org/linux/man-pages/man3/epoll_event.3type.html>.
+-///
+-/// Specifies data that the kernel should save and return when the
+-/// corresponding file descriptor becomes ready.
 -#[cfg(not(all(target_os = "redox", target_pointer_width = "64")))]
-+/// On 32-bit Redox this is 12 bytes, the size of `syscall::Event`
-+/// (three `usize`), so the union is packed to 4-byte alignment.
-+#[cfg(all(target_os = "redox", target_pointer_width = "32"))]
-+#[repr(C, packed(4))]
-+#[derive(Clone, Copy, Default)]
-+pub struct epoll_event {
-+    /// Epoll events.
-+    pub events: c_uint,
-+    /// User data variable.
-+    pub data: epoll_data,
-+}
-+
 +#[cfg(not(target_os = "redox"))]
  #[repr(C)]
  #[derive(Clone, Copy, Default)]
  pub struct epoll_event {
+@@ -141,7 +123,7 @@ pub struct epoll_event {
+ 
+ impl epoll_event {
+     pub fn new(events: c_uint, data: epoll_data) -> Self {
+-        #[cfg(all(target_os = "redox", target_pointer_width = "64"))]
++        #[cfg(target_os = "redox")]
+         {
+             Self {
+                 events,
+@@ -149,7 +131,7 @@ impl epoll_event {
+                 _pad: Default::default(),
+             }
+         }
+-        #[cfg(not(all(target_os = "redox", target_pointer_width = "64")))]
++        #[cfg(not(target_os = "redox"))]
+         {
+             Self { events, data }
+         }
 diff --git a/src/header/sys_procfs/mod.rs b/src/header/sys_procfs/mod.rs
 index 0bc4a88..63708a3 100644
 --- a/src/header/sys_procfs/mod.rs
@@ -1335,6 +1402,29 @@ index 0bc4a88..63708a3 100644
  #[cfg(target_arch = "x86_64")]
  use crate::header::arch_x64_user::{elf_fpregset_t, elf_gregset_t};
  use crate::platform::types::{
+diff --git a/src/header/sys_select/mod.rs b/src/header/sys_select/mod.rs
+index 46659ef..7b6b507 100644
+--- a/src/header/sys_select/mod.rs
++++ b/src/header/sys_select/mod.rs
+@@ -88,7 +88,8 @@ pub unsafe fn select_epoll(
+         }
+ 
+         if events > 0 {
+-            let mut event = epoll_event::new(events, epoll_data { fd });
++            // The u64 member: the conversion to the kernel event goes through it.
++            let mut event = epoll_event::new(events, epoll_data { u64: fd as u64 });
+             if unsafe { epoll_ctl(*ep, EPOLL_CTL_ADD, fd, &raw mut event) } < 0 {
+                 if crate::platform::ERRNO.get() == errno::EPERM {
+                     not_epoll += 1;
+@@ -159,7 +160,7 @@ pub unsafe fn select_epoll(
+         .iter()
+         .take(usize::try_from(res).expect("already checked for negative values"))
+     {
+-        let fd = unsafe { event.data.fd };
++        let fd = unsafe { event.data.u64 } as c_int;
+         // TODO: Error status when fd does not match?
+         if fd >= 0 && fd < c_int::try_from(FD_SETSIZE).expect("constant value within c_int::MAX") {
+             let fd_usize = usize::try_from(fd).expect("already checked for negative values");
 diff --git a/src/header/time/mod.rs b/src/header/time/mod.rs
 index fd3db59..2c030ca 100755
 --- a/src/header/time/mod.rs
@@ -1493,6 +1583,82 @@ index 4d9415a..3772556 100644
  #![feature(alloc_error_handler)]
  #![feature(c_variadic)]
  #![feature(core_intrinsics)]
+diff --git a/src/platform/redox/epoll.rs b/src/platform/redox/epoll.rs
+index aed5939..39783a1 100644
+--- a/src/platform/redox/epoll.rs
++++ b/src/platform/redox/epoll.rs
+@@ -10,7 +10,7 @@ use crate::{
+     error::Errno,
+     header::{bits_sigset_t::sigset_t, errno::*, fcntl::*, sys_epoll::*},
+ };
+-use core::{mem, ptr, slice};
++use core::{mem, slice};
+ use syscall::{data::Event, flag::EVENT_READ};
+ 
+ fn epoll_to_event_flags(epoll: c_uint) -> syscall::EventFlags {
+@@ -106,19 +106,22 @@ impl Sys {
+         timeout: c_int,
+         sigmask: Option<&sigset_t>,
+     ) -> Result<usize, Errno> {
+-        const { assert!(mem::size_of::<epoll_event>() == mem::size_of::<Event>()) }
+-
+         if timeout != -1 {
+             register_timeout(epfd, timeout)?;
+         }
++        // epoll_event and syscall::Event differ in size on 32-bit targets,
++        // so the kernel's events are read into a buffer and converted.
++        const BATCH: usize = 32;
++        let mut raw = [Event::default(); BATCH];
++        let wanted = events.len().min(BATCH);
+         let mut callback = || {
+             syscall::read(
+                 epfd,
+-                // SAFETY: the const assert guarantees the same size
++                // SAFETY: `raw` holds at least `wanted` events
+                 unsafe {
+                     slice::from_raw_parts_mut(
+-                        events.as_mut_ptr().cast::<u8>(),
+-                        events.len() * mem::size_of::<syscall::Event>(),
++                        raw.as_mut_ptr().cast::<u8>(),
++                        wanted * mem::size_of::<Event>(),
+                     )
+                 },
+             )
+@@ -132,27 +135,16 @@ impl Sys {
+             callback()
+         }?;
+ 
+-        let read = bytes_read as usize / mem::size_of::<syscall::Event>();
+-        assert!(read <= events.len());
++        let read = bytes_read as usize / mem::size_of::<Event>();
++        assert!(read <= wanted);
+ 
+-        let events_ptr = events.as_mut_ptr();
+         let mut count = 0;
+-
+-        for i in 0..read {
+-            // SAFETY:
+-            // We already checked the size and it's aligned
+-            unsafe {
+-                let event_ptr = events_ptr.add(i) as *const syscall::Event;
+-                let event = ptr::read(event_ptr);
+-
+-                if event.id == syscall::EVENT_TIMEOUT_ID {
+-                    continue;
+-                }
+-                let new_event =
+-                    epoll_event::new(event_flags_to_epoll(event.flags), event.data.into());
+-                events_ptr.add(count).write(new_event);
+-                count += 1;
++        for event in &raw[..read] {
++            if event.id == syscall::EVENT_TIMEOUT_ID {
++                continue;
+             }
++            events[count] = epoll_event::new(event_flags_to_epoll(event.flags), event.data.into());
++            count += 1;
+         }
+ 
+         Ok(count)
 diff --git a/src/platform/redox/ptrace.rs b/src/platform/redox/ptrace.rs
 index f70c00f..7a3003a 100644
 --- a/src/platform/redox/ptrace.rs

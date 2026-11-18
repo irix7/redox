@@ -1,0 +1,25 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index bcb4d73..8524d67 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -733,8 +733,6 @@ dependencies = [
+ [[package]]
+ name = "libc"
+ version = "0.2.191"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+ 
+ [[package]]
+ name = "link-section"
+@@ -1523,3 +1521,11 @@ name = "zmij"
+ version = "1.0.23"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
++
++[[patch.unused]]
++name = "redox_syscall"
++version = "0.9.6"
++
++[[patch.unused]]
++name = "redox_syscall"
++version = "0.5.11"

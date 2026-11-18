@@ -1,0 +1,148 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index fe712b7c..ebf8e350 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -157,9 +157,12 @@ checksum = "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a"
+ 
+ [[package]]
+ name = "buf_read_splitter"
+-version = "0.4.1"
++version = "1.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4645e4b1f94aa320084c653bc616681dd8f34c8d656cdd76f7e71efde19ada10"
++checksum = "6a6850642203d705e11397e3e1dd46a2c4cf10c28e64bf805d492c4f69975982"
++dependencies = [
++ "thiserror 2.0.21",
++]
+ 
+ [[package]]
+ name = "builtins-proc"
+@@ -1031,7 +1034,7 @@ dependencies = [
+  "serial_test_derive",
+  "small",
+  "smallvec",
+- "thiserror",
++ "thiserror 1.0.69",
+  "types-rs",
+  "unicode-segmentation",
+  "users",
+@@ -1158,9 +1161,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "libc"
+-version = "0.2.171"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "c19937216e9d3aa9956d9bb8dfc0b0c8beb6058fc4f7a4dc4d850edf86a237d6"
++version = "0.2.191"
+ 
+ [[package]]
+ name = "libloading"
+@@ -1322,7 +1323,7 @@ dependencies = [
+  "jni-sys",
+  "ndk-sys",
+  "num_enum",
+- "thiserror",
++ "thiserror 1.0.69",
+ ]
+ 
+ [[package]]
+@@ -1396,7 +1397,6 @@ dependencies = [
+ [[package]]
+ name = "nix"
+ version = "0.23.1"
+-source = "git+https://github.com/nix-rust/nix.git?rev=ff6f8b8a#ff6f8b8a26c8d61f4341e441acf405402b46a430"
+ dependencies = [
+  "bitflags 1.3.2",
+  "cfg-if 1.0.0",
+@@ -2061,8 +2061,6 @@ dependencies = [
+ [[package]]
+ name = "redox_syscall"
+ version = "0.5.11"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d2f103c6d277498fbceb16e84d317e2a400f160f46904d5f5410848c829511a3"
+ dependencies = [
+  "bitflags 2.9.0",
+ ]
+@@ -2082,7 +2080,7 @@ dependencies = [
+  "getrandom 0.2.15",
+  "libredox",
+  "rust-argon2",
+- "thiserror",
++ "thiserror 1.0.69",
+  "zeroize",
+ ]
+ 
+@@ -2387,6 +2385,17 @@ dependencies = [
+  "unicode-ident",
+ ]
+ 
++[[package]]
++name = "syn"
++version = "3.0.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4ae9ccbea3a7b0b09443036490c8f34a8b1b760fd345e5c0dae0aac718faea79"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
+ [[package]]
+ name = "termion"
+ version = "4.0.5"
+@@ -2414,7 +2423,16 @@ version = "1.0.69"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+ dependencies = [
+- "thiserror-impl",
++ "thiserror-impl 1.0.69",
++]
++
++[[package]]
++name = "thiserror"
++version = "2.0.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
++dependencies = [
++ "thiserror-impl 2.0.21",
+ ]
+ 
+ [[package]]
+@@ -2428,6 +2446,17 @@ dependencies = [
+  "syn 2.0.100",
+ ]
+ 
++[[package]]
++name = "thiserror-impl"
++version = "2.0.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.10",
++]
++
+ [[package]]
+ name = "tiff"
+ version = "0.6.1"
+@@ -2948,3 +2977,7 @@ dependencies = [
+  "quote",
+  "syn 2.0.100",
+ ]
++
++[[patch.unused]]
++name = "redox_syscall"
++version = "0.9.6"
+diff --git a/Cargo.toml b/Cargo.toml
+index a27a58f4..7dbc55a5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -123,3 +123,7 @@ panic = "abort"
+ # Required to make `cargo vendor` work
+ [patch.crates-io]
+ redox_liner = { git = "https://gitlab.redox-os.org/redox-os/liner" }
++
++# Indy port: nix with sa_flags as c_int (irix7/redox vendor/, tools/vendor.sh).
++[patch."https://github.com/nix-rust/nix.git"]
++nix = { path = "../../../../vendor/nix-ff6f8b8" }

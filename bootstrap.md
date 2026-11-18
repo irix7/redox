@@ -740,9 +740,27 @@ and none of them is on the critical path to "the machine runs our code".
   the timer stopping for a minute after a late tick.
   Open: that IPC cost, no ASIDs (the TLB is flushed on every switch), the machine does not
   answer ping, the store server is started by hand.
-- **T9 — next.** First real-hardware boot and whatever it shows; shrink the initfs (4.4 MiB
-  against a 2 MiB budget); an entropy source for `randd`; the serial interrupt (INT3
-  mappable lines) instead of polling; `ion` in place of the bring-up shell.
+- **T8c — userland.** 2026-11-18, in the emulator. The root store holds 109 programs
+  (126 MB): `ion`, 64 uutils programs, Redox coreutils (`ps`, `free`, `df`), `login`,
+  `su`, `find`, `grep`, `sed`, `less`, `tar`, `gzip`, `kibi`, `ping`, `nc`, `dns`,
+  `ifconfig`. `tools/indy-userland.sh` fetches each upstream at a pinned revision,
+  applies `recipes/<group>/<name>/indy-mips64.patch`, builds and stages it
+  (`make indy-userland`; about an hour from nothing). The console runs `getty` and
+  `login` (users `root` and `user`, no password) with `ion` on a PTY; `/tmp`, `/root`,
+  `/home` and `/var` are links into a RAM filesystem at `/scheme/tmp`. The bring-up
+  shell is `indy-sh` on TCP port 23 only, and `kdbg` starts on demand
+  (`tools/indy-gdb.sh`). Found on the way: relibc's `epoll_event` on 32-bit targets was
+  12 bytes against 24 in the `libc` crate, which broke every `mio` user; the kernel woke
+  console readers on every tick; an out-of-frames page fault panicked the kernel
+  (`todo!("oom")`) and now fails the faulting process.
+  Memory is the limit. After login 3.1 MiB of 24.3 MiB is free: the initfs image
+  (4.2 MiB) stays resident beside the loaded copies of its five programs, and each of
+  the 15 processes is a private static image of 0.5 to 2.3 MB. One uutils program fits
+  (`ls` is 3.1 MB); two large ones in a pipeline can run out, and the second is killed.
+- **T9 — next.** Memory before more programs: map initfs programs from the image
+  and stop keeping a second copy, fold `zerod` and the other small daemons together,
+  smaller `ls`/`sort`; an entropy source for `randd`; a clock (`date` reads 1970); the
+  serial interrupt (INT3 mappable lines) instead of polling.
 - **T2** stays worth doing: it tells which userspace cut matters most before T6 pulls in
   packages.
 

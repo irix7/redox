@@ -1,0 +1,7 @@
+[unit]
+description = "IPC daemon: schemes chan and shm"
+default_dependencies = false
+
+[service]
+cmd = "ipcd"
+type = "notify"

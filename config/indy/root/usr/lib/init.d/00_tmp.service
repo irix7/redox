@@ -1,0 +1,9 @@
+[unit]
+description = "RAM filesystem at /scheme/tmp; /tmp, /root, /home and /var link into it"
+default_dependencies = false
+requires_weak = ["00_ipcd.service"]
+
+[service]
+cmd = "ramfs"
+args = ["tmp"]
+type = { scheme = "tmp" }

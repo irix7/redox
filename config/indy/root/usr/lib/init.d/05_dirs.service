@@ -1,0 +1,8 @@
+[unit]
+description = "Directories in the RAM filesystem"
+requires_weak = ["00_tmp.service"]
+
+[service]
+cmd = "indy-sh"
+args = ["mkdir", "/scheme/tmp/tmp", "/scheme/tmp/root", "/scheme/tmp/home/user", "/scheme/tmp/var/log", "/scheme/tmp/var/run"]
+type = "oneshot"

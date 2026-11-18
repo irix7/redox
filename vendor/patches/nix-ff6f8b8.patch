@@ -1,0 +1,33 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-11-18 11:41:10.174784618 +1000
++++ b/src/lib.rs	2026-11-18 11:41:33.430344697 +1000
+@@ -44,12 +44,12 @@
+ #![allow(non_camel_case_types)]
+ #![cfg_attr(test, deny(warnings))]
+ #![recursion_limit = "500"]
+-#![deny(unused)]
++#![allow(unused)] // a path dependency gets no cap-lints
+ #![allow(unused_macros)]
+ #![cfg_attr(not(feature = "default"), allow(unused_imports))]
+-#![deny(unstable_features)]
+-#![deny(missing_copy_implementations)]
+-#![deny(missing_debug_implementations)]
++#![allow(unstable_features)] // a path dependency gets no cap-lints
++#![allow(missing_copy_implementations)] // a path dependency gets no cap-lints
++#![allow(missing_debug_implementations)] // a path dependency gets no cap-lints
+ #![warn(missing_docs)]
+ 
+ #![cfg_attr(docsrs, feature(doc_cfg))]
+diff -ruN a/src/sys/signal.rs b/src/sys/signal.rs
+--- a/src/sys/signal.rs	2026-11-18 11:41:10.175989835 +1000
++++ b/src/sys/signal.rs	2026-11-18 11:41:10.215802438 +1000
+@@ -423,7 +423,8 @@
+ 
+ cfg_if! {
+     if #[cfg(target_os = "redox")] {
+-        type SaFlags_t = libc::c_ulong;
++        // libc 0.2.191 declares sa_flags and the SA_ constants as c_int.
++        type SaFlags_t = libc::c_int;
+     } else if #[cfg(target_env = "uclibc")] {
+         type SaFlags_t = libc::c_ulong;
+     } else {
