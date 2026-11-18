@@ -776,10 +776,22 @@ and none of them is on the critical path to "the machine runs our code".
   history and `kibi` work from the emulated keyboard. On the real Indy the kernel takes
   the graphics path and the machine boots to the TCP shell; what the screen shows and
   whether the keyboard acknowledged has not been read back yet.
+  Later the same day the owner logged in at the real keyboard and ran commands, so the
+  screen and the keyboard work on the hardware.
   Real hardware, same day: T8c and T8d run. 13.1 MiB of 28.5 MiB is free at the login
   prompt, and the TCP shell answers 160 s after `reboot`.
-- **T9 — next.** Confirm T8e on the real screen and keyboard; the keyboard interrupt
-  (INT3) instead of the tick; a faster scroll (TOPSCAN). Then: each process is still a
+- **T8f — console interrupts.** 2026-11-18, in the emulator. The keyboard controller
+  and the serial port interrupt through INT3's mappable lines 4 and 5, gathered by map
+  mask 0 into local 0 bit 7, which the kernel serves itself (`interrupt/irq.rs`; it is
+  no longer an `irq:` line). The Z85C30 interrupts on received characters; with the
+  screen as the console its output is a 2 KiB queue sent by the transmit interrupt, so
+  printing no longer waits 1 ms per character for the 9600 baud copy. The tick keeps a
+  once-a-second look at both devices; `cachestat` in `indy-sh` prints the interrupt
+  counts and how many keyboard bytes that fallback found (0 in iris). `ping` works:
+  netutils built a `TimeSpec` in an unaligned byte array, which `libredox` asserts on
+  where `time_t` needs 8-byte alignment.
+- **T9 — next.** T8f on the real machine (`cachestat` after typing); a faster scroll
+  (TOPSCAN). Then: each process is still a
   private static image read whole (no shared or demand-paged text), `zerod` runs twice,
   an entropy source for `randd`, a clock (`date` reads 1970), the serial interrupt
   (INT3 mappable lines) instead of polling.

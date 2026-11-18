@@ -32,3 +32,67 @@ index 6b5591e..51ee3ae 100644
 +[[patch.unused]]
 +name = "redox_syscall"
 +version = "0.9.6"
+diff --git a/src/ping/main.rs b/src/ping/main.rs
+index 7f72aa0..95d09be 100644
+--- a/src/ping/main.rs
++++ b/src/ping/main.rs
+@@ -216,13 +216,13 @@ fn main() -> Result<()> {
+     ping.send_ping(&current_time)?;
+ 
+     // Schedule the next time event
+-    let mut buf = [0_u8; mem::size_of::<TimeSpec>()];
+-    let time = libredox::data::timespec_from_mut_bytes(&mut buf);
++    let mut buf = ping::TimeSpecBytes::new();
++    let time = libredox::data::timespec_from_mut_bytes(&mut buf.0);
+ 
+     time.tv_sec = current_time.tv_sec + interval;
+     time.tv_nsec = current_time.tv_nsec;
+     ping.time_file
+-        .write(&buf)
++        .write(&buf.0)
+         .context("Failed to write to time file")?;
+ 
+     // Start the event loop
+diff --git a/src/ping/ping.rs b/src/ping/ping.rs
+index c6a2395..84c051f 100644
+--- a/src/ping/ping.rs
++++ b/src/ping/ping.rs
+@@ -20,6 +20,21 @@ use crate::ECHO_PAYLOAD_SIZE;
+ use crate::time_diff_ms;
+ use crate::PING_TIMEOUT_S;
+ 
++/// Bytes for one `TimeSpec`, aligned like one.
++///
++/// `libredox::data::timespec_from_mut_bytes` asserts the alignment of the
++/// slice it is given. A plain byte array on the stack has alignment 1, and
++/// where `TimeSpec` needs 8 (a 64-bit `time_t` on a 32-bit target) the
++/// assertion fails whenever the array lands on an odd word.
++#[repr(C, align(8))]
++pub struct TimeSpecBytes(pub [u8; mem::size_of::<TimeSpec>()]);
++
++impl TimeSpecBytes {
++    pub fn new() -> Self {
++        Self([0; mem::size_of::<TimeSpec>()])
++    }
++}
++
+ /// A wrapper around `libredox::data::TimeSpec` that adds trait implementations
+ /// like `PartialEq`, `Debug`, and ordering traits for usage in data structures.
+ ///
+@@ -235,13 +250,13 @@ impl Ping {
+         alarm_time.tv_sec += self.interval;
+ 
+         // Serialize alarm_time into a byte buffer and write it
+-        let mut alarm_buf = [0_u8; mem::size_of::<TimeSpec>()];
++        let mut alarm_buf = TimeSpecBytes::new();
+         {
+-            let alarm_spec = libredox::data::timespec_from_mut_bytes(&mut alarm_buf);
++            let alarm_spec = libredox::data::timespec_from_mut_bytes(&mut alarm_buf.0);
+             *alarm_spec = alarm_time;
+         }
+         self.time_file
+-            .write(&alarm_buf)
++            .write(&alarm_buf.0)
+             .context("Failed to write the next alarm time")?;
+ 
+         // If we've sent all packets and have no outstanding replies, finish

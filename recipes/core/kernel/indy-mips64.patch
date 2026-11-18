@@ -1,4 +1,4 @@
-From f2d81999aa06f46b1959f9ea2611849e1d108818 Mon Sep 17 00:00:00 2001
+From f8b7a9caf951f952f8cc8ea8fa42affdee1d1637 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -33,19 +33,19 @@ Signed-off-by: belikh <io@belic.net>
  rmm/src/arch/mips.rs                   | 247 ++++++++
  rmm/src/arch/mod.rs                    |   4 +-
  rmm/src/lib.rs                         |   1 +
- src/arch/mips64/cache.rs               | 461 +++++++++++++++
+ src/arch/mips64/cache.rs               | 467 ++++++++++++++++
  src/arch/mips64/consts.rs              |  24 +
  src/arch/mips64/cp0.rs                 | 112 ++++
  src/arch/mips64/debug.rs               |  22 +
  src/arch/mips64/device/arcs.rs         | 178 ++++++
  src/arch/mips64/device/cpu/mod.rs      |  11 +
- src/arch/mips64/device/kbd.rs          | 291 ++++++++++
- src/arch/mips64/device/mod.rs          |  27 +
+ src/arch/mips64/device/kbd.rs          | 318 +++++++++++
+ src/arch/mips64/device/mod.rs          |  69 +++
  src/arch/mips64/device/newport.rs      | 701 +++++++++++++++++++++++
  src/arch/mips64/device/serial.rs       |  14 +
- src/arch/mips64/interrupt/exception.rs | 750 +++++++++++++++++++++++++
+ src/arch/mips64/interrupt/exception.rs | 746 +++++++++++++++++++++++++
  src/arch/mips64/interrupt/handler.rs   | 396 +++++++++++++
- src/arch/mips64/interrupt/irq.rs       |  90 +++
+ src/arch/mips64/interrupt/irq.rs       | 135 +++++
  src/arch/mips64/interrupt/mod.rs       |  47 ++
  src/arch/mips64/interrupt/syscall.rs   |   4 +
  src/arch/mips64/interrupt/trace.rs     |  19 +
@@ -61,8 +61,8 @@ Signed-off-by: belikh <io@belic.net>
  src/context/memory.rs                  |  44 +-
  src/context/mod.rs                     |   4 +
  src/devices/mod.rs                     |   2 +
- src/devices/serial.rs                  |  19 +
- src/devices/uart_z85c30.rs             | 120 ++++
+ src/devices/serial.rs                  |  27 +
+ src/devices/uart_z85c30.rs             | 196 +++++++
  src/main.rs                            |   1 +
  src/memory/mod.rs                      |  78 ++-
  src/panic.rs                           |  15 +
@@ -77,7 +77,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 +
- 49 files changed, 5268 insertions(+), 19 deletions(-)
+ 49 files changed, 5468 insertions(+), 19 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -489,10 +489,10 @@ index 1f2c1a13..ccbee701 100644
  
 diff --git a/src/arch/mips64/cache.rs b/src/arch/mips64/cache.rs
 new file mode 100644
-index 00000000..bcbdae77
+index 00000000..7ee6390f
 --- /dev/null
 +++ b/src/arch/mips64/cache.rs
-@@ -0,0 +1,461 @@
+@@ -0,0 +1,467 @@
 +//! Primary cache coherence.
 +//!
 +//! The R4x00 and R5000 primary caches are indexed by virtual address, and a
@@ -880,6 +880,12 @@ index 00000000..bcbdae77
 +            }
 +        }
 +    }
++    info!(
++        "Indy: console: {} keyboard interrupts, {} serial interrupts, {} keyboard bytes found by the fallback poll",
++        crate::arch::device::KEYBOARD_INTERRUPTS.load(Ordering::Relaxed),
++        crate::arch::device::SERIAL_INTERRUPTS.load(Ordering::Relaxed),
++        crate::arch::device::FALLBACK_INPUT.load(Ordering::Relaxed)
++    );
 +    info!(
 +        "Indy: events: {} switches, {} fast refills, {} TLB flushes;{}",
 +        STAT_SWITCHES.swap(0, Ordering::Relaxed),
@@ -1333,18 +1339,19 @@ index 00000000..e8c7e2c3
 +}
 diff --git a/src/arch/mips64/device/kbd.rs b/src/arch/mips64/device/kbd.rs
 new file mode 100644
-index 00000000..f7440380
+index 00000000..3b5f2454
 --- /dev/null
 +++ b/src/arch/mips64/device/kbd.rs
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,318 @@
 +//! The Indy's keyboard, read from the IOC2's 8042-compatible controller.
 +//!
 +//! The controller is in the IOC2 (0x1FBD_9800): data at offset 0x40, command
 +//! and status at 0x44. The IOC2 is an 8-bit device on the low byte lane of a
 +//! big-endian word, so the bytes are at kseg1 0xBFBD_9843 and 0xBFBD_9847.
 +//!
-+//! `init` selects scancode set 2 and turns the mouse port off; the PROM is
-+//! not called for input. `poll` runs from the timer tick: it reads what the
++//! `init` selects scancode set 2, turns the mouse port off and enables the
++//! keyboard interrupt; the PROM is not called for input. `poll` runs from
++//! that interrupt (INT3 mappable line 4): it reads what the
 +//! controller holds and turns make codes into the bytes a terminal sends
 +//! (ASCII, control characters, and xterm sequences for the cursor and editing
 +//! keys).
@@ -1361,7 +1368,16 @@ index 00000000..f7440380
 +const STATUS_INPUT_FULL: u8 = 0x02;
 +const STATUS_AUX: u8 = 0x20;
 +
++const CONTROLLER_READ_COMMAND_BYTE: u8 = 0x20;
++const CONTROLLER_WRITE_COMMAND_BYTE: u8 = 0x60;
 +const CONTROLLER_DISABLE_AUX: u8 = 0xa7;
++/// Command byte: keyboard interrupt, mouse interrupt, keyboard clock off,
++/// mouse clock off, translation to set 1.
++const COMMAND_KEYBOARD_INTERRUPT: u8 = 0x01;
++const COMMAND_AUX_INTERRUPT: u8 = 0x02;
++const COMMAND_KEYBOARD_DISABLE: u8 = 0x10;
++const COMMAND_AUX_DISABLE: u8 = 0x20;
++const COMMAND_TRANSLATE: u8 = 0x40;
 +const KEYBOARD_SET_SCANCODE_SET: u8 = 0xf0;
 +const KEYBOARD_ENABLE: u8 = 0xf4;
 +const ACK: u8 = 0xfa;
@@ -1436,6 +1452,21 @@ index 00000000..f7440380
 +    // The mouse would fill the same output buffer with movement packets.
 +    if wait_input_empty() {
 +        unsafe { COMMAND.write_volatile(CONTROLLER_DISABLE_AUX) };
++    }
++    // Command byte: the keyboard interrupts (INT3 mappable line 4), the
++    // mouse does not, and the controller passes set 2 codes through
++    // untranslated.
++    if wait_input_empty() {
++        unsafe { COMMAND.write_volatile(CONTROLLER_READ_COMMAND_BYTE) };
++        let old = wait_reply().unwrap_or(0);
++        let new = (old | COMMAND_KEYBOARD_INTERRUPT | COMMAND_AUX_DISABLE)
++            & !(COMMAND_AUX_INTERRUPT | COMMAND_KEYBOARD_DISABLE | COMMAND_TRANSLATE);
++        if wait_input_empty() {
++            unsafe { COMMAND.write_volatile(CONTROLLER_WRITE_COMMAND_BYTE) };
++            if wait_input_empty() {
++                unsafe { DATA.write_volatile(new) };
++            }
++        }
 +    }
 +    let acknowledged = keyboard_command(KEYBOARD_SET_SCANCODE_SET)
 +        && keyboard_command(2)
@@ -1613,27 +1644,29 @@ index 00000000..f7440380
 +}
 +
 +/// Read what the controller holds, up to a bound that keeps the tick short.
++///
++/// Runs without `init` as well (a serial console): the bytes are read and
++/// dropped, so that a controller the PROM left interrupting cannot hold its
++/// interrupt line up.
 +pub fn poll(emit: &mut dyn FnMut(u8)) {
-+    if !active() {
-+        return;
-+    }
++    let active = active();
 +    for _ in 0..16 {
 +        let status = status();
 +        if status & STATUS_OUTPUT_FULL == 0 {
 +            break;
 +        }
 +        let byte = unsafe { DATA.read_volatile() };
-+        if status & STATUS_AUX == 0 {
++        if active && status & STATUS_AUX == 0 {
 +            decode(byte, emit);
 +        }
 +    }
 +}
 diff --git a/src/arch/mips64/device/mod.rs b/src/arch/mips64/device/mod.rs
 new file mode 100644
-index 00000000..c26db90c
+index 00000000..956b016a
 --- /dev/null
 +++ b/src/arch/mips64/device/mod.rs
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,69 @@
 +//! Indy devices the kernel itself drives: the console (Serial Port 1, or the
 +//! Newport screen with the IOC2 keyboard) and the CP0 timer. Everything else
 +//! (HPC3, SCSI, Seeq Ethernet) is a userspace scheme reached through fixed
@@ -1653,6 +1686,48 @@ index 00000000..c26db90c
 +}
 +
 +pub unsafe fn init_noncore() {}
++
++/// Counters for the console's interrupts and for the once-a-second fallback
++/// poll finding input an interrupt should have delivered. Read with kdbg.
++pub static KEYBOARD_INTERRUPTS: core::sync::atomic::AtomicUsize =
++    core::sync::atomic::AtomicUsize::new(0);
++pub static SERIAL_INTERRUPTS: core::sync::atomic::AtomicUsize =
++    core::sync::atomic::AtomicUsize::new(0);
++pub static FALLBACK_INPUT: core::sync::atomic::AtomicUsize =
++    core::sync::atomic::AtomicUsize::new(0);
++
++/// Move what the keyboard controller holds, and the screen's replies to
++/// terminal reports, to the console input. Returns the number of bytes
++/// that came from the keyboard.
++pub fn keyboard_input(token: &mut crate::sync::CleanLockToken) -> usize {
++    let mut bytes = [0u8; 96];
++    let mut len = {
++        let mut reply = [0u8; 32];
++        let n = newport::take_reply(&mut reply);
++        bytes[..n].copy_from_slice(&reply[..n]);
++        n
++    };
++    let replies = len;
++    kbd::poll(&mut |byte| {
++        if len < bytes.len() {
++            bytes[len] = byte;
++            len += 1;
++        }
++    });
++    for &byte in &bytes[..len] {
++        crate::scheme::debug::debug_input(byte, token);
++    }
++    if len != 0 {
++        crate::scheme::debug::debug_notify(token);
++    }
++    len - replies
++}
++
++/// Serial Port 1: received bytes to the console input, queued output to
++/// the chip.
++pub fn serial_service(token: &mut crate::sync::CleanLockToken) {
++    serial::COM1.lock().receive(token);
++}
 +
 +pub struct ArchPercpuMisc;
 +
@@ -2390,10 +2465,10 @@ index 00000000..85cd4255
 +}
 diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
 new file mode 100644
-index 00000000..5228fccb
+index 00000000..d117b932
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/exception.rs
-@@ -0,0 +1,750 @@
+@@ -0,0 +1,746 @@
 +//! Exception vectors and the common handler.
 +//!
 +//! The R4400 takes every exception at one of three kseg0 vectors when
@@ -2897,29 +2972,25 @@ index 00000000..5228fccb
 +            regs.iret.status as u32 & cp0::status::KSU_MASK != 0,
 +        );
 +        crate::arch::time::tick();
-+        // The console's receive side is polled from the tick: the serial
-+        // interrupt arrives through INT3's mappable lines, not routed yet.
-+        crate::arch::device::serial::COM1.lock().receive(&mut token);
-+        // The keyboard controller is polled from the tick as well, along
-+        // with the screen's replies to terminal reports.
-+        if crate::arch::device::kbd::active() {
-+            let mut bytes = [0u8; 96];
-+            let mut len = {
-+                let mut reply = [0u8; 32];
-+                let n = crate::arch::device::newport::take_reply(&mut reply);
-+                bytes[..n].copy_from_slice(&reply[..n]);
-+                n
-+            };
-+            crate::arch::device::kbd::poll(&mut |byte| {
-+                if len < bytes.len() {
-+                    bytes[len] = byte;
-+                    len += 1;
-+                }
-+            });
-+            for &byte in &bytes[..len] {
++        // The keyboard and the serial port interrupt (irq.rs). The tick
++        // delivers the screen's replies to terminal reports, and once a
++        // second looks at both devices in case an interrupt was lost;
++        // FALLBACK_INPUT counts what that finds.
++        static CONSOLE_TICK: core::sync::atomic::AtomicU32 =
++            core::sync::atomic::AtomicU32::new(0);
++        let tick = CONSOLE_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++        if tick % 100 == 0 {
++            let found = crate::arch::device::keyboard_input(&mut token);
++            crate::arch::device::FALLBACK_INPUT
++                .fetch_add(found, core::sync::atomic::Ordering::Relaxed);
++            crate::arch::device::serial_service(&mut token);
++        } else if crate::arch::device::newport::active() {
++            let mut reply = [0u8; 32];
++            let n = crate::arch::device::newport::take_reply(&mut reply);
++            for &byte in &reply[..n] {
 +                crate::scheme::debug::debug_input(byte, &mut token);
 +            }
-+            if len != 0 {
++            if n != 0 {
 +                crate::scheme::debug::debug_notify(&mut token);
 +            }
 +        }
@@ -3548,10 +3619,10 @@ index 00000000..fced8a75
 +}
 diff --git a/src/arch/mips64/interrupt/irq.rs b/src/arch/mips64/interrupt/irq.rs
 new file mode 100644
-index 00000000..0cd49786
+index 00000000..5b6e9c95
 --- /dev/null
 +++ b/src/arch/mips64/interrupt/irq.rs
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,135 @@
 +//! Device interrupts for the `irq:` scheme: the IOC2's INT3 controller.
 +//!
 +//! INT3 has two 8-bit local interrupt registers. Local 0 drives CPU IP2,
@@ -3568,6 +3639,14 @@ index 00000000..0cd49786
 +//! A line that fires is masked and reported to its `irq:` handle; the
 +//! driver's acknowledgement unmasks it. A line nobody holds stays masked
 +//! after its first interrupt.
++//!
++//! INT3 also has eight mappable lines with their own status register and
++//! two mask registers: mask 0 gathers lines into local 0 bit 7, mask 1 into
++//! local 1 bit 3. The kernel's console owns two of them through mask 0 and
++//! serves them itself: line 4, the keyboard controller, and line 5, the
++//! serial ports. Both are level interrupts that drop when the device is
++//! read, so they are never masked. Local 0 bit 7 is therefore not an `irq:`
++//! line.
 +
 +use core::ptr::{read_volatile, write_volatile};
 +
@@ -3582,10 +3661,26 @@ index 00000000..0cd49786
 +const L0_MASK: *mut u8 = 0xBFBD_9887 as *mut u8;
 +const L1_STAT: *mut u8 = 0xBFBD_988B as *mut u8;
 +const L1_MASK: *mut u8 = 0xBFBD_988F as *mut u8;
++const MAP_STAT: *mut u8 = 0xBFBD_9893 as *mut u8;
++const MAP_MASK0: *mut u8 = 0xBFBD_9897 as *mut u8;
++const MAP_MASK1: *mut u8 = 0xBFBD_989B as *mut u8;
++
++const MAP_KEYBOARD: u8 = 1 << 4;
++const MAP_SERIAL: u8 = 1 << 5;
++/// Local 0 bit 7: the mappable lines enabled in mask 0.
++const L0_MAPPABLE: u8 = 1 << 7;
 +
 +/// Enable every local line and the two CPU inputs they cascade into.
 +pub unsafe fn init() {
 +    unsafe {
++        write_volatile(MAP_MASK1, 0);
++        write_volatile(MAP_MASK0, MAP_KEYBOARD | MAP_SERIAL);
++        // The serial port interrupts for received characters. With the
++        // screen as the console its output is only a copy, sent from a
++        // queue by the transmit interrupt.
++        crate::arch::device::serial::COM1.lock().enable_serial_interrupts(
++            crate::arch::device::newport::active(),
++        );
 +        write_volatile(L0_MASK, 0xff);
 +        write_volatile(L1_MASK, 0xff);
 +        cp0::write_status(cp0::read_status() | status::IM2 | status::IM3);
@@ -3607,7 +3702,26 @@ index 00000000..0cd49786
 +unsafe fn dispatch(stat: *mut u8, mask: *mut u8, base: u8, token: &mut CleanLockToken) {
 +    unsafe {
 +        let enabled = read_volatile(mask);
-+        let active = read_volatile(stat) & enabled;
++        let mut active = read_volatile(stat) & enabled;
++        if base == 0 && active & L0_MAPPABLE != 0 {
++            active &= !L0_MAPPABLE;
++            let lines = read_volatile(MAP_STAT) & read_volatile(MAP_MASK0);
++            if lines & MAP_KEYBOARD != 0 {
++                crate::arch::device::KEYBOARD_INTERRUPTS
++                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++                crate::arch::device::keyboard_input(token);
++            }
++            if lines & MAP_SERIAL != 0 {
++                crate::arch::device::SERIAL_INTERRUPTS
++                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++                crate::arch::device::serial_service(token);
++            }
++            // A line nobody serves would interrupt for ever: drop it.
++            let stray = lines & !(MAP_KEYBOARD | MAP_SERIAL);
++            if stray != 0 {
++                write_volatile(MAP_MASK0, read_volatile(MAP_MASK0) & !stray);
++            }
++        }
 +        if active == 0 {
 +            return;
 +        }
@@ -3624,7 +3738,9 @@ index 00000000..0cd49786
 +pub unsafe fn acknowledge(irq: usize) {
 +    unsafe {
 +        let (mask, bit) = match irq {
-+            0..=7 => (L0_MASK, irq as u8),
++            // Bit 7 belongs to the console's mappable lines.
++            7 => return,
++            0..=6 => (L0_MASK, irq as u8),
 +            8..=15 => (L1_MASK, irq as u8 - 8),
 +            _ => return,
 +        };
@@ -4926,7 +5042,7 @@ index dc475689..d1a3104b 100644
 +#[cfg(target_arch = "mips64")]
 +pub mod uart_z85c30;
 diff --git a/src/devices/serial.rs b/src/devices/serial.rs
-index 1b3435dc..5b4d026a 100644
+index 1b3435dc..301c709c 100644
 --- a/src/devices/serial.rs
 +++ b/src/devices/serial.rs
 @@ -2,6 +2,8 @@ use syscall::MmioPtr;
@@ -4947,19 +5063,34 @@ index 1b3435dc..5b4d026a 100644
  }
  
  impl SerialKind {
-@@ -68,6 +72,19 @@ impl SerialKind {
+@@ -43,6 +47,14 @@ impl SerialKind {
+         }
+     }
+ 
++    /// Z85C30 only: see `uart_z85c30::SerialPort::enable_interrupts`.
++    #[cfg(target_arch = "mips64")]
++    pub fn enable_serial_interrupts(&mut self, queue_output: bool) {
++        if let Self::Z85c30(inner) = self {
++            inner.enable_interrupts(queue_output);
++        }
++    }
++
+     pub fn receive(&mut self, token: &mut CleanLockToken) {
+         //TODO: make PL011 receive work the same way as NS16550
+         match self {
+@@ -68,6 +80,19 @@ impl SerialKind {
              }
              Self::Meson(inner) => inner.receive(token),
              Self::Pl011(inner) => inner.receive(token),
 +            #[cfg(target_arch = "mips64")]
 +            Self::Z85c30(inner) => {
-+                // Polled from the timer tick: notify readers only when a
-+                // byte arrived, or every reader wakes on every tick.
++                // Notify readers only when a byte arrived.
 +                let mut any = false;
 +                while let Some(c) = inner.receive() {
 +                    debug_input(c, token);
 +                    any = true;
 +                }
++                inner.service();
 +                if any {
 +                    debug_notify(token);
 +                }
@@ -4967,7 +5098,7 @@ index 1b3435dc..5b4d026a 100644
          }
      }
  
-@@ -80,6 +97,8 @@ impl SerialKind {
+@@ -80,6 +105,8 @@ impl SerialKind {
              Self::Ns16550u32(inner) => inner.write(buf),
              Self::Meson(inner) => inner.write(buf),
              Self::Pl011(inner) => inner.write(buf),
@@ -4978,11 +5109,16 @@ index 1b3435dc..5b4d026a 100644
  }
 diff --git a/src/devices/uart_z85c30.rs b/src/devices/uart_z85c30.rs
 new file mode 100644
-index 00000000..d5ef56bc
+index 00000000..d7333905
 --- /dev/null
 +++ b/src/devices/uart_z85c30.rs
-@@ -0,0 +1,120 @@
-+//! Zilog Z85C30 ESCC inside the SGI Indy's IOC2, polled.
+@@ -0,0 +1,196 @@
++//! Zilog Z85C30 ESCC inside the SGI Indy's IOC2.
++//!
++//! The port starts polled, which is all the early boot can use. Once the
++//! INT3 controller is set up, `enable_interrupts` turns on the receive
++//! interrupt, and optionally a transmit queue drained by the transmit
++//! interrupt for a port that only carries a copy of the console.
 +//!
 +//! Registers are indirect: write the register number to the control port,
 +//! then the value to the same port. The data register has its own port.
@@ -5003,12 +5139,21 @@ index 00000000..d5ef56bc
 +/// a character takes 1 ms.
 +const TX_POLL_LIMIT: u32 = 20_000;
 +
++/// Transmit queue size. At 9600 baud it drains in about two seconds.
++const TX_QUEUE: usize = 2048;
++
 +pub struct SerialPort {
 +    control: *mut u8,
 +    data: *mut u8,
 +    /// The transmitter never became ready once; output is dropped from then
 +    /// on so a dead port cannot hang the console.
 +    tx_stuck: bool,
++    /// Output goes through `queue` and the transmit interrupt, and is
++    /// dropped when the queue is full. Off: `send` waits for the chip.
++    queued: bool,
++    queue: [u8; TX_QUEUE],
++    head: usize,
++    len: usize,
 +}
 +
 +/// Recovery time between accesses to the chip. The Z85C30 needs a few PCLK
@@ -5033,6 +5178,10 @@ index 00000000..d5ef56bc
 +            control: control as *mut u8,
 +            data: (control + 4) as *mut u8,
 +            tx_stuck: false,
++            queued: false,
++            queue: [0; TX_QUEUE],
++            head: 0,
++            len: 0,
 +        }
 +    }
 +
@@ -5067,6 +5216,57 @@ index 00000000..d5ef56bc
 +        self.write_reg(5, 0xea); // DTR, tx 8 bits, transmitter on, RTS
 +    }
 +
++    /// Turn on the receive interrupt, and with `queue_output` the transmit
++    /// interrupt and queue. The chip's interrupt reaches the CPU through
++    /// INT3's mappable line 5.
++    pub fn enable_interrupts(&mut self, queue_output: bool) {
++        self.queued = queue_output;
++        self.write_reg(15, 0x00); // no external/status interrupts
++        // WR1: receive interrupt on every character or special condition
++        // (bits 4:3 = 10), transmit interrupt (bit 1) for a queued port.
++        self.write_reg(1, if queue_output { 0x12 } else { 0x10 });
++        self.write_reg(9, 0x0a); // master interrupt enable, no vector
++    }
++
++    /// Service the transmit side from the interrupt: send the next queued
++    /// byte, or clear the pending transmit interrupt when there is none.
++    pub fn service(&mut self) {
++        // Error reset, for an overrun or framing error latched with the
++        // character, then the highest interrupt under service.
++        unsafe {
++            write_volatile(self.control, 0x30);
++            recover();
++        }
++        if self.queued && self.rr0() & RR0_TX_EMPTY != 0 {
++            if self.len != 0 {
++                let byte = self.queue[self.head];
++                self.head = (self.head + 1) % TX_QUEUE;
++                self.len -= 1;
++                unsafe { write_volatile(self.data, byte) }
++                recover();
++            } else {
++                unsafe {
++                    write_volatile(self.control, 0x28); // reset Tx interrupt pending
++                    recover();
++                }
++            }
++        }
++        unsafe {
++            write_volatile(self.control, 0x38); // reset highest IUS
++            recover();
++        }
++    }
++
++    fn enqueue(&mut self, byte: u8) {
++        if self.len == 0 && self.rr0() & RR0_TX_EMPTY != 0 {
++            unsafe { write_volatile(self.data, byte) }
++            recover();
++        } else if self.len < TX_QUEUE {
++            self.queue[(self.head + self.len) % TX_QUEUE] = byte;
++            self.len += 1;
++        }
++    }
++
 +    pub fn receive(&mut self) -> Option<u8> {
 +        if self.rr0() & RR0_RX_AVAILABLE != 0 {
 +            let byte = unsafe { read_volatile(self.data) };
@@ -5095,6 +5295,13 @@ index 00000000..d5ef56bc
 +
 +    pub fn write(&mut self, buf: &[u8]) {
 +        for &byte in buf {
++            if self.queued {
++                if byte == b'\n' {
++                    self.enqueue(b'\r');
++                }
++                self.enqueue(byte);
++                continue;
++            }
 +            if byte == b'\n' {
 +                self.send(b'\r');
 +            }
