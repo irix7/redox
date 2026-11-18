@@ -1,4 +1,4 @@
-From 9b64738c7516c2a001c0e9b46108f81e17fed476 Mon Sep 17 00:00:00 2001
+From 3b22fd28a8f5ae4b7b83d33d0092780446090380 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
 Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
@@ -55,7 +55,7 @@ Signed-off-by: belikh <io@belic.net>
  src/arch/mips64/paging.rs              |  75 ++
  src/arch/mips64/start.rs               | 392 +++++++++++
  src/arch/mips64/stop.rs                |  47 ++
- src/arch/mips64/time.rs                | 205 ++++++
+ src/arch/mips64/time.rs                | 219 ++++++
  src/arch/mod.rs                        |   6 +
  src/context/arch/mips64.rs             | 235 +++++++
  src/context/context.rs                 |  93 ++-
@@ -71,7 +71,7 @@ Signed-off-by: belikh <io@belic.net>
  src/scheme/irq.rs                      |   2 +
  src/scheme/proc.rs                     |   8 +-
  src/scheme/sys/kdbg.rs                 | 165 +++++
- src/scheme/sys/mod.rs                  |  34 +
+ src/scheme/sys/mod.rs                  |  39 ++
  src/scheme/user.rs                     |  18 +-
  src/startup/mod.rs                     |  20 +-
  src/syscall/process.rs                 |   4 +
@@ -79,7 +79,7 @@ Signed-off-by: belikh <io@belic.net>
  syscall/src/data.rs                    |   6 +
  syscall/src/lib.rs                     |   5 +
  targets/mips64-unknown-kernel.json     |  31 +
- 51 files changed, 6449 insertions(+), 44 deletions(-)
+ 51 files changed, 6468 insertions(+), 44 deletions(-)
  create mode 100644 linkers/mips64.ld
  create mode 100644 rmm/src/arch/mips.rs
  create mode 100644 src/arch/mips64/cache.rs
@@ -5294,10 +5294,10 @@ index 00000000..49d7eee0
 +}
 diff --git a/src/arch/mips64/time.rs b/src/arch/mips64/time.rs
 new file mode 100644
-index 00000000..983e3c92
+index 00000000..06a79466
 --- /dev/null
 +++ b/src/arch/mips64/time.rs
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,219 @@
 +//! Monotonic time from CP0 Count.
 +//!
 +//! Count runs at half the pipeline clock. The PROM measures the CPU clock
@@ -5436,14 +5436,23 @@ index 00000000..983e3c92
 +
 +/// User-mode samples of one program, chosen by the last four characters
 +/// of its name: 256-byte buckets of its first 2 MiB.
-+const PROFILE_USER_TAG: u32 = u32::from_be_bytes(*b"tack");
++static PROFILE_USER_TAG: AtomicU32 = AtomicU32::new(u32::from_be_bytes(*b"tack"));
++
++/// Choose the program whose user-mode PC is sampled, by the last four
++/// characters of its name (`profile=ebfs` to `/scheme/sys/kstop`).
++pub fn profile_program(tag: [u8; 4]) {
++    PROFILE_USER_TAG.store(u32::from_be_bytes(tag), Ordering::Relaxed);
++    for bucket in PROFILE_USER_PC.iter() {
++        bucket.store(0, Ordering::Relaxed);
++    }
++}
 +static PROFILE_USER_PC: [core::sync::atomic::AtomicU16; PROFILE_BUCKETS] =
 +    [const { core::sync::atomic::AtomicU16::new(0) }; PROFILE_BUCKETS];
 +
 +pub fn profile_sample(epc: usize, user: bool) {
 +    if user {
 +        PROFILE_USER.fetch_add(1, Ordering::Relaxed);
-+        if crate::arch::cache::current_tag() == PROFILE_USER_TAG
++        if crate::arch::cache::current_tag() == PROFILE_USER_TAG.load(Ordering::Relaxed)
 +            && let Some(bucket) = PROFILE_USER_PC.get(epc >> 8)
 +        {
 +            bucket.fetch_add(1, Ordering::Relaxed);
@@ -5491,7 +5500,12 @@ index 00000000..983e3c92
 +            top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 +        }
 +    }
-+    info!("Indy: profile: {} samples in netstack", total);
++    let tag = PROFILE_USER_TAG.load(Ordering::Relaxed).to_be_bytes();
++    info!(
++        "Indy: profile: {} samples in the program ending in '{}'",
++        total,
++        core::str::from_utf8(&tag).unwrap_or("?")
++    );
 +    for chunk in top.chunks(12) {
 +        let mut line = alloc::string::String::new();
 +        for (count, bucket) in chunk {
@@ -6762,7 +6776,7 @@ index 00000000..05282a3f
 +    }
 +}
 diff --git a/src/scheme/sys/mod.rs b/src/scheme/sys/mod.rs
-index f4c0dba6..096deac5 100644
+index f4c0dba6..c4eac6f5 100644
 --- a/src/scheme/sys/mod.rs
 +++ b/src/scheme/sys/mod.rs
 @@ -31,6 +31,8 @@ mod cpu;
@@ -6787,7 +6801,7 @@ index f4c0dba6..096deac5 100644
      // Disabled because the debugger is inherently unsafe and probably will break the system.
      /*
      ("trigger_debugger", Rd(|token| unsafe {
-@@ -103,6 +111,32 @@ const FILES: &[(&str, Kind)] = &[
+@@ -103,6 +111,37 @@ const FILES: &[(&str, Kind)] = &[
              match arg.trim_ascii() {
                  b"shutdown" => crate::stop::kstop(token),
                  b"reset" => crate::stop::kreset(),
@@ -6797,6 +6811,11 @@ index f4c0dba6..096deac5 100644
 +                b"profile" => {
 +                    crate::arch::time::profile_log();
 +                    Ok(0)
++                }
++                #[cfg(target_arch = "mips64")]
++                [b'p', b'r', b'o', b'f', b'i', b'l', b'e', b'=', a, b, c, d] => {
++                    crate::arch::time::profile_program([*a, *b, *c, *d]);
++                    Ok(arg.len())
 +                }
 +                #[cfg(target_arch = "mips64")]
 +                b"cachestat" => {

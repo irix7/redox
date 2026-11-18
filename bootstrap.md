@@ -856,8 +856,12 @@ and none of them is on the critical path to "the machine runs our code".
   cost about 3 microseconds each, ten per scheme call. The cache code's index-type
   operations now run a few thousand times per boot. The `Flusher` drops all of an
   address space's TLB entries when any of its mappings change. smoltcp's CUBIC uses
-  floating point, which is soft float here. Tools: `TRAP_TIMING` in
-  `arch/mips64/cache.rs` (per program, syscall and descriptor), the user-PC profile, the
+  floating point, which is soft float here (the R4600's FPU is unused: the target is
+  `+soft-float` and the kernel leaves CP1 off). `webfs`'s share is about half SHA-256
+  (`sha2::sha256::compress256`, about 2.2 MB/s on this CPU) and a quarter the kernel
+  side of its TCP reads. Tools: `TRAP_TIMING` in
+  `arch/mips64/cache.rs` (per program, syscall and descriptor), the user-PC profile
+  (`profile NAME`, then `profile`, in `indy-sh`), the
   named off-colour list and the PROM inventory in `cachestat`.
 - **T8h — Doom.** 2026-11-18, in the emulator. `doom-rs` (github.com/bejiihiu/doom-rs,
   GPL-2.0-or-later, a Rust rewrite of linuxdoom-1.10 with fixed-point maths and UDP net

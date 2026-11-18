@@ -105,6 +105,18 @@ fn run(line: &str, out: &mut dyn Write) -> bool {
         }
         "bench" => bench(out),
         "polltest" => polltest(out),
+        // `profile NAME` chooses the program whose user-mode PC is sampled
+        // (the kernel matches the last four characters of its name) and
+        // clears its counts; `profile` prints and clears every count.
+        "profile" if args.first().is_some() => {
+            let name = args[0].as_bytes();
+            let mut tag = *b"    ";
+            let tail = &name[name.len().saturating_sub(4)..];
+            tag[..tail.len()].copy_from_slice(tail);
+            let command = [b"profile=".as_slice(), &tag].concat();
+            let _ = fs::write("/scheme/sys/kstop", command);
+            let _ = writeln!(out, "profiling {}\r", args[0]);
+        }
         "profile" => {
             let _ = fs::write("/scheme/sys/kstop", "profile");
             let log = fs::read("/scheme/sys/log").unwrap_or_default();
