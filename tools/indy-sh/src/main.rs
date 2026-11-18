@@ -255,7 +255,16 @@ fn tcp_server() {
     // The kernel reboots a test image that never gets this far.
     let _ = fs::write("/scheme/sys/kstop", "disarm");
     for stream in listener.incoming().flatten() {
-        thread::spawn(move || serve(stream));
+        // Out of memory must not take the maintenance shell down with it:
+        // a session that cannot get a thread is dropped, and the listener
+        // goes on.
+        if thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || serve(stream))
+            .is_err()
+        {
+            println!("indy-sh: no thread for a TCP session (out of memory?)\r");
+        }
     }
 }
 

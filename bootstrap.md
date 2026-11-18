@@ -809,7 +809,16 @@ and none of them is on the critical path to "the machine runs our code".
   the front end forces, the engine no longer renders music (a whole track up front,
   33 MB for E1M1) or preloads sounds: its heap in E1M1 is 8.4 MB on the host. In iris:
   title, menu, E1M1, walking and firing, quit back to the shell, 24.9 frames a second.
-  Not run on the real machine; no sound; net play not tried yet.
+  No sound.
+  Net play, same day: a two-player game between the real Indy and the build host over
+  the LAN ran in lockstep for 60 s (the host's player counted 35 tics a second while the
+  Indy was in the game). Both ran the front end's `--headless` mode, which needs no
+  terminal: `doom --headless 60 -warp 1 1 -port 5029 -net 10.1.1.112:5029
+  10.1.1.3:20530` on the Indy and the same list with `-port 20530` on the host (the
+  host's firewall only passes UDP 20000 to 32000). The Indy took about 150 s to load the
+  program and the WAD before it joined. That test ran while the owner was using the
+  machine and it ran out of memory; the maintenance shell died with it because it
+  panicked when it could not start a thread, which is fixed.
 - **T9 — next.** T8f on the real machine (`cachestat` after typing); a faster scroll
   (TOPSCAN). Then: each process is still a
   private static image read whole (no shared or demand-paged text), `zerod` runs twice,
