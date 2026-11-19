@@ -44,5 +44,5 @@ UNIT
 
 $BASE/target/release/redox-initfs-ar "$DIR" \
   $BASE/bootstrap/target/mips64-sgi-redox/release/bootstrap -o "$DIR.img"
-tools/ecoff/target/release/ecoff convert build/indy/kernel/kernel "$OUT" --append "$DIR.img"
+tools/ecoff/target/release/ecoff convert "${KERNEL_ELF:-build/indy/kernel/kernel}" "$OUT" --append "$DIR.img"
 ls -l "$DIR.img" "$DIR/bin"

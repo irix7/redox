@@ -134,7 +134,7 @@ IMAGE_DEPS=$(INDY_ELF) $(ECOFF) $(BOOTSTRAP_ELF) $(INITFS_AR) $(BASE_OUT)/init $
 	tools/indy-image.sh $(wildcard config/indy/init.d/* config/indy/net/*)
 
 $(INDY_BUILD)/redox: $(IMAGE_DEPS)
-	tools/indy-image.sh $@ $(INITFS_DIR) "$(INDY_ROOT_URL)" $(INDY_ROOT_ARGS)
+	KERNEL_ELF=$(INDY_ELF) tools/indy-image.sh $@ $(INITFS_DIR) "$(INDY_ROOT_URL)" $(INDY_ROOT_ARGS)
 	llvm-size $(INDY_KERNEL_ALL)
 
 $(INDY_BUILD)/redox-gate: $(IMAGE_DEPS)

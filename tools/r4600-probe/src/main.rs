@@ -11,6 +11,26 @@ use std::time::Instant;
 std::arch::global_asm!(
     ".set noreorder",
     ".set nomacro",
+    ".global probe_fpregs",
+    "probe_fpregs:",
+    "ldc1 $f0, 0($4)",
+    "ldc1 $f1, 8($4)",
+    "ldc1 $f2, 16($4)",
+    "ldc1 $f3, 24($4)",
+    "ldc1 $f4, 32($4)",
+    "ldc1 $f5, 40($4)",
+    "sdc1 $f0, 0($5)",
+    "sdc1 $f1, 8($5)",
+    "sdc1 $f2, 16($5)",
+    "sdc1 $f3, 24($5)",
+    "sdc1 $f4, 32($5)",
+    "sdc1 $f5, 40($5)",
+    "jr $31",
+    "nop",
+);
+std::arch::global_asm!(
+    ".set noreorder",
+    ".set nomacro",
     ".set noat",
     ".global probe_alu",
     "probe_alu:",
@@ -22,6 +42,7 @@ std::arch::global_asm!(
     "addiu $4, $4, -1",
     "bnez $4, 1b",
     "nop",
+    "move $2, $4",
     "jr $31",
     "nop",
     ".global probe_mult",
@@ -36,6 +57,7 @@ std::arch::global_asm!(
     "addiu $4, $4, -1",
     "bnez $4, 2b",
     "nop",
+    "move $2, $4",
     "jr $31",
     "nop",
     ".global probe_div",
@@ -50,6 +72,7 @@ std::arch::global_asm!(
     "addiu $4, $4, -1",
     "bnez $4, 3b",
     "nop",
+    "move $2, $4",
     "jr $31",
     "nop",
     ".global probe_add_s",
@@ -65,6 +88,7 @@ std::arch::global_asm!(
     "addiu $4, $4, -1",
     "bnez $4, 4b",
     "nop",
+    "move $2, $4",
     "jr $31",
     "nop",
     ".global probe_mul_s",
@@ -80,26 +104,28 @@ std::arch::global_asm!(
     "addiu $4, $4, -1",
     "bnez $4, 5b",
     "nop",
+    "move $2, $4",
     "jr $31",
     "nop",
 );
 
 unsafe extern "C" {
-    fn probe_alu(n: u64);
-    fn probe_mult(n: u64);
-    fn probe_div(n: u64);
-    fn probe_add_s(n: u64);
-    fn probe_mul_s(n: u64);
+    fn probe_fpregs(src: *const u64, dst: *mut u64);
+    fn probe_alu(n: u64) -> u64;
+    fn probe_mult(n: u64) -> u64;
+    fn probe_div(n: u64) -> u64;
+    fn probe_add_s(n: u64) -> u64;
+    fn probe_mul_s(n: u64) -> u64;
 }
 
 const ITER: u64 = 2_000_000;
 
 // Each chain is called directly. Passing the functions through a fn pointer
 // made the code load the target address from memory, so the loop never ran.
-fn time_alu() -> f64 {
+fn time_alu() -> (f64, u64) {
     let start = Instant::now();
-    unsafe { probe_alu(ITER) };
-    start.elapsed().as_nanos() as f64 / ITER as f64
+    let left = unsafe { probe_alu(ITER) };
+    (start.elapsed().as_nanos() as f64 / ITER as f64, left)
 }
 
 fn time_mult() -> f64 {
@@ -127,24 +153,22 @@ fn time_mul_s() -> f64 {
 }
 
 fn main() {
-    // Clock check: a one-second sleep must read about 1e9 ns.
-    let t0 = Instant::now();
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    println!("clock check: sleep(1s) measured {} ns", t0.elapsed().as_nanos());
-    // 8 dependent addu per iteration: 8 cycles at 1 cycle each.
-    let alu = time_alu() / 8.0;
-    println!("alu  addu chain: {alu:.3} ns per op (1 cycle assumed)");
-    println!("implied CPU clock: {:.1} MHz", 1000.0 / alu);
-
-    let report = |name: &str, per_iter_ns: f64, ops_per_iter: f64| {
-        let per_op = per_iter_ns / ops_per_iter;
-        println!(
-            "{name:<10} {per_op:>9.2} ns/op {:>8.2} cycles/op (ALU calibrated)",
-            per_op / alu
-        );
-    };
-    report("mult+mflo", time_mult(), 4.0);
-    report("div+mflo", time_div(), 2.0);
-    report("add.s", time_add_s(), 8.0);
-    report("mul.s", time_mul_s(), 8.0);
+    // Round trip six known 64-bit patterns through $f0 to $f5.
+    let src: [u64; 6] = [
+        0x1111_1111_1111_1111, 0x2222_2222_2222_2222, 0x3333_3333_3333_3333,
+        0x4444_4444_4444_4444, 0x5555_5555_5555_5555, 0x6666_6666_6666_6666,
+    ];
+    let mut dst = [0u64; 6];
+    unsafe { probe_fpregs(src.as_ptr(), dst.as_mut_ptr()) };
+    for i in 0..6 {
+        let ok = if src[i] == dst[i] { "ok" } else { "MISMATCH" };
+        println!("fpreg f{i}: stored {:#018x} read back {:#018x} {ok}", src[i], dst[i]);
+    }
+    let a = std::hint::black_box(1000.0f64);
+    let b = std::hint::black_box(8.0f64);
+    println!("fp self-test: 1000.0/8.0 bits {:#018x} (expected 0x405f400000000000)", (a / b).to_bits());
+    // Deliberate fault: the kernel logs the user Status in dmesg (FR is bit 26).
+    println!("status probe: executing pref to log the user Status");
+    let buf = [0u8; 16];
+    unsafe { std::arch::asm!("pref 0, 0({p})", p = in(reg) buf.as_ptr()) };
 }
