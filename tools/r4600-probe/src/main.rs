@@ -153,22 +153,20 @@ fn time_mul_s() -> f64 {
 }
 
 fn main() {
-    // Round trip six known 64-bit patterns through $f0 to $f5.
-    let src: [u64; 6] = [
-        0x1111_1111_1111_1111, 0x2222_2222_2222_2222, 0x3333_3333_3333_3333,
-        0x4444_4444_4444_4444, 0x5555_5555_5555_5555, 0x6666_6666_6666_6666,
-    ];
-    let mut dst = [0u64; 6];
-    unsafe { probe_fpregs(src.as_ptr(), dst.as_mut_ptr()) };
-    for i in 0..6 {
-        let ok = if src[i] == dst[i] { "ok" } else { "MISMATCH" };
-        println!("fpreg f{i}: stored {:#018x} read back {:#018x} {ok}", src[i], dst[i]);
-    }
-    let a = std::hint::black_box(1000.0f64);
-    let b = std::hint::black_box(8.0f64);
-    println!("fp self-test: 1000.0/8.0 bits {:#018x} (expected 0x405f400000000000)", (a / b).to_bits());
-    // Deliberate fault: the kernel logs the user Status in dmesg (FR is bit 26).
-    println!("status probe: executing pref to log the user Status");
-    let buf = [0u8; 16];
-    unsafe { std::arch::asm!("pref 0, 0({p})", p = in(reg) buf.as_ptr()) };
+    // Clock check: a one-second sleep, in integer nanoseconds.
+    let t0 = Instant::now();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    println!("clock check ns {}", t0.elapsed().as_nanos());
+
+    // Raw totals: nanoseconds for each chain and the counter left after it.
+    let run = |name: &str, f: unsafe extern "C" fn(u64) -> u64, n: u64| {
+        let t = Instant::now();
+        let left = unsafe { f(n) };
+        println!("{name} iter {n} total_ns {} left {left}", t.elapsed().as_nanos());
+    };
+    run("alu", probe_alu, ITER);
+    run("mult", probe_mult, ITER);
+    run("div", probe_div, ITER);
+    run("add_s", probe_add_s, ITER);
+    run("mul_s", probe_mul_s, ITER);
 }
