@@ -24,7 +24,7 @@ export TARGET_SPEC="$ROOT/targets/mips64-sgi-redox.json"
 export USE_RUST_LIBM=1
 export CARGOFLAGS="-Z build-std=core,alloc,compiler_builtins -Zjson-target-spec"
 export CC_mips64_sgi_redox="$SDK/bin/mips64-buildroot-linux-uclibc-gcc"
-export CFLAGS_mips64_sgi_redox="-mabi=n32 -EB -march=mips3 -msoft-float -mno-abicalls -fno-pic -G0 -ffreestanding"
+export CFLAGS_mips64_sgi_redox="-mabi=n32 -EB -march=mips3 -mhard-float -mno-abicalls -fno-pic -G0 -ffreestanding"
 export AR="$SDK/bin/mips64-buildroot-linux-uclibc-ar"
 export NM="$SDK/bin/mips64-buildroot-linux-uclibc-nm"
 export OBJCOPY="$SDK/bin/mips64-buildroot-linux-uclibc-objcopy"

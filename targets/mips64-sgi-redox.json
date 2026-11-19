@@ -9,7 +9,7 @@
   "emit-debug-gdb-scripts": false,
   "env": "relibc",
   "executables": true,
-  "features": "+mips3,+soft-float,+noabicalls",
+  "features": "+mips3,+noabicalls",
   "linker": "rust-lld",
   "linker-flavor": "gnu-lld",
   "llvm-abiname": "n32",

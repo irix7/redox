@@ -105,6 +105,7 @@ fn run(line: &str, out: &mut dyn Write) -> bool {
         }
         "bench" => bench(out),
         "polltest" => polltest(out),
+        "fptest" => fptest(out),
         // `profile NAME` chooses the program whose user-mode PC is sampled
         // (the kernel matches the last four characters of its name) and
         // clears its counts; `profile` prints and clears every count.
@@ -583,4 +584,45 @@ fn sigtest(out: &mut dyn Write) {
         out,
         "sigtest {verdict}: {hits} handler calls, {failed} raise errors, checksum {with:#x} (expect {plain:#x})\r"
     );
+}
+
+/// Float work across context switches. Four threads run the same f64 and
+/// f32 recurrence and yield after every step, so the kernel switches between
+/// them while each holds live FPU registers. Each result must equal the
+/// single-thread run. A register shared or lost across a switch shows as a
+/// mismatch.
+fn fptest(out: &mut dyn Write) {
+    fn work(seed: u64) -> (u64, u32) {
+        let mut x = seed as f64 * 0.001 + 1.0;
+        let mut y = 0.5f32 + seed as f32;
+        for _ in 0..2000 {
+            x = x * 1.000_000_3 + 0.25;
+            y = y * 0.999 + 0.5;
+            std::thread::yield_now();
+        }
+        (x.to_bits(), y.to_bits())
+    }
+    let expect: Vec<(u64, u32)> = (1..=4).map(|s| work(s)).collect();
+    let handles: Vec<_> = (1..=4u64)
+        .map(|s| std::thread::spawn(move || work(s)))
+        .collect();
+    let mut bad = 0;
+    for (i, h) in handles.into_iter().enumerate() {
+        match h.join() {
+            Ok(got) if got == expect[i] => {}
+            Ok(got) => {
+                bad += 1;
+                let _ = writeln!(out, "fptest: thread {} got {:?}, expected {:?}\r", i + 1, got, expect[i]);
+            }
+            Err(_) => {
+                bad += 1;
+                let _ = writeln!(out, "fptest: thread {} panicked\r", i + 1);
+            }
+        }
+    }
+    if bad == 0 {
+        let _ = writeln!(out, "fptest: 4 threads match the single-thread result\r");
+    } else {
+        let _ = writeln!(out, "fptest: {bad} thread(s) differ\r");
+    }
 }

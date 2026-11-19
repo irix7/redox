@@ -32,7 +32,7 @@ export CARGO_PROFILE_RELEASE_STRIP=symbols CARGO_PROFILE_RELEASE_DEBUG=0
 SDK="${INDY_MIPS_SDK:-/mnt/europa/toolchains/mips64-n32--uclibc--stable-2026.08-1}"
 export CC_mips64_sgi_redox="$SDK/bin/mips64-buildroot-linux-uclibc-gcc"
 export AR_mips64_sgi_redox="$SDK/bin/mips64-buildroot-linux-uclibc-ar"
-export CFLAGS_mips64_sgi_redox="-mabi=n32 -EB -march=mips3 -msoft-float -mno-abicalls -fno-pic -G0 -ffreestanding -Os -ffunction-sections -fdata-sections"
+export CFLAGS_mips64_sgi_redox="-mabi=n32 -EB -march=mips3 -mhard-float -mno-abicalls -fno-pic -G0 -ffreestanding -Os -ffunction-sections -fdata-sections"
 cd "$ROOT/$DIR"
 cargo build --release "$@" \
   --config "patch.crates-io.libc.path=\"$ROOT/vendor/libc-0.2.191\"" \

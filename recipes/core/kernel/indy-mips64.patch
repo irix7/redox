@@ -1,7 +1,7 @@
 From 3b22fd28a8f5ae4b7b83d33d0092780446090380 Mon Sep 17 00:00:00 2001
 From: belikh <io@jupiter.au>
 Date: Tue, 17 Nov 2026 09:24:42 +1000
-Subject: [PATCH] Add the mips64 arch layer for the SGI Indy (IP24)
+Subject: [PATCH 1/2] Add the mips64 arch layer for the SGI Indy (IP24)
 
 A MIPS R4400 n32 big-endian kernel with 32-bit addresses, entered directly
 from the SGI PROM over `boot -f bootp()redox` (ECOFF, no bootloader).
@@ -7264,6 +7264,514 @@ index 00000000..38ecdbf1
 +  "target-pointer-width": 32,
 +  "vendor": "sgi"
 +}
+-- 
+2.56.0
+
+
+From 2a3b8fa5218e997f87f3fb25b0c836b998e42d89 Mon Sep 17 00:00:00 2001
+From: belikh <io@belic.net>
+Date: Thu, 19 Nov 2026 10:37:57 +1000
+Subject: [PATCH 2/2] mips64: FPU context switch, cache-error vector,
+ delay-slot resume, WAIT
+
+The R4600 has its FPU on chip, so userland is hard float. The kernel stays
+soft float; only the routines below use FPU instructions.
+
+- context/arch/mips64.rs: fp_save and fp_load store and load the 16 even
+  doubleword pairs and FCR31 in the context's kfx. switch_to saves the
+  outgoing context's FPU state when its trap frame has Status.CU1, and loads
+  the incoming one's under the same condition.
+- interrupt/exception.rs: a coprocessor-unusable trap for CU1 from user mode
+  zeroes the FPU registers and sets CU1 in the frame, then retries.
+- interrupt/exception.rs: the syscall and rdhwr paths resume at the branch
+  outcome when Cause.BD is set, instead of EPC + 4. The branch is decoded
+  from the user text, with FCR31 read for BC1.
+- interrupt/exception.rs: cache_error_stub at physical 0x100 (vector
+  0xA0000100) records CacheErr and ErrorEPC at 0x140 and 0x148 in uncached
+  RAM and stops.
+- interrupt/handler.rs: pop_registers writes Status with IE clear, waits
+  three instructions, then writes IE back.
+- interrupt/mod.rs: enable_and_halt uses WAIT (0x42000020), not a spin.
+
+Memory: kernel.all text 1085440 -> 1089536 bytes (+4096); data 24576 and
+bss 139264 unchanged; total 1249280 -> 1253376 (+4096). Measured on the
+R4600 and boot-gated on iris; fptest passes on the real Indy.
+
+Signed-off-by: belikh <io@jupiter.au>
+Signed-off-by: belikh <io@belic.net>
+---
+ src/arch/mips64/interrupt/exception.rs | 194 +++++++++++++++++++++----
+ src/arch/mips64/interrupt/handler.rs   |  10 ++
+ src/arch/mips64/interrupt/mod.rs       |  10 +-
+ src/context/arch/mips64.rs             | 140 +++++++++++++++++-
+ src/context/mod.rs                     |   4 +
+ 5 files changed, 324 insertions(+), 34 deletions(-)
+
+diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
+index 0d832f1f..c17f0820 100644
+--- a/src/arch/mips64/interrupt/exception.rs
++++ b/src/arch/mips64/interrupt/exception.rs
+@@ -38,36 +38,77 @@ const VECTOR_GENERAL: usize = 0x8000_0180;
+ /// workaround early R4600 revisions need for that operation.
+ pub unsafe fn install_vectors() {
+     unsafe {
+-        for vector in [VECTOR_TLB_REFILL, VECTOR_XTLB_REFILL, VECTOR_GENERAL] {
+-            // Refills go to the assembly handler, everything else to the
+-            // general entry.
+-            let stub = if vector == VECTOR_GENERAL {
+-                vector_stub as usize
+-            } else {
+-                refill_stub as usize
+-            } as *const u32;
+-            let _ = (vector as *const u32).read_volatile();
+-            core::arch::asm!(
+-                "cache 21, 0({0})", // Hit_Writeback_Inv_D
+-                in(reg) vector,
+-                options(nostack)
+-            );
+-            let dst = (vector | 0x2000_0000) as *mut u32;
+-            for i in 0..VECTOR_STUB_WORDS {
+-                dst.add(i).write_volatile(stub.add(i).read_volatile());
+-            }
+-            core::arch::asm!(
+-                "cache 16, 0({0})", // Hit_Invalidate_I
+-                in(reg) vector,
+-                options(nostack)
+-            );
++        install_stub(VECTOR_TLB_REFILL, refill_stub as usize, VECTOR_STUB_WORDS);
++        install_stub(VECTOR_XTLB_REFILL, refill_stub as usize, VECTOR_STUB_WORDS);
++        install_stub(VECTOR_GENERAL, vector_stub as usize, VECTOR_STUB_WORDS);
++        install_stub(VECTOR_CACHE_ERROR, cache_error_stub as usize, CACHE_ERROR_STUB_WORDS);
++    }
++}
++
++/// Copy `words` instruction words from `stub` to the physical address behind
++/// `vector` (kseg0 address), writing through kseg1 as described above.
++unsafe fn install_stub(vector: usize, stub: usize, words: usize) {
++    unsafe {
++        let stub = stub as *const u32;
++        let _ = (vector as *const u32).read_volatile();
++        core::arch::asm!(
++            "cache 21, 0({0})", // Hit_Writeback_Inv_D
++            in(reg) vector,
++            options(nostack)
++        );
++        let dst = (vector | 0x2000_0000) as *mut u32;
++        for i in 0..words {
++            dst.add(i).write_volatile(stub.add(i).read_volatile());
+         }
++        core::arch::asm!(
++            "cache 16, 0({0})", // Hit_Invalidate_I
++            in(reg) vector,
++            options(nostack)
++        );
+     }
+ }
+ 
+ /// Instruction words in `vector_stub`.
+ const VECTOR_STUB_WORDS: usize = 4;
+ 
++/// Cache error vector, used with `Status.BEV` clear: `0xA000_0100` is
++/// physical 0x100, uncached. The gap between the XTLB stub and the general
++/// vector holds it.
++const VECTOR_CACHE_ERROR: usize = 0x8000_0100;
++
++/// Instruction words in `cache_error_stub`.
++const CACHE_ERROR_STUB_WORDS: usize = 9;
++
++/// Where `cache_error_stub` records `CacheErr` and `ErrorEPC`: uncached
++/// words at physical 0x140 and 0x148, inside the same gap and below the
++/// general vector. Nothing prints them. Read them with `peek` in the
++/// bring-up shell, or in the debugger, before a reboot clears RAM.
++pub const CACHE_ERROR_RECORD: usize = 0xA000_0140;
++
++/// Record `CacheErr` and `ErrorEPC` and stop. A cache error leaves the cache
++/// in an unknown state, so the CPU spins with interrupts off instead of
++/// returning. The stub uses only uncached kseg1 addresses and k0/k1.
++#[unsafe(naked)]
++unsafe extern "C" fn cache_error_stub() {
++    naked_asm!(
++        "
++        .set noreorder
++        .set noat
++        lui     $26, 0xa000             // kseg1: uncached, unmapped
++        mfc0    $27, $27                // CacheErr
++        nop
++        sw      $27, 0x140($26)
++        dmfc0   $27, $30                // ErrorEPC
++        nop
++        sd      $27, 0x148($26)
++    1:  b       1b
++        nop
++        .set at
++        .set reorder
++        "
++    )
++}
++
+ /// Position-independent: `la` expands to lui/ori with the absolute address.
+ #[unsafe(naked)]
+ unsafe extern "C" fn vector_stub() {
+@@ -557,14 +598,112 @@ unsafe fn handle_system_exception(regs: &InterruptStack, exc_code: u32) {
+     unsafe { crate::arch::stop::emergency_reset() }
+ }
+ 
++/// Where the user instruction at EPC resumes after it was emulated or
++/// handled. Outside a delay slot that is the next word. In a delay slot
++/// (`Cause.BD` set, EPC names the branch), the slot has run, so the
++/// resume point is the branch outcome: the target when taken, the word
++/// after the slot when not.
++///
++/// The branch is decoded from the user's text and its registers come from
++/// the saved frame. The branch ran before the slot, so its inputs are the
++/// frame's values. `BC1F/BC1T` read FCR31 from the live FPU, which holds
++/// this thread's state because the branch executed with `CU1` on.
++unsafe fn resume_pc(regs: &InterruptStack) -> u64 {
++    let epc = regs.iret.epc;
++    if regs.iret.cause as u32 & cause::BD == 0 {
++        return epc + 4;
++    }
++    let slot = epc + 4;
++    let Some(branch) = read_user_insn(epc as usize) else {
++        return slot + 4;
++    };
++    let reg = |n: u32| -> u64 {
++        if n == 0 {
++            0
++        } else {
++            unsafe { (&raw const regs.registers as *const u64).add(n as usize - 1).read_unaligned() }
++        }
++    };
++    let op = branch >> 26;
++    let rs = (branch >> 21) & 31;
++    let rt = (branch >> 16) & 31;
++    let vs = reg(rs) as i64;
++    let vt = reg(rt) as i64;
++    let rel = slot.wrapping_add(((branch as u16 as i16) as i64 * 4) as u64);
++    let taken = match op {
++        // SPECIAL: JR and JALR jump to the register.
++        0 => match branch & 0x3f {
++            8 | 9 => return reg(rs),
++            _ => return unknown_slot(epc, slot),
++        },
++        // J and JAL: the region of the delay slot plus the 26-bit index.
++        2 | 3 => {
++            return (slot & 0xffff_ffff_f000_0000) | (((branch & 0x03ff_ffff) as u64) << 2);
++        }
++        // BEQ, BEQL, BNE, BNEL, BLEZ, BLEZL, BGTZ, BGTZL
++        4 | 20 => vs == vt,
++        5 | 21 => vs != vt,
++        6 | 22 => vs <= 0,
++        7 | 23 => vs > 0,
++        // REGIMM: BLTZ, BGEZ and their likely and link forms.
++        1 => match rt {
++            0 | 2 | 16 | 18 => vs < 0,
++            1 | 3 | 17 | 19 => vs >= 0,
++            _ => return unknown_slot(epc, slot),
++        },
++        // COP1 BC: rt 0 BC1F, 1 BC1T, 2 BC1FL, 3 BC1TL.
++        17 if rs == 8 => {
++            let cond = fcr31_condition();
++            if rt & 1 == 0 { !cond } else { cond }
++        }
++        _ => return unknown_slot(epc, slot),
++    };
++    if taken { rel } else { slot + 4 }
++}
++
++/// Read the FCR31 condition bit. Caller: a trap whose frame has `CU1` set.
++unsafe fn fcr31_condition() -> bool {
++    let fcr31: u32;
++    unsafe {
++        core::arch::asm!(
++            // cfc1 $2, $31, written as a word so the soft-float target
++            // assembles it.
++            ".word 0x4442f800",
++            "nop",
++            out("$2") fcr31,
++            options(nomem, nostack)
++        );
++    }
++    fcr31 & (1 << 23) != 0
++}
++
++/// A delay-slot fault whose branch this decoder does not know. Only
++/// possible for a corrupt text word, so log it and resume after the slot.
++fn unknown_slot(epc: u64, slot: u64) -> u64 {
++    warn!("delay slot at {epc:#x}: branch not decoded, resuming at {slot:#x}");
++    slot + 4
++}
++
+ unsafe fn handle_user_exception(regs: &mut InterruptStack, exc_code: u32) {
+     unsafe {
+         let mut token = CleanLockToken::new();
+ 
++        // First FPU instruction of this context: its FPU registers start at
++        // zero. Give it the FPU (`CU1` in its frame), then retry the instruction.
++        // Later switches save and load the registers (context::arch::switch_to).
++        if exc_code == cause::EXC_CPU
++            && (regs.iret.cause as u32 >> 28) & 3 == 1
++            && regs.iret.status as u32 & cp0::status::CU1 == 0
++        {
++            crate::context::fp_load(&syscall::FloatRegisters::default());
++            regs.iret.status |= cp0::status::CU1 as u64;
++            return;
++        }
++
+         if exc_code == cause::EXC_SYS {
++            // Resume after the syscall. In a delay slot, resume at the branch outcome.
++            regs.iret.epc = resume_pc(regs);
+             let r = &mut regs.registers;
+-            // Skip the syscall instruction. LLVM never places it in a branch delay slot.
+-            regs.iret.epc += 4;
+             // Kernel time per syscall number (buckets 32..96 of the stats).
+             // One bucket per calling program, syscall number and first
+             // argument (the file descriptor of a read or a write).
+@@ -617,12 +756,15 @@ unsafe fn handle_user_exception(regs: &mut InterruptStack, exc_code: u32) {
+         {
+             let rt = ((insn >> 16) & 0x1f) as usize;
+             let tp = regs.registers.gp;
++            // Work out the resume point before the write: a branch in a
++            // delay slot reads the registers the slot is about to change.
++            let resume = unsafe { resume_pc(regs) };
+             if rt != 0 && rt != 26 && rt != 27 {
+                 unsafe {
+                     (&raw mut regs.registers as *mut u64).add(rt - 1).write(tp);
+                 }
+             }
+-            regs.iret.epc += 4;
++            regs.iret.epc = resume;
+             return;
+         }
+ 
+diff --git a/src/arch/mips64/interrupt/handler.rs b/src/arch/mips64/interrupt/handler.rs
+index fced8a75..bb653b9d 100644
+--- a/src/arch/mips64/interrupt/handler.rs
++++ b/src/arch/mips64/interrupt/handler.rs
+@@ -319,7 +319,17 @@ macro_rules! pop_registers {
+     mtlo    $8
+     ld      $8, 248($sp)
+     dmtc0   $8, $14
++    // Status takes effect three instructions late (interrupts sample it at
++    // stage 3). Write it with IE clear, wait out the window, then write IE
++    // back. EXL is already set by the first write, so no interrupt can
++    // arrive with IE set and EXL not yet.
+     ld      $8, 256($sp)
++    addiu   $9, $zero, -2
++    and     $9, $8, $9
++    mtc0    $9, $12
++    nop
++    nop
++    nop
+     mtc0    $8, $12
+     nop
+     nop
+diff --git a/src/arch/mips64/interrupt/mod.rs b/src/arch/mips64/interrupt/mod.rs
+index bd878a28..1e5a6f1e 100644
+--- a/src/arch/mips64/interrupt/mod.rs
++++ b/src/arch/mips64/interrupt/mod.rs
+@@ -21,11 +21,13 @@ pub unsafe fn disable() {
+ /// Performing enable followed by halt is not guaranteed to be atomic, use this instead!
+ #[inline(always)]
+ pub unsafe fn enable_and_halt() {
+-    // The R4400 has no wait instruction: enabling interrupts and spinning is
+-    // the closest thing. The first interrupt returns here.
++    // WAIT (COP0, CO=1, funct 0x20, word 0x42000020) stops the pipeline until
++    // an interrupt is requested. It takes effect only while the SysAD bus is
++    // idle, and otherwise does nothing, so the caller loops. An interrupt
++    // already pending when IE is set is taken before WAIT runs.
+     unsafe {
+-        enable_and_nop();
+-        core::arch::asm!("nop", "nop", options(nomem, nostack));
++        cp0::write_status(cp0::read_status() | cp0::status::IE);
++        core::arch::asm!(".word 0x42000020", "nop", options(nomem, nostack));
+     }
+ }
+ 
+diff --git a/src/context/arch/mips64.rs b/src/context/arch/mips64.rs
+index c8d1533a..1f4c116e 100644
+--- a/src/context/arch/mips64.rs
++++ b/src/context/arch/mips64.rs
+@@ -1,5 +1,8 @@
+ use crate::{
+-    arch::interrupt::InterruptStack, context::context::Kstack, memory::RmmA, percpu::PercpuBlock,
++    arch::{cp0, interrupt::InterruptStack},
++    context::context::Kstack,
++    memory::RmmA,
++    percpu::PercpuBlock,
+     syscall::FloatRegisters,
+ };
+ use crate::arch::interrupt::handler::sign_extend;
+@@ -88,12 +91,22 @@ impl Context {
+ }
+ 
+ impl super::Context {
++    /// The FPU registers of this context. Zero until its first FPU use.
+     pub fn get_fx_regs(&self) -> FloatRegisters {
+-        // TODO: the FPU is disabled (Status.CU1 = 0); userspace is soft float.
+-        FloatRegisters::default()
++        if !frame_uses_fpu(self) {
++            return FloatRegisters::default();
++        }
++        unsafe { self.kfx.as_ptr().cast::<FloatRegisters>().read_unaligned() }
+     }
+ 
+-    pub fn set_fx_regs(&mut self, _new: FloatRegisters) {}
++    /// Set the FPU registers of this context and give it the FPU: its frame
++    /// gets `Status.CU1`, so it loads these on its next switch in.
++    pub fn set_fx_regs(&mut self, new: FloatRegisters) {
++        unsafe { self.kfx.as_mut_ptr().cast::<FloatRegisters>().write_unaligned(new) };
++        if let Some(regs) = self.regs_mut() {
++            regs.iret.status |= cp0::status::CU1 as u64;
++        }
++    }
+ 
+     pub fn current_syscall(&self) -> Option<[usize; 7]> {
+         if !self.inside_syscall {
+@@ -155,9 +168,128 @@ pub unsafe fn empty_cr3() -> rmm::PhysicalAddress {
+     }
+ }
+ 
++/// Whether this context has used the FPU: its trap frame has `Status.CU1`.
++/// Such a context keeps its FPU registers in `kfx`, and a context without
++/// the bit has none, so its first FPU instruction traps and starts from zero.
++fn frame_uses_fpu(context: &super::Context) -> bool {
++    context
++        .regs()
++        .is_some_and(|regs| regs.iret.status as u32 & cp0::status::CU1 != 0)
++}
++
++/// Save the FPU registers of the current context into `out`. Works with
++/// `CU1` off: it turns `CU1` on for the save, then restores the old Status.
++/// FR is 0, so the 16 even doubleword pairs hold all 32 single registers.
++#[unsafe(naked)]
++pub(crate) unsafe extern "C" fn fp_save(out: *mut FloatRegisters) {
++    core::arch::naked_asm!(
++        "
++        .set noreorder
++        .set noat
++        .set hardfloat                  // the kernel is soft float; only these two use FPU instructions
++        mfc0    $11, $12                // old Status
++        lui     $10, 0x2000             // CU1
++        or      $10, $11, $10
++        mtc0    $10, $12
++        nop
++        nop
++        nop
++        nop
++        sdc1    $f0, 0($4)
++        sdc1    $f2, 8($4)
++        sdc1    $f4, 16($4)
++        sdc1    $f6, 24($4)
++        sdc1    $f8, 32($4)
++        sdc1    $f10, 40($4)
++        sdc1    $f12, 48($4)
++        sdc1    $f14, 56($4)
++        sdc1    $f16, 64($4)
++        sdc1    $f18, 72($4)
++        sdc1    $f20, 80($4)
++        sdc1    $f22, 88($4)
++        sdc1    $f24, 96($4)
++        sdc1    $f26, 104($4)
++        sdc1    $f28, 112($4)
++        sdc1    $f30, 120($4)
++        cfc1    $10, $31
++        nop
++        sw      $10, {fcsr}($4)
++        mtc0    $11, $12
++        nop
++        nop
++        jr      $31
++        nop
++        .set softfloat
++        .set at
++        .set reorder
++        ",
++        fcsr = const offset_of!(FloatRegisters, fcsr),
++    )
++}
++
++/// Load the FPU registers of the current context from `src`, as `fp_save`
++/// stores them. The same `CU1` handling applies.
++#[unsafe(naked)]
++pub(crate) unsafe extern "C" fn fp_load(src: *const FloatRegisters) {
++    core::arch::naked_asm!(
++        "
++        .set noreorder
++        .set noat
++        .set hardfloat                  // the kernel is soft float; only these two use FPU instructions
++        mfc0    $11, $12                // old Status
++        lui     $10, 0x2000             // CU1
++        or      $10, $11, $10
++        mtc0    $10, $12
++        nop
++        nop
++        nop
++        nop
++        ldc1    $f0, 0($4)
++        ldc1    $f2, 8($4)
++        ldc1    $f4, 16($4)
++        ldc1    $f6, 24($4)
++        ldc1    $f8, 32($4)
++        ldc1    $f10, 40($4)
++        ldc1    $f12, 48($4)
++        ldc1    $f14, 56($4)
++        ldc1    $f16, 64($4)
++        ldc1    $f18, 72($4)
++        ldc1    $f20, 80($4)
++        ldc1    $f22, 88($4)
++        ldc1    $f24, 96($4)
++        ldc1    $f26, 104($4)
++        ldc1    $f28, 112($4)
++        ldc1    $f30, 120($4)
++        lw      $10, {fcsr}($4)
++        nop
++        ctc1    $10, $31
++        nop
++        nop
++        mtc0    $11, $12
++        nop
++        nop
++        jr      $31
++        nop
++        .set softfloat
++        .set at
++        .set reorder
++        ",
++        fcsr = const offset_of!(FloatRegisters, fcsr),
++    )
++}
++
+ /// Switch to the next context by restoring its stack and registers
+ pub unsafe fn switch_to(prev: &mut super::Context, next: &mut super::Context) {
+     unsafe {
++        // FPU registers belong to the context that used them last. Save the
++        // outgoing context's, and load the incoming one's if it has any.
++        if frame_uses_fpu(prev) {
++            fp_save(prev.kfx.as_mut_ptr().cast());
++        }
++        if frame_uses_fpu(next) {
++            fp_load(next.kfx.as_ptr().cast());
++        }
++
+         PercpuBlock::current()
+             .new_addrsp_tmp
+             .set(next.addr_space.clone());
+diff --git a/src/context/mod.rs b/src/context/mod.rs
+index 3e1ec214..4f645a22 100644
+--- a/src/context/mod.rs
++++ b/src/context/mod.rs
+@@ -76,6 +76,10 @@ pub const CONTEXT_MAX_FILES: usize = 65_536;
+ 
+ pub use self::arch::empty_cr3;
+ 
++/// Load FPU registers on the current CPU (MIPS: the first-use trap zeroes them).
++#[cfg(target_arch = "mips64")]
++pub(crate) use self::arch::fp_load;
++
+ // Set of weak references to all contexts available for scheduling. The only strong references are
+ // the context file descriptors.
+ static CONTEXTS: RwLock<L2, BTreeSet<ContextRef>> = RwLock::new(BTreeSet::new());
 -- 
 2.56.0
 

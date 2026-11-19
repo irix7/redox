@@ -40,7 +40,7 @@ versions, commands and byte counts, not principles.
 |---|---|
 | Machine | SGI Indy (IP24), R4400SC, 75–100 MHz |
 | CPU | MIPS III, 32-bit, **big-endian** |
-| ABI | n32 (`-mabi=n32`), soft float, no abicalls, `-G0` |
+| ABI | n32 (`-mabi=n32`), hard float (FR=0, the R4600's on-chip FPU), no abicalls, `-G0` |
 | RAM | **32 MiB** |
 | Boot | `boot -f bootp()redox` at the PROM Command Monitor; TFTP from the network |
 | Display | Newport (REX3). No GPU acceleration; software rendering only |
@@ -196,7 +196,7 @@ Copy the field values, not the vendor. The load-bearing ones for this port:
 | `cpu` | `mips3` | R4400; do not emit MIPS IV |
 | `target-pointer-width` | `32` | |
 | `max-atomic-width` | `64` | |
-| `features` | `+mips3,+soft-float,+noabicalls` | the Indy has an FPU, but the sibling's ABI is soft float; match it until you have a reason not to |
+| `features` | `+mips3,+noabicalls` | hard float: the R4600 has its FPU on chip (`FIR` 0x2020). The kernel keeps its own soft spec (`recipes/core/kernel/source/targets/mips64-unknown-kernel.json`); its FPU routines are `context::arch::fp_save/fp_load` |
 | `linker` | `rust-lld` | no GNU ld in the target path |
 | `relocation-model` | `static` | no PIC in the kernel |
 | `panic-strategy` | `abort` | Redox already does this; keep it |
@@ -856,8 +856,8 @@ and none of them is on the critical path to "the machine runs our code".
   cost about 3 microseconds each, ten per scheme call. The cache code's index-type
   operations now run a few thousand times per boot. The `Flusher` drops all of an
   address space's TLB entries when any of its mappings change. smoltcp's CUBIC uses
-  floating point, which is soft float here (the R4600's FPU is unused: the target is
-  `+soft-float` and the kernel leaves CP1 off). `webfs`'s share is about half SHA-256
+  floating point. Userland is hard float: the kernel saves and loads the FPU registers
+  per context on switch, with `Status.CU1` in each trap frame as the flag. `webfs`'s share is about half SHA-256
   (`sha2::sha256::compress256`, about 2.2 MB/s on this CPU) and a quarter the kernel
   side of its TCP reads. Tools: `TRAP_TIMING` in
   `arch/mips64/cache.rs` (per program, syscall and descriptor), the user-PC profile
