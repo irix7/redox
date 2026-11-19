@@ -106,7 +106,7 @@ There are three toolchains in play. Know which one you are using.
 
 | Toolchain | Channel | Components | Used for |
 |---|---|---|---|
-| This fork | `nightly-2026-05-24` (`rust-toolchain.toml`) | `rust-src`, `rustfmt`, `clippy` | Redox's own build |
+| This fork | `nightly-2026-10-03` (`rust-toolchain.toml`) | `rust-src`, `rustfmt`, `clippy`, `llvm-tools-preview` | the MIPS n32 target, and Redox's own build (ADR 0001); the kernel keeps `nightly-2026-05-24` |
 | `irix7/os` | `nightly-2026-10-03` (`rust-toolchain.toml`) | `rust-src`, `rustfmt`, `clippy`, `llvm-tools-preview` | the MIPS n32 target |
 
 The two channels differ. **Decide one pin for this fork and record it** (see
