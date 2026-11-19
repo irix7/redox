@@ -66,6 +66,7 @@ $(INITFS_AR): FORCE
 # which stands in for init until base's init builds for the target.
 SYSROOT=$(INDY_BUILD)/sysroot
 INIT_ELF=tools/indy-sh/target/mips64-sgi-redox/release/indy-sh
+SSH_ELF=tools/ssh/target/mips64-sgi-redox/release/ssh
 RUST_SRC?=/mnt/europa/redox-rust-src/library
 
 $(SYSROOT)/lib/libc.a: FORCE
@@ -77,6 +78,11 @@ KDBG_ELF=tools/kdbg/target/mips64-sgi-redox/release/kdbg
 $(KDBG_ELF): $(SYSROOT)/lib/libc.a $(wildcard tools/kdbg/src/*.rs) tools/kdbg/Cargo.toml tools/kdbg/.cargo/config.toml
 	touch tools/kdbg/src/main.rs
 	cd tools/kdbg && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) __CARGO_TESTS_ONLY_SRC_ROOT=$(RUST_SRC) cargo build --release
+
+# The SSH client (tools/ssh): pure-Rust crypto, its own protocol code.
+$(SSH_ELF): $(SYSROOT)/lib/libc.a $(wildcard tools/ssh/src/*.rs) tools/ssh/Cargo.toml tools/ssh/.cargo/config.toml
+	touch tools/ssh/src/main.rs
+	cd tools/ssh && RUSTUP_TOOLCHAIN=$(INDY_RUST_TOOLCHAIN) __CARGO_TESTS_ONLY_SRC_ROOT=$(RUST_SRC) cargo build --release --target ../../targets/mips64-sgi-redox.json -Z json-target-spec
 
 $(INIT_ELF): $(SYSROOT)/lib/libc.a $(wildcard tools/indy-sh/src/*.rs) tools/indy-sh/Cargo.toml tools/indy-sh/.cargo/config.toml
 	touch tools/indy-sh/src/main.rs
@@ -156,7 +162,7 @@ indy-userland: $(SYSROOT)/lib/libc.a
 
 # The root tree: config/indy/root plus the programs, packed into the store.
 # Packing is incremental and only `root` changes for clients.
-indy-root: $(WEBFS_HOST) $(WEBFS_ELF) $(INIT_ELF) $(KDBG_ELF) $(BASE_OUT)/init $(USERLAND_STAMP)
+indy-root: $(WEBFS_HOST) $(WEBFS_ELF) $(INIT_ELF) $(SSH_ELF) $(KDBG_ELF) $(BASE_OUT)/init $(USERLAND_STAMP)
 	rm -rf $(ROOT_DIR)
 	mkdir -p $(ROOT_DIR)/usr/bin
 	cp -r config/indy/root/. $(ROOT_DIR)/
@@ -168,6 +174,7 @@ indy-root: $(WEBFS_HOST) $(WEBFS_ELF) $(INIT_ELF) $(KDBG_ELF) $(BASE_OUT)/init $
 		cp $(GAMES_DIR)/doom/*.wad $(ROOT_DIR)/usr/share/games/doom/; fi
 	for bin in $(ROOT_BINS); do install -m 0755 $(BASE_OUT)/$$bin $(ROOT_DIR)/usr/bin/$$bin; done
 	install -m 0755 $(INIT_ELF) $(ROOT_DIR)/usr/bin/indy-sh
+	install -m 0755 $(SSH_ELF) $(ROOT_DIR)/usr/bin/ssh
 	install -m 0755 $(KDBG_ELF) $(ROOT_DIR)/usr/bin/kdbg
 	install -m 0755 $(WEBFS_ELF) $(ROOT_DIR)/usr/bin/webfs
 	ln -s usr/bin $(ROOT_DIR)/bin
