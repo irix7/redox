@@ -15,7 +15,7 @@ DIR="${1:?usage: userland-indy.sh DIR [CARGO ARGS...]}"
 shift
 unset RUSTUP_TOOLCHAIN
 . "$ROOT/tools/env.sh"
-export RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")"
+. "$ROOT/tools/indy-toolchain.sh"
 export __CARGO_TESTS_ONLY_SRC_ROOT="${RUST_SRC:-/mnt/europa/redox-rust-src/library}"
 # cargo does not track libc.a (a link argument): its hash in the flags makes
 # a rebuilt libc relink every program.

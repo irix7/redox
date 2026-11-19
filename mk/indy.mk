@@ -15,7 +15,12 @@ INDY_TFTP_DIR?=/var/lib/sgi-netboot
 INDY_TFTP_NAMES?=redox
 INDY_MARKER?=addr 192.168
 # The toolchain pin of this fork; the kernel checkout carries upstream's own.
-INDY_RUST_TOOLCHAIN?=nightly-2026-10-03
+# The r4600 toolchain (tools/indy-toolchain.sh, toolchains.md) is the default;
+# set nightly-2026-10-03 to build with the rustup nightly instead.
+INDY_RUST_TOOLCHAIN?=r4600
+ifeq ($(INDY_RUST_TOOLCHAIN),r4600)
+export LD_LIBRARY_PATH := /mnt/europa/rust-r4600/lib$(if $(LD_LIBRARY_PATH),:$(LD_LIBRARY_PATH))
+endif
 
 # The image the PROM loads: the kernel, built from the cookbook's kernel
 # checkout for ARCH=mips64 with the fork's target JSON and linker script.
@@ -138,7 +143,7 @@ $(INDY_BUILD)/redox: $(IMAGE_DEPS)
 	llvm-size $(INDY_KERNEL_ALL)
 
 $(INDY_BUILD)/redox-gate: $(IMAGE_DEPS)
-	tools/indy-image.sh $@ $(INITFS_DIR)-gate "$(GATE_ROOT_URL)" --connect 192.168.0.1 $(ROOT_MOUNT_SIZE)
+	KERNEL_ELF=$(INDY_ELF) tools/indy-image.sh $@ $(INITFS_DIR)-gate "$(GATE_ROOT_URL)" --connect 192.168.0.1 $(ROOT_MOUNT_SIZE)
 
 indy: $(INDY_BUILD)/redox
 

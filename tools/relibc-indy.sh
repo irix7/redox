@@ -18,7 +18,7 @@ unset RUSTUP_TOOLCHAIN
 . "$ROOT/tools/env.sh"
 
 unset RUSTUP_TOOLCHAIN
-export RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")"
+. "$ROOT/tools/indy-toolchain.sh"
 export TARGET=mips64-sgi-redox
 export TARGET_SPEC="$ROOT/targets/mips64-sgi-redox.json"
 export USE_RUST_LIBM=1

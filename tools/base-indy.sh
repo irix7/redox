@@ -11,7 +11,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SYSROOT="${INDY_SYSROOT:-$ROOT/build/indy/sysroot}"
 unset RUSTUP_TOOLCHAIN
 . "$ROOT/tools/env.sh"
-export RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")"
+. "$ROOT/tools/indy-toolchain.sh"
 export __CARGO_TESTS_ONLY_SRC_ROOT="${RUST_SRC:-/mnt/europa/redox-rust-src/library}"
 # cargo does not track libc.a (a link argument): put its hash in the flags so
 # a rebuilt libc relinks every program.
