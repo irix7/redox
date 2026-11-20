@@ -1,0 +1,227 @@
+From c7dc7b2e42b4714afa0fb27f7de4d3109e8ef583 Mon Sep 17 00:00:00 2001
+From: belikh <io@belic.net>
+Date: Thu, 19 Nov 2026 21:00:12 +1000
+Subject: [PATCH] mips64: FPU uses FR=1 (32 doubleword registers)
+
+The userland is built for FR=1: n32 and LLVM mips3 use the 32 doubleword
+register layout. The kernel still ran with FR=0 (16 even pairs), so every
+odd-register double load wrote into its even neighbour and every float
+result was wrong on the Indy.
+
+- cp0.rs: Status.FR (bit 26).
+- exception.rs, context/arch/mips64.rs: the first-use CU1 grant and
+  set_fx_regs set FR with CU1.
+- context/arch/mips64.rs: fp_save and fp_load save and load all 32
+  doubleword registers, and set CU1 and FR while they run.
+- interrupt/handler.rs: user frames start with FR, and the return path
+  sets FR on every return.
+
+Verified on the Indy (R4600, 133 MHz): f0 to f5 round-trip with their own
+values, and 1000.0/8.0 returns 125.0.
+
+Signed-off-by: belikh <io@belic.net>
+---
+ src/arch/mips64/cp0.rs                 |   3 +
+ src/arch/mips64/interrupt/exception.rs |   2 +-
+ src/arch/mips64/interrupt/handler.rs   |   4 +
+ src/context/arch/mips64.rs             | 100 ++++++++++++++++---------
+ 4 files changed, 74 insertions(+), 35 deletions(-)
+
+diff --git a/src/arch/mips64/cp0.rs b/src/arch/mips64/cp0.rs
+index fe08c5ca..46e93246 100644
+--- a/src/arch/mips64/cp0.rs
++++ b/src/arch/mips64/cp0.rs
+@@ -40,6 +40,9 @@ pub mod status {
+     /// Bootstrap exception vectors (PROM) when set.
+     pub const BEV: u32 = 1 << 22;
+     pub const CU1: u32 = 1 << 29;
++    /// 32 64-bit floating-point registers (FR=1). The userland is built for
++    /// FR=1 (n32 and LLVM mips3), so the kernel must set this with CU1.
++    pub const FR: u32 = 1 << 26;
+ }
+ 
+ /// Cause register bits.
+diff --git a/src/arch/mips64/interrupt/exception.rs b/src/arch/mips64/interrupt/exception.rs
+index c17f0820..bca12d84 100644
+--- a/src/arch/mips64/interrupt/exception.rs
++++ b/src/arch/mips64/interrupt/exception.rs
+@@ -696,7 +696,7 @@ unsafe fn handle_user_exception(regs: &mut InterruptStack, exc_code: u32) {
+             && regs.iret.status as u32 & cp0::status::CU1 == 0
+         {
+             crate::context::fp_load(&syscall::FloatRegisters::default());
+-            regs.iret.status |= cp0::status::CU1 as u64;
++            regs.iret.status |= (cp0::status::CU1 | cp0::status::FR) as u64;
+             return;
+         }
+ 
+diff --git a/src/arch/mips64/interrupt/handler.rs b/src/arch/mips64/interrupt/handler.rs
+index bb653b9d..71e39e5d 100644
+--- a/src/arch/mips64/interrupt/handler.rs
++++ b/src/arch/mips64/interrupt/handler.rs
+@@ -112,6 +112,7 @@ impl InterruptStack {
+         // are reserved in user mode without it. With UX set, user TLB misses
+         // arrive at the XTLB refill vector, which has the same stub.
+         self.iret.status = (crate::arch::cp0::status::KSU_USER
++            | crate::arch::cp0::status::FR
+             | crate::arch::cp0::status::UX
+             | crate::arch::cp0::status::EXL
+             | crate::arch::cp0::status::IE
+@@ -324,6 +325,9 @@ macro_rules! pop_registers {
+     // back. EXL is already set by the first write, so no interrupt can
+     // arrive with IE set and EXL not yet.
+     ld      $8, 256($sp)
++    // FR (bit 26) on every return: the FPU register layout the userland uses.
++    lui     $9, 0x0400
++    or      $8, $8, $9
+     addiu   $9, $zero, -2
+     and     $9, $8, $9
+     mtc0    $9, $12
+diff --git a/src/context/arch/mips64.rs b/src/context/arch/mips64.rs
+index 1f4c116e..a92f64e4 100644
+--- a/src/context/arch/mips64.rs
++++ b/src/context/arch/mips64.rs
+@@ -104,7 +104,7 @@ impl super::Context {
+     pub fn set_fx_regs(&mut self, new: FloatRegisters) {
+         unsafe { self.kfx.as_mut_ptr().cast::<FloatRegisters>().write_unaligned(new) };
+         if let Some(regs) = self.regs_mut() {
+-            regs.iret.status |= cp0::status::CU1 as u64;
++            regs.iret.status |= (cp0::status::CU1 | cp0::status::FR) as u64;
+         }
+     }
+ 
+@@ -179,7 +179,7 @@ fn frame_uses_fpu(context: &super::Context) -> bool {
+ 
+ /// Save the FPU registers of the current context into `out`. Works with
+ /// `CU1` off: it turns `CU1` on for the save, then restores the old Status.
+-/// FR is 0, so the 16 even doubleword pairs hold all 32 single registers.
++/// FR is 1 (set with CU1 by the exception path): 32 doubleword registers.
+ #[unsafe(naked)]
+ pub(crate) unsafe extern "C" fn fp_save(out: *mut FloatRegisters) {
+     core::arch::naked_asm!(
+@@ -188,7 +188,7 @@ pub(crate) unsafe extern "C" fn fp_save(out: *mut FloatRegisters) {
+         .set noat
+         .set hardfloat                  // the kernel is soft float; only these two use FPU instructions
+         mfc0    $11, $12                // old Status
+-        lui     $10, 0x2000             // CU1
++        lui     $10, 0x2400             // CU1 and FR (bit 26)
+         or      $10, $11, $10
+         mtc0    $10, $12
+         nop
+@@ -196,21 +196,37 @@ pub(crate) unsafe extern "C" fn fp_save(out: *mut FloatRegisters) {
+         nop
+         nop
+         sdc1    $f0, 0($4)
+-        sdc1    $f2, 8($4)
+-        sdc1    $f4, 16($4)
+-        sdc1    $f6, 24($4)
+-        sdc1    $f8, 32($4)
+-        sdc1    $f10, 40($4)
+-        sdc1    $f12, 48($4)
+-        sdc1    $f14, 56($4)
+-        sdc1    $f16, 64($4)
+-        sdc1    $f18, 72($4)
+-        sdc1    $f20, 80($4)
+-        sdc1    $f22, 88($4)
+-        sdc1    $f24, 96($4)
+-        sdc1    $f26, 104($4)
+-        sdc1    $f28, 112($4)
+-        sdc1    $f30, 120($4)
++        sdc1    $f1, 8($4)
++        sdc1    $f2, 16($4)
++        sdc1    $f3, 24($4)
++        sdc1    $f4, 32($4)
++        sdc1    $f5, 40($4)
++        sdc1    $f6, 48($4)
++        sdc1    $f7, 56($4)
++        sdc1    $f8, 64($4)
++        sdc1    $f9, 72($4)
++        sdc1    $f10, 80($4)
++        sdc1    $f11, 88($4)
++        sdc1    $f12, 96($4)
++        sdc1    $f13, 104($4)
++        sdc1    $f14, 112($4)
++        sdc1    $f15, 120($4)
++        sdc1    $f16, 128($4)
++        sdc1    $f17, 136($4)
++        sdc1    $f18, 144($4)
++        sdc1    $f19, 152($4)
++        sdc1    $f20, 160($4)
++        sdc1    $f21, 168($4)
++        sdc1    $f22, 176($4)
++        sdc1    $f23, 184($4)
++        sdc1    $f24, 192($4)
++        sdc1    $f25, 200($4)
++        sdc1    $f26, 208($4)
++        sdc1    $f27, 216($4)
++        sdc1    $f28, 224($4)
++        sdc1    $f29, 232($4)
++        sdc1    $f30, 240($4)
++        sdc1    $f31, 248($4)
+         cfc1    $10, $31
+         nop
+         sw      $10, {fcsr}($4)
+@@ -237,7 +253,7 @@ pub(crate) unsafe extern "C" fn fp_load(src: *const FloatRegisters) {
+         .set noat
+         .set hardfloat                  // the kernel is soft float; only these two use FPU instructions
+         mfc0    $11, $12                // old Status
+-        lui     $10, 0x2000             // CU1
++        lui     $10, 0x2400             // CU1 and FR (bit 26)
+         or      $10, $11, $10
+         mtc0    $10, $12
+         nop
+@@ -245,21 +261,37 @@ pub(crate) unsafe extern "C" fn fp_load(src: *const FloatRegisters) {
+         nop
+         nop
+         ldc1    $f0, 0($4)
+-        ldc1    $f2, 8($4)
+-        ldc1    $f4, 16($4)
+-        ldc1    $f6, 24($4)
+-        ldc1    $f8, 32($4)
+-        ldc1    $f10, 40($4)
+-        ldc1    $f12, 48($4)
+-        ldc1    $f14, 56($4)
+-        ldc1    $f16, 64($4)
+-        ldc1    $f18, 72($4)
+-        ldc1    $f20, 80($4)
+-        ldc1    $f22, 88($4)
+-        ldc1    $f24, 96($4)
+-        ldc1    $f26, 104($4)
+-        ldc1    $f28, 112($4)
+-        ldc1    $f30, 120($4)
++        ldc1    $f1, 8($4)
++        ldc1    $f2, 16($4)
++        ldc1    $f3, 24($4)
++        ldc1    $f4, 32($4)
++        ldc1    $f5, 40($4)
++        ldc1    $f6, 48($4)
++        ldc1    $f7, 56($4)
++        ldc1    $f8, 64($4)
++        ldc1    $f9, 72($4)
++        ldc1    $f10, 80($4)
++        ldc1    $f11, 88($4)
++        ldc1    $f12, 96($4)
++        ldc1    $f13, 104($4)
++        ldc1    $f14, 112($4)
++        ldc1    $f15, 120($4)
++        ldc1    $f16, 128($4)
++        ldc1    $f17, 136($4)
++        ldc1    $f18, 144($4)
++        ldc1    $f19, 152($4)
++        ldc1    $f20, 160($4)
++        ldc1    $f21, 168($4)
++        ldc1    $f22, 176($4)
++        ldc1    $f23, 184($4)
++        ldc1    $f24, 192($4)
++        ldc1    $f25, 200($4)
++        ldc1    $f26, 208($4)
++        ldc1    $f27, 216($4)
++        ldc1    $f28, 224($4)
++        ldc1    $f29, 232($4)
++        ldc1    $f30, 240($4)
++        ldc1    $f31, 248($4)
+         lw      $10, {fcsr}($4)
+         nop
+         ctc1    $10, $31
+-- 
+2.56.0
+

@@ -7,7 +7,7 @@ git = "https://gitlab.redox-os.org/redox-os/kernel.git"
 rev = "7824a967b630d4a81c0dbe75a3e50a2a3657cacd"
 # event-kcall.patch is upstream c0769114 and a3596de7 (2026-11-07), which the
 # pinned relibc needs for poll(); they are later than the pin.
-patches = ["event-kcall.patch", "indy-mips64.patch"]
+patches = ["event-kcall.patch", "indy-mips64.patch", "fpu-fr.patch"]
 
 [build]
 template = "custom"
